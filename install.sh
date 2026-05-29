@@ -82,7 +82,8 @@ fi
 
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/aimilivpn"
-echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR}...${PLAIN}"
+DEPLOY_BRANCH="bate"
+echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR} (分支: ${DEPLOY_BRANCH})...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
     echo -e "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"
 else
@@ -90,29 +91,31 @@ else
         echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
         git fetch --all || true
-        BRANCH="main"
-        if git rev-parse --verify origin/main >/dev/null 2>&1; then
-            BRANCH="main"
-        elif git rev-parse --verify origin/master >/dev/null 2>&1; then
-            BRANCH="master"
-        fi
-        echo -e "  -> 正在强制重置本地源码至 origin/${BRANCH} ..."
-        if git reset --hard "origin/${BRANCH}"; then
+        git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
+        echo -e "  -> 正在强制重置本地源码至 origin/${DEPLOY_BRANCH} ..."
+        if git reset --hard "origin/${DEPLOY_BRANCH}"; then
             echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
         else
-            if git pull; then
+            if git pull origin "${DEPLOY_BRANCH}"; then
                 echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
             else
                 echo -e "${YELLOW}  -> 警告: git pull/reset 失败，将保留当前本地源码并继续安装。${PLAIN}"
             fi
         fi
     else
-        echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} ..."
-        if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
+        echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} (分支: ${DEPLOY_BRANCH}) ..."
+        if git clone -b "${DEPLOY_BRANCH}" "${GITHUB_URL}" "${INSTALL_DIR}"; then
             echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
         else
-            echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
-            exit 1
+            echo -e "  -> 尝试默认克隆..."
+            if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
+                cd "${INSTALL_DIR}"
+                git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
+                echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
+            else
+                echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
+                exit 1
+            fi
         fi
     fi
 fi
