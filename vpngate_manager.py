@@ -292,9 +292,150 @@ def parse_int(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
 
+def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_ssl_verify: bool = True) -> str:
+    import socket
+    import ssl
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(url)
+    domain = parsed.hostname or "www.vpngate.net"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    is_https = parsed.scheme == "https"
+    path = parsed.path
+    if parsed.query:
+        path += "?" + parsed.query
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(12)
+    try:
+        s.connect((phost, pport))
+        if ptype == "socks":
+            # SOCKS5 Handshake
+            s.sendall(b"\x05\x01\x00")
+            resp = s.recv(2)
+            if len(resp) < 2 or resp[0] != 5 or resp[1] != 0:
+                raise RuntimeError("SOCKS5 authentication failed or unsupported")
+            # SOCKS5 Connect
+            domain_bytes = domain.encode('ascii')
+            req = b"\x05\x01\x00\x03" + bytes([len(domain_bytes)]) + domain_bytes + port.to_bytes(2, 'big')
+            s.sendall(req)
+            resp = s.recv(10)
+            if len(resp) < 4 or resp[1] != 0:
+                raise RuntimeError("SOCKS5 connection request rejected")
+            # If HTTPS, wrap socket with SSL
+            if is_https:
+                ctx = ssl.create_default_context() if use_ssl_verify else ssl._create_unverified_context()
+                s = ctx.wrap_socket(s, server_hostname=domain)
+        else: # http proxy
+            if is_https:
+                # HTTP CONNECT tunnel
+                req_str = f"CONNECT {domain}:{port} HTTP/1.1\r\nHost: {domain}:{port}\r\nUser-Agent: Mozilla/5.0 vpngate-openvpn-manager/2.0\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+                s.sendall(req_str.encode('ascii'))
+                resp = s.recv(4096)
+                if not (b"200" in resp or b"established" in resp.lower() or b"ok" in resp.lower()):
+                    raise RuntimeError(f"HTTP CONNECT tunnel failed: {resp.decode('utf-8', errors='replace')}")
+                # Wrap socket with SSL
+                ctx = ssl.create_default_context() if use_ssl_verify else ssl._create_unverified_context()
+                s = ctx.wrap_socket(s, server_hostname=domain)
+            else:
+                # Direct HTTP request through proxy: request URI must be absolute
+                pass
+
+        # Send HTTP GET request
+        if ptype == "http" and not is_https:
+            request_uri = url
+        else:
+            request_uri = path
+            
+        req_headers = (
+            f"GET {request_uri} HTTP/1.1\r\n"
+            f"Host: {domain}\r\n"
+            f"User-Agent: Mozilla/5.0 vpngate-openvpn-manager/2.0\r\n"
+            f"Accept: text/plain,*/*\r\n"
+            f"Connection: close\r\n\r\n"
+        )
+        s.sendall(req_headers.encode('utf-8'))
+
+        # Read response
+        response_data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            response_data += chunk
+            if len(response_data) > 10 * 1024 * 1024: # max 10MB safety guard
+                break
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+    # Parse HTTP response
+    header_end = response_data.find(b"\r\n\r\n")
+    if header_end == -1:
+        raise RuntimeError("Invalid HTTP response format")
+    
+    headers_part = response_data[:header_end].decode('utf-8', errors='replace')
+    body_part = response_data[header_end+4:]
+
+    # Check for HTTP status code
+    lines = headers_part.splitlines()
+    if not lines:
+        raise RuntimeError("Empty response headers")
+    status_line = lines[0]
+    status_parts = status_line.split()
+    if len(status_parts) >= 2:
+        try:
+            status_code = int(status_parts[1])
+            if status_code != 200:
+                raise RuntimeError(f"HTTP Server returned status {status_code}: {status_line}")
+        except ValueError:
+            pass
+
+    # Handle chunked transfer encoding
+    is_chunked = False
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            if k.strip().lower() == "transfer-encoding" and "chunked" in v.lower():
+                is_chunked = True
+                break
+
+    if is_chunked:
+        decoded = b""
+        idx = 0
+        while idx < len(body_part):
+            c_end = body_part.find(b"\r\n", idx)
+            if c_end == -1:
+                break
+            chunk_size_str = body_part[idx:c_end].split(b";")[0].strip()
+            try:
+                chunk_size = int(chunk_size_str, 16)
+            except ValueError:
+                break
+            if chunk_size == 0:
+                break
+            idx = c_end + 2
+            decoded += body_part[idx : idx + chunk_size]
+            idx += chunk_size + 2
+        body_part = decoded
+
+    return body_part.decode('utf-8', errors='replace')
+
 def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
     if url is None:
         url = API_URL
+    
+    ptype, phost, pport = vpn_utils.get_upstream_proxy()
+    if ptype and phost and pport:
+        try:
+            print(f"[fetch_api_text] 监测到上游代理 ({ptype}://{phost}:{pport})，尝试通过代理获取 API...", flush=True)
+            return fetch_api_text_via_proxy(url, ptype, phost, pport, use_ssl_verify)
+        except Exception as e:
+            print(f"[fetch_api_text] 通过代理获取 API 失败: {e}，尝试使用直连/默认系统代理...", flush=True)
+            log_to_json("WARNING", "Main", f"使用代理 {ptype}://{phost}:{pport} 获取 API 失败: {e}")
+
     request = urllib.request.Request(
         url,
         headers={
@@ -1547,7 +1688,7 @@ INDEX_HTML = r"""<!doctype html>
       gap: 12px;
     }
 
-    button {
+    button, .btn-telegram {
       height: 38px;
       border: 1px solid var(--border-color);
       border-radius: 8px;
@@ -1563,11 +1704,26 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(255, 255, 255, 0.04);
       color: var(--text-primary);
       white-space: nowrap;
+      text-decoration: none;
+      box-sizing: border-box;
     }
 
     button:hover {
       background: rgba(255, 255, 255, 0.08);
       border-color: rgba(255, 255, 255, 0.15);
+      transform: translateY(-1px);
+    }
+
+    .btn-telegram {
+      background: rgba(43, 162, 223, 0.15);
+      border: 1px solid rgba(43, 162, 223, 0.3);
+      color: #2ba2df;
+    }
+
+    .btn-telegram:hover {
+      background: rgba(43, 162, 223, 0.25);
+      border-color: rgba(43, 162, 223, 0.5);
+      color: #2ba2df;
       transform: translateY(-1px);
     }
 
@@ -2198,7 +2354,7 @@ INDEX_HTML = r"""<!doctype html>
         width: 100%;
         margin-top: 12px;
       }
-      .btn-group button {
+      .btn-group button, .btn-group .btn-telegram {
         flex: 1;
       }
       .btn-group .dropdown {
@@ -2349,7 +2505,7 @@ INDEX_HTML = r"""<!doctype html>
         <a href="https://github.com/baoweise-bot/aimili-vpngate/tree/bate" target="_blank">测试版</a>
       </div>
     </div>
-    <a href="https://t.me/arestemple" target="_blank" class="btn-primary" style="background: rgba(43, 162, 223, 0.15); border: 1px solid rgba(43, 162, 223, 0.3); color: #2ba2df; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; height: 38px; box-sizing: border-box; font-weight: 600;">
+    <a href="https://t.me/arestemple" target="_blank" class="btn-telegram">
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
       Telegram
     </a>
@@ -2816,12 +2972,13 @@ function getFilteredNodes() {
   const q = $("search").value.toLowerCase();
   const selectedCountry = $("country_filter").value;
   return nodes.filter(n => {
+    if (!n) return false;
     if (selectedCountry && n.country !== selectedCountry) {
       return false;
     }
     const searchStr = [
-      n.country, n.country_short, n.ip, n.remote_host, n.proto,
-      translateQuality(n.quality), translateIpType(n.ip_type), n.location, n.owner, n.as_name
+      n.country || "", n.country_short || "", n.ip || "", n.remote_host || "", n.proto || "",
+      translateQuality(n.quality), translateIpType(n.ip_type), n.location || "", n.owner || "", n.as_name || ""
     ].join(" ").toLowerCase();
     return searchStr.includes(q);
   });
@@ -2829,16 +2986,21 @@ function getFilteredNodes() {
 
 function stableSortNodes() {
   nodes.sort((a, b) => {
-    if ((b.score || 0) !== (a.score || 0)) {
-      return (b.score || 0) - (a.score || 0);
+    if (!a || !b) return 0;
+    const aScore = a.score || 0;
+    const bScore = b.score || 0;
+    if (bScore !== aScore) {
+      return bScore - aScore;
     }
-    return a.id.localeCompare(b.id);
+    const aId = a.id || "";
+    const bId = b.id || "";
+    return aId.localeCompare(bId);
   });
 }
 
 function render(){
   const activeNodeId = state.active_openvpn_node_id;
-  const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
+  const activeNode = nodes.find(n => n && (n.active || n.id === activeNodeId));
   
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
@@ -2987,6 +3149,7 @@ function render(){
     $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
+      if (!n) return '';
       const isCurrentlyActive = activeNode && n.id === activeNode.id;
       const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
       
