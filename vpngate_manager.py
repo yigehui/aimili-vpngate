@@ -146,6 +146,7 @@ UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
+ENV_FILE = ROOT_DIR / ".env"
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
@@ -212,6 +213,25 @@ def read_json(path: Path, default: Any) -> Any:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return default
+
+def read_env_file_text() -> str:
+    try:
+        if ENV_FILE.is_file():
+            return ENV_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"读取 .env 失败: {exc}") from exc
+    return ""
+
+def write_env_file_text(content: str) -> None:
+    text = str(content or "")
+    if "\x00" in text:
+        raise ValueError(".env 内容不能包含 NUL 字符")
+    if len(text.encode("utf-8")) > 256 * 1024:
+        raise ValueError(".env 内容不能超过 256KB")
+    ENV_FILE.parent.mkdir(exist_ok=True, parents=True)
+    tmp = ENV_FILE.with_suffix(ENV_FILE.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(ENV_FILE)
 
 def mask_secret(value: str, left: int = 6, right: int = 4) -> str:
     text = str(value or "")
@@ -2401,7 +2421,7 @@ INDEX_HTML = r"""<!doctype html>
       gap: 12px;
     }
 
-    button, .btn-telegram {
+    button {
       height: 38px;
       border: 1px solid var(--border-color);
       border-radius: 8px;
@@ -2424,19 +2444,6 @@ INDEX_HTML = r"""<!doctype html>
     button:hover {
       background: rgba(255, 255, 255, 0.08);
       border-color: rgba(255, 255, 255, 0.15);
-      transform: translateY(-1px);
-    }
-
-    .btn-telegram {
-      background: rgba(43, 162, 223, 0.15);
-      border: 1px solid rgba(43, 162, 223, 0.3);
-      color: #2ba2df;
-    }
-
-    .btn-telegram:hover {
-      background: rgba(43, 162, 223, 0.25);
-      border-color: rgba(43, 162, 223, 0.5);
-      color: #2ba2df;
       transform: translateY(-1px);
     }
 
@@ -3044,7 +3051,7 @@ INDEX_HTML = r"""<!doctype html>
         width: 100%;
         margin-top: 12px;
       }
-      .btn-group button, .btn-group .btn-telegram {
+      .btn-group button {
         flex: 1;
       }
       .btn-group .dropdown {
@@ -3236,21 +3243,6 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <div class="btn-group">
 
-    <div class="dropdown">
-      <button id="github_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        GITHUB
-        <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
-      </button>
-      <div id="github_dropdown" class="dropdown-content">
-        <a href="https://github.com/yigehui/aimili-vpngate" target="_blank">正式版</a>
-        <a href="https://github.com/yigehui/aimili-vpngate/tree/bate" target="_blank">测试版</a>
-      </div>
-    </div>
-    <a href="https://t.me/arestemple" target="_blank" class="btn-telegram">
-      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
-      Telegram
-    </a>
     <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       更新节点
@@ -3273,6 +3265,10 @@ INDEX_HTML = r"""<!doctype html>
         <a href="javascript:void(0)" onclick="openGatewayModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
           网关设置
+        </a>
+        <a href="javascript:void(0)" onclick="openSystemConfigModal()">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414A1 1 0 0119 9.414V19a2 2 0 01-2 2z" /></svg>
+          系统配置
         </a>
         <a href="javascript:void(0)" onclick="openPoolApiDocsModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 9l3 3-3 3m5 0h3M5 5h14a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2z" /></svg>
@@ -3613,6 +3609,45 @@ INDEX_HTML = r"""<!doctype html>
       
       <div style="display: flex; justify-content: flex-end; margin-top: 20px;">
         <button type="button" onclick="closeGatewayModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- System Config Modal -->
+  <div id="system_config_modal" class="modal">
+    <div class="modal-content" style="max-width: 920px; width: 95%;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px;">
+        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414A1 1 0 0119 9.414V19a2 2 0 01-2 2z" /></svg>
+          系统配置
+        </h3>
+        <button type="button" onclick="closeSystemConfigModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+
+      <div id="system_config_notice" style="background: rgba(99,102,241,0.08); border: 1px solid rgba(99,102,241,0.18); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; font-size: 13px; color: var(--text-secondary); line-height: 1.6;">
+        正在读取 .env ...
+      </div>
+
+      <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap;">
+        <div style="font-size: 12px; color: var(--text-secondary);">
+          文件路径：<span id="system_config_path" class="mono">-</span>
+        </div>
+        <button type="button" onclick="loadSystemConfig()" class="btn-primary" style="height: 32px; padding: 0 12px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">重新读取</button>
+      </div>
+
+      <textarea id="system_config_env_text" spellcheck="false" placeholder="例如：SERVICE_MODE=pool&#10;POOL_PUBLIC_HOST=你的服务器IP&#10;POOL_PROXY_USER=你的用户名&#10;POOL_PROXY_PASS=你的密码" style="width: 100%; height: 420px; box-sizing: border-box; resize: vertical; border-radius: 10px; border: 1px solid var(--border-color); background: #050811; color: #dbeafe; padding: 14px; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12px; line-height: 1.6; outline: none;"></textarea>
+
+      <div style="margin-top: 10px; font-size: 12px; color: var(--text-secondary); line-height: 1.6;">
+        保存只会写入项目根目录 <span class="mono">.env</span>；大部分环境变量需要重启服务后生效。保存后页面会询问是否立即重启。
+      </div>
+
+      <div id="system_config_result" style="display:none; margin-top: 10px; font-size: 12px;"></div>
+
+      <div style="display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-top: 16px;">
+        <button type="button" onclick="saveSystemConfig()" class="btn-primary" style="height: 38px; padding: 0 18px;">保存 .env</button>
+        <button type="button" onclick="closeSystemConfigModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
       </div>
     </div>
   </div>
@@ -4455,33 +4490,20 @@ $("btn_test_proxy").onclick = async () => {
   }
 };
 
-// Admin dropdown toggle & GitHub dropdown toggle
+// Admin dropdown toggle
 const adminBtn = $("admin_btn");
 const adminDropdown = $("admin_dropdown");
-const githubBtn = $("github_btn");
-const githubDropdown = $("github_dropdown");
 
 if (adminBtn && adminDropdown) {
   adminBtn.onclick = (e) => {
     e.stopPropagation();
     const isShow = adminDropdown.style.display === "block";
     adminDropdown.style.display = isShow ? "none" : "block";
-    if (githubDropdown) githubDropdown.style.display = "none";
-  };
-}
-
-if (githubBtn && githubDropdown) {
-  githubBtn.onclick = (e) => {
-    e.stopPropagation();
-    const isShow = githubDropdown.style.display === "block";
-    githubDropdown.style.display = isShow ? "none" : "block";
-    if (adminDropdown) adminDropdown.style.display = "none";
   };
 }
 
 document.addEventListener("click", () => {
   if (adminDropdown) adminDropdown.style.display = "none";
-  if (githubDropdown) githubDropdown.style.display = "none";
 });
 
 let showFavoritesOnly = false;
@@ -4887,6 +4909,83 @@ async function logoutAdmin() {
   } catch (err) {
     console.error("退出登录失败", err);
     window.location.reload();
+  }
+}
+
+function setSystemConfigResult(message, ok=true) {
+  const el = $("system_config_result");
+  if (!el) return;
+  el.style.display = "block";
+  el.style.color = ok ? "var(--success)" : "var(--danger)";
+  el.textContent = message || "";
+}
+
+async function loadSystemConfig() {
+  const notice = $("system_config_notice");
+  const pathEl = $("system_config_path");
+  const textarea = $("system_config_env_text");
+  if (notice) {
+    notice.style.background = "rgba(99,102,241,0.08)";
+    notice.style.borderColor = "rgba(99,102,241,0.18)";
+    notice.textContent = "正在读取 .env ...";
+  }
+  try {
+    const res = await fetch("./api/system_config");
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "读取失败");
+    if (pathEl) pathEl.textContent = data.path || "-";
+    if (textarea) textarea.value = data.content || "";
+    if (notice) {
+      notice.textContent = data.exists ? ".env 已读取，可直接编辑保存。" : "当前还没有 .env 文件，保存后会自动创建。";
+    }
+    const result = $("system_config_result");
+    if (result) result.style.display = "none";
+  } catch (e) {
+    if (notice) {
+      notice.style.background = "rgba(239,68,68,0.08)";
+      notice.style.borderColor = "rgba(239,68,68,0.18)";
+      notice.textContent = e.message || "读取 .env 失败";
+    }
+  }
+}
+
+function openSystemConfigModal() {
+  $("admin_dropdown").style.display = "none";
+  $("system_config_modal").style.display = "flex";
+  loadSystemConfig();
+}
+
+function closeSystemConfigModal() {
+  $("system_config_modal").style.display = "none";
+}
+
+async function restartServiceFromPage() {
+  setSystemConfigResult("正在重启服务，页面稍后自动刷新...", true);
+  try {
+    await fetch("./api/restart_service", { method: "POST" });
+  } catch (e) {}
+  setTimeout(() => window.location.reload(), 5000);
+}
+
+async function saveSystemConfig() {
+  const textarea = $("system_config_env_text");
+  const content = textarea ? textarea.value : "";
+  setSystemConfigResult("正在保存 .env ...", true);
+  try {
+    const res = await fetch("./api/system_config", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({content})
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "保存失败");
+    setSystemConfigResult("保存成功。", true);
+    const shouldRestart = confirm("系统配置已保存。是否立即重启服务让配置生效？");
+    if (shouldRestart) {
+      await restartServiceFromPage();
+    }
+  } catch (e) {
+    setSystemConfigResult(e.message || "保存失败", false);
   }
 }
 
@@ -5827,6 +5926,16 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif effective_path == "/api/pool_admin/status":
             self.send_json(self._pool_admin_status())
+        elif effective_path == "/api/system_config":
+            try:
+                self.send_json({
+                    "ok": True,
+                    "path": str(ENV_FILE),
+                    "exists": ENV_FILE.is_file(),
+                    "content": read_env_file_text(),
+                })
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/logs":
             logs_dir = DATA_DIR / "logs"
             date_str = time.strftime("%Y-%m-%d", time.localtime())
@@ -5929,6 +6038,37 @@ class Handler(BaseHTTPRequestHandler):
                 })
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/system_config":
+            try:
+                payload = self.read_json_body(max_bytes=300 * 1024)
+                content = str(payload.get("content") or "")
+                write_env_file_text(content)
+                self.send_json({
+                    "ok": True,
+                    "path": str(ENV_FILE),
+                    "message": ".env 已保存",
+                    "restart_required": True,
+                })
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/restart_service":
+            try:
+                self.send_json({"ok": True, "message": "服务正在重启"})
+
+                def restart_server():
+                    time.sleep(1.0)
+                    print("[系统] 页面触发服务重启，进程即将退出以触发自动重启...", flush=True)
+                    os._exit(0)
+
+                threading.Thread(target=restart_server, daemon=True).start()
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
