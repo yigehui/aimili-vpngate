@@ -10,6 +10,9 @@ import urllib.parse
 import time
 from typing import Any
 
+# Linux-only; value 25 matches Linux SO_BINDTODEVICE when constant is missing (e.g. Windows).
+SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
+
 def parse_positive_int(value: str | None, default: int) -> int:
     try:
         return max(1, int(value or default))
@@ -78,13 +81,27 @@ def parse_http_basic_auth(lines: list[str]) -> tuple[str | None, str | None]:
         return username, password
     return None, None
 
-def check_credentials(username: str | None, password: str | None) -> bool:
-    expected_user, expected_pass = get_proxy_credentials()
-    if expected_user is None or expected_pass is None:
-        return True
-    return secrets.compare_digest(username or "", expected_user) and secrets.compare_digest(password or "", expected_pass)
+def check_credentials(
+    username: str | None,
+    password: str | None,
+    expected_user: str | None = None,
+    expected_pass: str | None = None,
+) -> bool:
+    if expected_user is None and expected_pass is None:
+        expected_user, expected_pass = get_proxy_credentials()
+        if expected_user is None and expected_pass is None:
+            return True
+    return secrets.compare_digest(username or "", expected_user or "") and secrets.compare_digest(
+        password or "", expected_pass or ""
+    )
 
-def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
+def dns_query_over_device(
+    host: str,
+    qtype: int,
+    dns_server: str,
+    timeout: float,
+    bind_device: str = "tun0",
+) -> str | None:
     import random
     sock = None
     try:
@@ -109,12 +126,18 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, bind_device.encode())
         except OSError as e:
             if "operation not permitted" in str(e).lower() or e.errno == 1:
-                print("[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 tun0 权限不足，请确保程序以 root 权限运行！", flush=True)
+                print(
+                    f"[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 {bind_device} 权限不足，请确保程序以 root 权限运行！",
+                    flush=True,
+                )
             elif "no such device" in str(e).lower() or e.errno == 19:
-                print("[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 tun0 失败，网卡设备不存在，请检查 VPN 连接！", flush=True)
+                print(
+                    f"[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 {bind_device} 失败，网卡设备不存在，请检查 VPN 连接！",
+                    flush=True,
+                )
             return None
         sock.sendto(packet, (dns_server, 53))
         resp, _ = sock.recvfrom(4096)
@@ -178,7 +201,15 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         return None
     return None
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
+    return dns_query_over_device(host, qtype, dns_server, timeout, bind_device="tun0")
+
+def resolve_dns_over_device(
+    host: str,
+    dns_server: str = "8.8.8.8",
+    timeout: float = 3.0,
+    bind_device: str = "tun0",
+) -> str | None:
     try:
         socket.inet_aton(host)
         return host
@@ -189,13 +220,24 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         return host
     except OSError:
         pass
-    return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
+    return (
+        dns_query_over_device(host, 1, dns_server, timeout, bind_device)
+        or dns_query_over_device(host, 28, dns_server, timeout, bind_device)
+    )
 
-def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+    return resolve_dns_over_device(host, dns_server=dns_server, timeout=timeout, bind_device="tun0")
+
+def create_connection(
+    address: tuple[str, int],
+    timeout: float = 20,
+    bind_device: str | None = "tun0",
+) -> socket.socket:
     host, port = address
-    resolved_ip = resolve_dns_over_tun0(host)
-    if resolved_ip:
-        host = resolved_ip
+    if bind_device is not None:
+        resolved_ip = resolve_dns_over_device(host, bind_device=bind_device)
+        if resolved_ip:
+            host = resolved_ip
 
     err = None
     for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
@@ -204,15 +246,23 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            if bind_device is not None:
+                sock.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, bind_device.encode())
             sock.connect(sa)
             return sock
         except OSError as e:
             err = e
-            if "operation not permitted" in str(e).lower() or e.errno == 1:
-                err = OSError(f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定虚拟网卡 tun0 失败，权限不足！必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。")
-            elif "no such device" in str(e).lower() or e.errno == 19:
-                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 tun0 失败，找不到设备！这通常是因为 OpenVPN 核心未能成功连接或已被异常终止。")
+            if bind_device is not None:
+                if "operation not permitted" in str(e).lower() or e.errno == 1:
+                    err = OSError(
+                        f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定虚拟网卡 {bind_device} 失败，权限不足！"
+                        f"必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。"
+                    )
+                elif "no such device" in str(e).lower() or e.errno == 19:
+                    err = OSError(
+                        f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 {bind_device} 失败，找不到设备！"
+                        f"这通常是因为 OpenVPN 核心未能成功连接或已被异常终止。"
+                    )
             if sock is not None:
                 sock.close()
     if err is not None:
@@ -233,12 +283,20 @@ def relay(left: socket.socket, right: socket.socket) -> None:
                 return
             target.sendall(data)
 
-def socks5_client(client: socket.socket, first_byte: bytes) -> None:
+def socks5_client(
+    client: socket.socket,
+    first_byte: bytes,
+    *,
+    bind_device: str | None = "tun0",
+    username: str | None = None,
+    password: str | None = None,
+    require_auth: bool = False,
+) -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
         methods = recv_exact(client, methods_count)
-        if proxy_auth_enabled():
+        if require_auth:
             if 2 not in methods:
                 client.sendall(b"\x05\xff")
                 return
@@ -247,9 +305,9 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             if auth_version != 1:
                 client.sendall(b"\x01\x01")
                 return
-            username = recv_exact(client, recv_exact(client, 1)[0]).decode("utf-8", errors="replace")
-            password = recv_exact(client, recv_exact(client, 1)[0]).decode("utf-8", errors="replace")
-            if not check_credentials(username, password):
+            auth_user = recv_exact(client, recv_exact(client, 1)[0]).decode("utf-8", errors="replace")
+            auth_pass = recv_exact(client, recv_exact(client, 1)[0]).decode("utf-8", errors="replace")
+            if not check_credentials(auth_user, auth_pass, expected_user=username, expected_pass=password):
                 client.sendall(b"\x01\x01")
                 return
             client.sendall(b"\x01\x00")
@@ -270,7 +328,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             return
         port = int.from_bytes(recv_exact(client, 2), "big")
         try:
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((host, port), timeout=20, bind_device=bind_device)
         except Exception as e:
             print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
             try:
@@ -294,7 +352,15 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
         data += chunk
     return data
 
-def http_client(client: socket.socket, first_byte: bytes) -> None:
+def http_client(
+    client: socket.socket,
+    first_byte: bytes,
+    *,
+    bind_device: str | None = "tun0",
+    username: str | None = None,
+    password: str | None = None,
+    require_auth: bool = False,
+) -> None:
     upstream = None
     try:
         header = read_http_header(client, first_byte)
@@ -311,9 +377,9 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if not version.startswith("HTTP/"):
             client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
             return
-        if proxy_auth_enabled():
-            username, password = parse_http_basic_auth(lines[1:])
-            if not check_credentials(username, password):
+        if require_auth:
+            auth_user, auth_pass = parse_http_basic_auth(lines[1:])
+            if not check_credentials(auth_user, auth_pass, expected_user=username, expected_pass=password):
                 client.sendall(
                     b"HTTP/1.1 407 Proxy Authentication Required\r\n"
                     b"Proxy-Authenticate: Basic realm=\"AimiliVPN Proxy\"\r\n"
@@ -322,7 +388,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
                 return
         if method.upper() == "CONNECT":
             host, port = parse_host_port(target, 443)
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((host, port), timeout=20, bind_device=bind_device)
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             if rest:
                 upstream.sendall(rest)
@@ -361,7 +427,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:", "proxy-authorization:"))]
         request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
-        upstream = create_connection((hostname, port), timeout=20)
+        upstream = create_connection((hostname, port), timeout=20, bind_device=bind_device)
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception as e:
@@ -375,14 +441,36 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if upstream:
             upstream.close()
 
-def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+def proxy_client(
+    client: socket.socket,
+    address: tuple[str, int],
+    *,
+    bind_device: str | None = "tun0",
+    username: str | None = None,
+    password: str | None = None,
+    require_auth: bool = False,
+) -> None:
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05":
-            socks5_client(client, first)
+            socks5_client(
+                client,
+                first,
+                bind_device=bind_device,
+                username=username,
+                password=password,
+                require_auth=require_auth,
+            )
         else:
-            http_client(client, first)
+            http_client(
+                client,
+                first,
+                bind_device=bind_device,
+                username=username,
+                password=password,
+                require_auth=require_auth,
+            )
     except Exception as e:
         err_msg = str(e)
         if "[错误代码" in err_msg:
@@ -392,80 +480,208 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int) -> None:
-    is_ipv6 = ":" in host or host == ""
-    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    server = None
-    try:
-        server = socket.socket(af, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if is_ipv6:
-            try:
-                server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            except OSError:
-                pass
-        server.bind((host, port))
-        server.listen(256)
-        print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
-    except Exception as e:
-        if server is not None:
-            try:
-                server.close()
-            except Exception:
-                pass
-        if is_ipv6 and host in ("::", ""):
-            print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 0.0.0.0 ...", flush=True)
-            try:
-                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind(("0.0.0.0", port))
-                server.listen(256)
-                print(f"HTTP/SOCKS5 proxy listening on 0.0.0.0:{port} (仅 IPv4)", flush=True)
-            except Exception as ex:
-                import vpn_utils
-                diag = vpn_utils.diagnose_local_obstructions(port, host="0.0.0.0")
-                diag_msg = diag[1] if diag else str(ex)
-                print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 0.0.0.0:{port}: {diag_msg}", flush=True)
-                return
-        elif is_ipv6 and host == "::1":
-            print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 127.0.0.1 ...", flush=True)
-            try:
-                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind(("127.0.0.1", port))
-                server.listen(256)
-                print(f"HTTP/SOCKS5 proxy listening on 127.0.0.1:{port} (仅 IPv4)", flush=True)
-            except Exception as ex:
-                import vpn_utils
-                diag = vpn_utils.diagnose_local_obstructions(port, host="127.0.0.1")
-                diag_msg = diag[1] if diag else str(ex)
-                print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 127.0.0.1:{port}: {diag_msg}", flush=True)
-                return
-        else:
-            import vpn_utils
-            diag = vpn_utils.diagnose_local_obstructions(port, host=host)
-            diag_msg = diag[1] if diag else str(e)
-            print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {diag_msg}", flush=True)
-            return
+class ProxyListener:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        username: str | None,
+        password: str | None,
+        bind_device: str | None,
+        max_connections: int | None,
+        require_auth: bool = False,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.bind_device = bind_device
+        self.max_connections = max_connections
+        self.require_auth = require_auth or (username is not None and password is not None)
+        self._server: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._sem = threading.BoundedSemaphore(max_connections or MAX_PROXY_CONNECTIONS)
+        self._alive = False
+        self.bound_port = 0
 
-    while True:
+    @property
+    def auth_enabled(self) -> bool:
+        return bool(self.require_auth)
+
+    def _open_server_socket(self) -> None:
+        host = self.host
+        port = self.port
+        is_ipv6 = ":" in host or host == ""
+        af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+        server = None
         try:
-            client, address = server.accept()
-            if not proxy_connection_sem.acquire(blocking=False):
-                print(f"[代理限流] 当前连接数已达到上限 {MAX_PROXY_CONNECTIONS}，拒绝客户端 {address}", flush=True)
+            server = socket.socket(af, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if is_ipv6:
+                try:
+                    server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                except OSError:
+                    pass
+            server.bind((host, port))
+            server.listen(256)
+            bound_host, bound_port = server.getsockname()[:2]
+            self.bound_port = int(bound_port)
+            print(f"HTTP/SOCKS5 proxy listening on {bound_host}:{self.bound_port}", flush=True)
+            self._server = server
+            return
+        except Exception as e:
+            if server is not None:
+                try:
+                    server.close()
+                except Exception:
+                    pass
+            if is_ipv6 and host in ("::", ""):
+                print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 0.0.0.0 ...", flush=True)
+                try:
+                    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    server.bind(("0.0.0.0", port))
+                    server.listen(256)
+                    self.bound_port = int(server.getsockname()[1])
+                    print(f"HTTP/SOCKS5 proxy listening on 0.0.0.0:{self.bound_port} (仅 IPv4)", flush=True)
+                    self._server = server
+                    return
+                except Exception as ex:
+                    import vpn_utils
+                    diag = vpn_utils.diagnose_local_obstructions(port, host="0.0.0.0")
+                    diag_msg = diag[1] if diag else str(ex)
+                    print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 0.0.0.0:{port}: {diag_msg}", flush=True)
+                    raise OSError(diag_msg) from ex
+            elif is_ipv6 and host == "::1":
+                print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 127.0.0.1 ...", flush=True)
+                try:
+                    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    server.bind(("127.0.0.1", port))
+                    server.listen(256)
+                    self.bound_port = int(server.getsockname()[1])
+                    print(f"HTTP/SOCKS5 proxy listening on 127.0.0.1:{self.bound_port} (仅 IPv4)", flush=True)
+                    self._server = server
+                    return
+                except Exception as ex:
+                    import vpn_utils
+                    diag = vpn_utils.diagnose_local_obstructions(port, host="127.0.0.1")
+                    diag_msg = diag[1] if diag else str(ex)
+                    print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 127.0.0.1:{port}: {diag_msg}", flush=True)
+                    raise OSError(diag_msg) from ex
+            else:
+                import vpn_utils
+                diag = vpn_utils.diagnose_local_obstructions(port, host=host)
+                diag_msg = diag[1] if diag else str(e)
+                print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {diag_msg}", flush=True)
+                raise OSError(diag_msg) from e
+
+    def _accept_loop(self) -> None:
+        assert self._server is not None
+        while not self._stop.is_set():
+            try:
+                client, address = self._server.accept()
+            except OSError as e:
+                if self._stop.is_set():
+                    break
+                print(f"[ERROR] Proxy accept failed: {e}", flush=True)
+                time.sleep(0.5)
+                continue
+            if not self._sem.acquire(blocking=False):
+                print(
+                    f"[代理限流] 当前连接数已达到上限 {self.max_connections or MAX_PROXY_CONNECTIONS}，拒绝客户端 {address}",
+                    flush=True,
+                )
                 try:
                     client.close()
                 except OSError:
                     pass
                 continue
 
-            def run_client() -> None:
+            def run_client(
+                c: socket.socket = client,
+                addr: tuple[str, int] = address,
+            ) -> None:
                 try:
-                    proxy_client(client, address)
+                    proxy_client(
+                        c,
+                        addr,
+                        bind_device=self.bind_device,
+                        username=self.username,
+                        password=self.password,
+                        require_auth=self.require_auth,
+                    )
                 finally:
-                    proxy_connection_sem.release()
+                    self._sem.release()
 
             threading.Thread(target=run_client, daemon=True).start()
-        except Exception as e:
-            print(f"[ERROR] Proxy accept failed: {e}", flush=True)
-            time.sleep(0.5)
+        self._alive = False
+
+    def start(self, background: bool = True) -> int:
+        if self._alive and not self._stop.is_set():
+            return self.bound_port
+        self._stop.clear()
+        self._open_server_socket()
+        self._alive = True
+        if background:
+            self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+            self._thread.start()
+        else:
+            self._accept_loop()
+        return self.bound_port
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._server is not None:
+            try:
+                self._server.close()
+            except OSError:
+                pass
+            self._server = None
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        self._alive = False
+
+    def is_alive(self) -> bool:
+        return self._alive and not self._stop.is_set()
+
+
+def create_proxy_listener(
+    host: str,
+    port: int,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+    bind_device: str | None = "tun0",
+    max_connections: int | None = None,
+    require_auth: bool = False,
+) -> ProxyListener:
+    return ProxyListener(
+        host,
+        port,
+        username=username,
+        password=password,
+        bind_device=bind_device,
+        max_connections=max_connections,
+        require_auth=require_auth,
+    )
+
+
+def start_proxy_server(host: str, port: int) -> None:
+    # Gateway compatibility: blocking forever using env credentials + tun0
+    user, password = get_proxy_credentials()
+    listener = create_proxy_listener(
+        host,
+        port,
+        username=user,
+        password=password,
+        bind_device="tun0",
+        max_connections=MAX_PROXY_CONNECTIONS,
+        require_auth=proxy_auth_enabled(),
+    )
+    try:
+        listener.start(background=False)
+    except OSError:
+        return

@@ -63,7 +63,7 @@ class ProxyListenerTests(unittest.TestCase):
                     )
                 sock.setsockopt.assert_any_call(
                     socket.SOL_SOCKET,
-                    socket.SO_BINDTODEVICE,
+                    getattr(socket, "SO_BINDTODEVICE", proxy_server.SO_BINDTODEVICE),
                     b"tun7",
                 )
 
