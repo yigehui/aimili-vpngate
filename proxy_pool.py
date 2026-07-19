@@ -183,6 +183,14 @@ def parse_pool_query(qs: dict[str, list[str]]) -> dict[str, Any]:
 
     detail_raw = _first("detail", "").strip().lower()
     detail = detail_raw in ("1", "true", "yes", "on")
+    fallback_unknown_raw = _first(
+        "fallback_unknown",
+        _first("include_unknown_ip_type", _first("allow_unknown_ip_type", "")),
+    ).strip().lower()
+    fallback_unknown = fallback_unknown_raw in ("1", "true", "yes", "on")
+    strict_raw = _first("strict", "").strip().lower()
+    if strict_raw in ("0", "false", "no", "off"):
+        fallback_unknown = True
 
     return {
         "country": _first("country", ""),
@@ -192,6 +200,7 @@ def parse_pool_query(qs: dict[str, list[str]]) -> dict[str, Any]:
         "protocol": _first("protocol", "all") or "all",
         "ip_type": _first("ip_type", _first("type", "all")) or "all",
         "detail": detail,
+        "fallback_unknown": fallback_unknown,
     }
 
 
@@ -349,9 +358,14 @@ class PoolManager:
         offset: int = 0,
         sort: str = "latency",
         ip_type: str = "all",
+        fallback_unknown: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
             slots = self._filtered_ready(country, ip_type)
+            fallback_unknown_used = False
+            if fallback_unknown and not slots and self._can_fallback_unknown(ip_type):
+                slots = self._filtered_ready(country, ip_type, include_unknown_ip_type=True)
+                fallback_unknown_used = bool(slots)
             slots = self._sort_slots(slots, sort)
             total = len(slots)
             off = max(0, int(offset or 0))
@@ -365,15 +379,28 @@ class PoolManager:
                 "ok": True,
                 "total": total,
                 "count": len(proxies),
+                "ip_type": ip_type or "all",
+                "fallback_unknown_used": fallback_unknown_used,
                 "proxies": proxies,
             }
 
-    def random_proxy(self, country: str = "", ip_type: str = "all") -> dict[str, Any] | None:
+    def random_proxy(
+        self,
+        country: str = "",
+        ip_type: str = "all",
+        fallback_unknown: bool = False,
+    ) -> dict[str, Any] | None:
         with self._lock:
             slots = self._filtered_ready(country, ip_type)
+            fallback_unknown_used = False
+            if fallback_unknown and not slots and self._can_fallback_unknown(ip_type):
+                slots = self._filtered_ready(country, ip_type, include_unknown_ip_type=True)
+                fallback_unknown_used = bool(slots)
             if not slots:
                 return None
-            return self._proxy_dict(random.choice(slots))
+            item = self._proxy_dict(random.choice(slots))
+            item["fallback_unknown_used"] = fallback_unknown_used
+            return item
 
     def status(self, detail: bool = False) -> dict[str, Any]:
         with self._lock:
@@ -483,7 +510,16 @@ class PoolManager:
             return value == "mobile"
         return value == req
 
-    def _filtered_ready(self, country: str, ip_type: str = "all") -> list[PoolSlot]:
+    def _can_fallback_unknown(self, requested: str) -> bool:
+        req = (requested or "all").strip().casefold()
+        return req not in ("", "all", "any")
+
+    def _filtered_ready(
+        self,
+        country: str,
+        ip_type: str = "all",
+        include_unknown_ip_type: bool = False,
+    ) -> list[PoolSlot]:
         filters = self._parse_countries(country)
         ready: list[PoolSlot] = []
         for slot in self.slots:
@@ -492,6 +528,8 @@ class PoolManager:
             if not self._country_match(slot.country, filters):
                 continue
             if not self._ip_type_match(slot.ip_type, ip_type):
+                if include_unknown_ip_type and not (slot.ip_type or "").strip():
+                    ready.append(slot)
                 continue
             ready.append(slot)
         return ready

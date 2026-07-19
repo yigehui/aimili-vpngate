@@ -3715,7 +3715,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 14px; margin-bottom: 16px;">
         <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 8px;">查询参数</div>
         <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.7;">
-          <span class="mono">country=JP,KR,US</span>：按国家代码过滤；<span class="mono">ip_type=residential|hosting|mobile</span>：按 IP 类型过滤，其中 <span class="mono">residential</span> 会包含住宅与移动；<span class="mono">limit</span> / <span class="mono">offset</span>：分页；<span class="mono">sort=latency|country|port</span>：排序。
+          <span class="mono">country=JP,KR,US</span>：按国家代码过滤；<span class="mono">ip_type=residential|hosting|mobile</span>：按 IP 类型过滤，其中 <span class="mono">residential</span> 会包含住宅与移动；<span class="mono">fallback_unknown=1</span>：严格住宅为空时回退返回未识别类型的可用槽位；<span class="mono">limit</span> / <span class="mono">offset</span>：分页；<span class="mono">sort=latency|country|port</span>：排序。
         </div>
       </div>
 
@@ -5058,8 +5058,11 @@ function renderPoolApiDocs() {
       "# 查看池状态和槽位健康详情",
       `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/status?detail=1"`,
       "",
-      "# 获取日本住宅/移动类型代理列表",
-      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies?country=JP&ip_type=residential&limit=10&sort=latency"`,
+      "# 获取日本住宅/移动类型代理列表，fallback_unknown=1 表示严格住宅为空时回退可用未知类型槽位",
+      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies?country=JP&ip_type=residential&fallback_unknown=1&limit=10&sort=latency"`,
+      "",
+      "# 随机获取一个住宅优先代理",
+      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies/random?ip_type=residential&fallback_unknown=1"`,
       "",
       "# 随机获取一个美国机房代理",
       `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies/random?country=US&ip_type=hosting"`,
@@ -5700,7 +5703,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(pool_manager.status(detail=bool(q.get("detail"))))
             return
         if effective_path in ("/api/pool/proxies/random", "/api/pool/proxies/random/"):
-            item = pool_manager.random_proxy(country=q.get("country") or "", ip_type=q.get("ip_type") or "all")
+            item = pool_manager.random_proxy(
+                country=q.get("country") or "",
+                ip_type=q.get("ip_type") or "all",
+                fallback_unknown=bool(q.get("fallback_unknown")),
+            )
             if item is None:
                 self.send_json({"ok": False, "error": "no_proxy_available"}, HTTPStatus.NOT_FOUND)
                 return
@@ -5714,6 +5721,7 @@ class Handler(BaseHTTPRequestHandler):
                     offset=int(q.get("offset") or 0),
                     sort=str(q.get("sort") or "latency"),
                     ip_type=str(q.get("ip_type") or "all"),
+                    fallback_unknown=bool(q.get("fallback_unknown")),
                 )
             )
             return

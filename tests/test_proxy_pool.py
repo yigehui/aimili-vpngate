@@ -93,6 +93,25 @@ class PoolQueryTests(unittest.TestCase):
         assert item is not None
         self.assertEqual(item["country"], "US")
 
+    def test_ip_type_fallback_unknown(self) -> None:
+        unknown = self.mgr.slots[3]
+        unknown.state = proxy_pool.SLOT_READY
+        unknown.country = "KR"
+        unknown.country_name = "KR"
+        unknown.ip_type = ""
+        unknown.latency_ms = 30
+        unknown.node_id = "KR_unknown"
+        strict = self.mgr.list_proxies(country="KR", ip_type="residential")
+        self.assertEqual(strict["total"], 0)
+        fallback = self.mgr.list_proxies(country="KR", ip_type="residential", fallback_unknown=True)
+        self.assertEqual(fallback["total"], 1)
+        self.assertEqual(fallback["proxies"][0]["id"], "KR_unknown")
+        self.assertEqual(fallback["fallback_unknown_used"], True)
+        item = self.mgr.random_proxy(country="KR", ip_type="residential", fallback_unknown=True)
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["fallback_unknown_used"], True)
+
     def test_status_counts(self) -> None:
         st = self.mgr.status()
         self.assertEqual(st["slots"]["ready"], 3)
