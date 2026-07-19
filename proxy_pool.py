@@ -629,12 +629,12 @@ class PoolManager:
             candidates = self._dedupe_nodes(list(nodes or []))
             candidates.sort(key=self._latency_key)
             self._last_candidates = list(candidates)
-            available_ids = {self._node_id(n) for n in candidates}
 
-            # Keep READY whose node_id still available; drain others
-            for slot in self.slots:
-                if slot.state == SLOT_READY and slot.node_id and slot.node_id not in available_ids:
-                    self._stop_slot(slot)
+            # Do not churn existing READY ports during a node-list refresh.
+            # VPNGate availability lists fluctuate a lot; a node disappearing from
+            # the latest CSV/test batch does not prove the already connected tunnel
+            # is unusable. Keep current proxies stable and let health checks replace
+            # a slot only when the actual OpenVPN/listener/exit-IP check fails.
 
         self._request_fill_slots()
 

@@ -141,6 +141,31 @@ class PoolQueryTests(unittest.TestCase):
 
 
 class PoolSyncTests(unittest.TestCase):
+    def test_sync_keeps_existing_ready_ports_when_node_list_changes(self) -> None:
+        mgr = proxy_pool.PoolManager(
+            pool_size=2,
+            port_base=52000,
+            public_host="127.0.0.1",
+            listen_host="127.0.0.1",
+            proxy_user="u",
+            proxy_pass="p",
+            return_credentials=True,
+            max_starting=1,
+            start_openvpn=mock.Mock(return_value=(False, "skip", None)),
+            stop_openvpn=mock.Mock(),
+            create_listener=mock.Mock(),
+            log=lambda *a, **k: None,
+        )
+        mgr.slots[0] = _ready_slot(0, "JP", 10, node_id="old_node")
+        mgr.start()
+        mgr.sync_from_nodes([
+            {"id": "new_node", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 5, "config_text": "b", "probe_status": "available"},
+        ])
+        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
+        self.assertEqual(mgr.slots[0].node_id, "old_node")
+        mgr.stop_openvpn.assert_not_called()
+
     def test_dedupe_same_node_id(self) -> None:
         started: list[str] = []
 
