@@ -3805,7 +3805,7 @@ INDEX_HTML = r"""<!doctype html>
         <button type="button" onclick="loadPoolManageStatus()" class="btn-primary" style="height: 34px; padding: 0 14px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">刷新</button>
       </div>
       <div style="overflow: auto; border: 1px solid var(--border-color); border-radius: 10px; max-height: 560px;">
-        <table style="width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1240px;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1080px;">
           <thead style="position: sticky; top: 0; background: #111827; z-index: 1;">
             <tr>
               <th style="text-align:left; padding: 10px;">槽位</th>
@@ -3819,11 +3819,10 @@ INDEX_HTML = r"""<!doctype html>
               <th style="text-align:left; padding: 10px;">出口 IP</th>
               <th style="text-align:left; padding: 10px;">最近检测</th>
               <th style="text-align:left; padding: 10px;">失败</th>
-              <th style="text-align:left; padding: 10px;">代理地址</th>
             </tr>
           </thead>
           <tbody id="pool_manage_tbody">
-            <tr><td colspan="12" style="padding: 14px; color: var(--text-secondary);">正在读取...</td></tr>
+            <tr><td colspan="11" style="padding: 14px; color: var(--text-secondary);">正在读取...</td></tr>
           </tbody>
         </table>
       </div>
@@ -5147,13 +5146,6 @@ function poolStatusBadge(stateName) {
   return `<span style="display:inline-flex; align-items:center; gap:5px; color:${color}; font-weight:700;"><span style="width:7px;height:7px;border-radius:999px;background:${color};display:inline-block;"></span>${esc(st)}</span>`;
 }
 
-function buildPoolProxyUrl(slot, pool) {
-  const host = pool && pool.public_host ? pool.public_host : window.location.hostname;
-  const port = slot && slot.port ? slot.port : "";
-  if (!port) return "";
-  return `http://${host}:${port}`;
-}
-
 function renderPoolManage(data) {
   const notice = $("pool_manage_notice");
   const summary = $("pool_manage_summary");
@@ -5166,7 +5158,7 @@ function renderPoolManage(data) {
       notice.textContent = data && data.error ? data.error : "代理池状态读取失败";
     }
     if (summary) summary.textContent = "不可用";
-    if (tbody) tbody.innerHTML = `<tr><td colspan="12" style="padding:14px;color:var(--text-secondary);">代理池不可用</td></tr>`;
+    if (tbody) tbody.innerHTML = `<tr><td colspan="11" style="padding:14px;color:var(--text-secondary);">代理池不可用</td></tr>`;
     return;
   }
   const pool = data.pool || {};
@@ -5199,11 +5191,10 @@ function renderPoolManage(data) {
   const details = Array.isArray(pool.slot_detail) ? pool.slot_detail : [];
   if (!tbody) return;
   if (!details.length) {
-    tbody.innerHTML = `<tr><td colspan="12" style="padding:14px;color:var(--text-secondary);">暂无槽位详情。请确认当前为 pool 模式。</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" style="padding:14px;color:var(--text-secondary);">暂无槽位详情。请确认当前为 pool 模式。</td></tr>`;
     return;
   }
   tbody.innerHTML = details.map(slot => {
-    const proxyUrl = buildPoolProxyUrl(slot, pool);
     const err = slot.last_error ? `<div style="max-width:220px;color:var(--danger);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(slot.last_error)}">${esc(slot.last_error)}</div>` : "";
     return `<tr style="border-top: 1px solid rgba(255,255,255,0.05);">
       <td style="padding: 9px;" class="mono">#${esc(slot.index)}</td>
@@ -5217,7 +5208,6 @@ function renderPoolManage(data) {
       <td style="padding: 9px;" class="mono">${esc(slot.exit_ip || "-")}</td>
       <td style="padding: 9px;">${time(slot.last_health_at)}</td>
       <td style="padding: 9px;" class="mono">${esc(slot.fail_count || 0)}${err}</td>
-      <td style="padding: 9px;"><span class="mono">${esc(proxyUrl || "-")}</span>${proxyUrl ? ` <button type="button" onclick="copyText('${esc(proxyUrl)}')" style="margin-left:6px;border:1px solid var(--border-color);background:rgba(255,255,255,0.04);color:var(--text-secondary);border-radius:6px;cursor:pointer;">复制</button>` : ""}</td>
     </tr>`;
   }).join("");
 }
