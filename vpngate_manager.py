@@ -2350,6 +2350,39 @@ INDEX_HTML = r"""<!doctype html>
       --warning-gradient: linear-gradient(135deg, #fbbf24 0%, #d97706 100%);
       --active-row-bg: rgba(16, 185, 129, 0.06);
       --active-row-border: rgba(16, 185, 129, 0.25);
+      --scrollbar-track: rgba(11, 15, 25, 0.55);
+      --scrollbar-thumb: rgba(99, 102, 241, 0.45);
+      --scrollbar-thumb-hover: rgba(129, 140, 248, 0.72);
+    }
+
+    * {
+      scrollbar-width: thin;
+      scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    }
+
+    *::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+
+    *::-webkit-scrollbar-track {
+      background: var(--scrollbar-track);
+      border-radius: 999px;
+    }
+
+    *::-webkit-scrollbar-thumb {
+      background: linear-gradient(180deg, rgba(129, 140, 248, 0.68), rgba(79, 70, 229, 0.46));
+      border: 2px solid rgba(11, 15, 25, 0.72);
+      border-radius: 999px;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+    }
+
+    *::-webkit-scrollbar-thumb:hover {
+      background: linear-gradient(180deg, rgba(165, 180, 252, 0.9), rgba(99, 102, 241, 0.72));
+    }
+
+    *::-webkit-scrollbar-corner {
+      background: rgba(11, 15, 25, 0.72);
     }
 
     body {
@@ -3133,6 +3166,8 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 20px;
       width: 90%;
       max-width: 480px;
+      max-height: calc(100vh - 48px);
+      overflow-y: auto;
       padding: 32px;
       box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
       position: relative;
@@ -3655,7 +3690,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Proxy Pool API Docs Modal -->
   <div id="pool_api_docs_modal" class="modal">
-    <div class="modal-content" style="max-width: 860px; width: 95%;">
+    <div class="modal-content" style="max-width: 1080px; width: 96%;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 9l3 3-3 3m5 0h3M5 5h14a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2z" /></svg>
@@ -3731,7 +3766,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Proxy Pool Manage Modal -->
   <div id="pool_manage_modal" class="modal">
-    <div class="modal-content" style="max-width: 1180px; width: 96%;">
+    <div class="modal-content" style="max-width: 1440px; width: 98%;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M4 12h16M4 17h16" /></svg>
@@ -3769,8 +3804,8 @@ INDEX_HTML = r"""<!doctype html>
         <div style="font-weight: 700; color: var(--text-primary);">端口 / 槽位代理列表</div>
         <button type="button" onclick="loadPoolManageStatus()" class="btn-primary" style="height: 34px; padding: 0 14px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">刷新</button>
       </div>
-      <div style="overflow-x: auto; border: 1px solid var(--border-color); border-radius: 10px; max-height: 520px;">
-        <table style="width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1080px;">
+      <div style="overflow: auto; border: 1px solid var(--border-color); border-radius: 10px; max-height: 560px;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1240px;">
           <thead style="position: sticky; top: 0; background: #111827; z-index: 1;">
             <tr>
               <th style="text-align:left; padding: 10px;">槽位</th>
