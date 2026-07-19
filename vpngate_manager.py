@@ -3684,7 +3684,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
 
-      <div style="background: #050811; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 14px; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12px; line-height: 1.7; color: #a5b4fc; white-space: pre-wrap; word-break: break-all; margin-bottom: 16px;" id="pool_api_examples"></div>
+      <pre style="background: #050811; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 14px; margin: 0 0 16px 0; overflow-x: auto; white-space: pre; line-height: 1.7;"><code id="pool_api_examples" style="font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12px; color: #a5b4fc;"></code></pre>
 
       <div style="display: flex; justify-content: space-between; gap: 12px; align-items: center;">
         <button type="button" onclick="copyPoolApiExamples()" class="btn-primary" style="height: 38px; padding: 0 16px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">复制示例</button>
