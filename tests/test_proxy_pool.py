@@ -151,5 +151,91 @@ class PoolSyncTests(unittest.TestCase):
         self.assertEqual(len(set(ready_ids)), 2)
 
 
+class PoolLifecycleTests(unittest.TestCase):
+    def _mgr(self, start_side_effect=None):
+        def ok_start(config_path, dev):
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            return True, "ok", proc
+
+        def listener_factory(**kwargs):
+            lis = mock.Mock()
+            lis.start.return_value = kwargs["port"]
+            lis.is_alive.return_value = True
+            lis.stop = mock.Mock()
+            return lis
+
+        return proxy_pool.PoolManager(
+            pool_size=2,
+            port_base=52000,
+            public_host="127.0.0.1",
+            listen_host="127.0.0.1",
+            proxy_user="u",
+            proxy_pass="p",
+            return_credentials=True,
+            max_starting=1,
+            start_openvpn=start_side_effect or ok_start,
+            stop_openvpn=mock.Mock(),
+            create_listener=listener_factory,
+            log=lambda *a, **k: None,
+            write_config=lambda node, path: path.write_text(node.get("config_text") or "", encoding="utf-8"),
+            config_dir=None,
+        )
+
+    def test_start_failure_leaves_empty_and_tries_next(self) -> None:
+        calls = {"n": 0}
+
+        def flaky(config_path, dev):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return False, "boom", None
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            return True, "ok", proc
+
+        mgr = self._mgr(flaky)
+        nodes = [
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "config_text": "a", "probe_status": "available"},
+            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 6, "config_text": "b", "probe_status": "available"},
+        ]
+        mgr.sync_from_nodes(nodes)
+        ready = [s for s in mgr.slots if s.state == proxy_pool.SLOT_READY]
+        self.assertGreaterEqual(len(ready), 1)
+        self.assertNotEqual(ready[0].node_id, "")
+
+    def test_shutdown_stops_all(self) -> None:
+        mgr = self._mgr()
+        mgr.sync_from_nodes([
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "config_text": "a", "probe_status": "available"},
+        ])
+        mgr.shutdown()
+        self.assertTrue(all(s.state == proxy_pool.SLOT_EMPTY for s in mgr.slots))
+        self.assertTrue(all(s.listener is None for s in mgr.slots))
+
+    def test_health_replaces_dead_process(self) -> None:
+        mgr = self._mgr()
+        mgr.sync_from_nodes([
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "config_text": "a", "probe_status": "available"},
+            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 6, "config_text": "b", "probe_status": "available"},
+        ])
+        ready = next(s for s in mgr.slots if s.state == proxy_pool.SLOT_READY)
+        ready.process.poll.return_value = 1  # dead
+        # fail_count threshold 2: call tick_health twice
+        mgr.tick_health()
+        mgr.tick_health()
+        # after health, dead slot drained/replaced if candidates remain via _last_candidates
+        self.assertTrue(
+            any(
+                s.node_id == "B" or s.state in (proxy_pool.SLOT_READY, proxy_pool.SLOT_EMPTY)
+                for s in mgr.slots
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

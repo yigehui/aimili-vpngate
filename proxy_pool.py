@@ -276,8 +276,52 @@ class PoolManager:
                 self._temp_config_dir = None
 
     def tick_health(self) -> None:
-        # Task 5 expands health / replace; stub is fine for Task 3.
-        return
+        """Check READY slots; after consecutive failures, stop and replace."""
+        with self._lock:
+            to_replace: list[PoolSlot] = []
+            for slot in self.slots:
+                if slot.state != SLOT_READY:
+                    continue
+                unhealthy = False
+                if slot.process is None:
+                    unhealthy = True
+                else:
+                    try:
+                        if slot.process.poll() is not None:
+                            unhealthy = True
+                    except Exception:
+                        unhealthy = True
+                if not unhealthy:
+                    if slot.listener is None:
+                        unhealthy = True
+                    else:
+                        try:
+                            is_alive = getattr(slot.listener, "is_alive", None)
+                            if callable(is_alive) and not is_alive():
+                                unhealthy = True
+                        except Exception:
+                            unhealthy = True
+                if unhealthy:
+                    slot.fail_count += 1
+                    if slot.fail_count >= 2:
+                        to_replace.append(slot)
+                else:
+                    slot.fail_count = 0
+
+            for slot in to_replace:
+                old_id = slot.node_id
+                last_error = "health: process/listener dead"
+                self._stop_slot(slot)
+                slot.last_error = last_error
+                if old_id:
+                    self._skipped[old_id] = time.time() + 60
+                try:
+                    self.log("PoolSlot", f"health replace slot={slot.index} node={old_id}")
+                except Exception:
+                    pass
+
+            if to_replace:
+                self._fill_empty_slots()
 
     def list_proxies(
         self,
@@ -470,46 +514,44 @@ class PoolManager:
                 if slot.state == SLOT_READY and slot.node_id and slot.node_id not in available_ids:
                     self._stop_slot(slot)
 
-            used_ids = {
-                s.node_id
-                for s in self.slots
-                if s.state in (SLOT_READY, SLOT_STARTING) and s.node_id
-            }
-            unused = [n for n in candidates if self._node_id(n) not in used_ids]
+            self._fill_empty_slots()
 
-            starting_count = sum(1 for s in self.slots if s.state == SLOT_STARTING)
-            empty_slots = [s for s in self.slots if s.state == SLOT_EMPTY]
+    def _fill_empty_slots(self) -> None:
+        """Fill EMPTY slots from unused _last_candidates, respecting max_starting."""
+        candidates = list(self._last_candidates or [])
+        used_ids = {
+            s.node_id
+            for s in self.slots
+            if s.state in (SLOT_READY, SLOT_STARTING) and s.node_id
+        }
+        unused = [n for n in candidates if self._node_id(n) not in used_ids]
 
-            for slot in empty_slots:
-                if starting_count >= self.max_starting:
-                    break
-                if not unused:
-                    break
+        starting_count = sum(1 for s in self.slots if s.state == SLOT_STARTING)
+        # Per-call start budget also counts successful starts that become READY immediately.
+        starts_budget_used = 0
+        empty_slots = [s for s in self.slots if s.state == SLOT_EMPTY]
+
+        for slot in empty_slots:
+            if starts_budget_used + starting_count >= self.max_starting:
+                break
+            if not unused:
+                break
+            started = False
+            while unused and slot.state == SLOT_EMPTY:
                 node = unused.pop(0)
                 nid = self._node_id(node)
+                if nid in used_ids:
+                    continue
                 until = self._skipped.get(nid)
                 if until is not None and until > time.time():
                     continue
-                ok = self._start_slot(slot, node)
-                if ok:
-                    starting_count += 1  # briefly counted; marked READY immediately on success
+                if self._start_slot(slot, node):
                     used_ids.add(nid)
-                else:
-                    # try next candidate for same slot
-                    # (loop continues to next empty only if this slot stayed EMPTY)
-                    if slot.state == SLOT_EMPTY:
-                        # retry more candidates on this same slot
-                        while unused and slot.state == SLOT_EMPTY:
-                            node = unused.pop(0)
-                            nid = self._node_id(node)
-                            if nid in used_ids:
-                                continue
-                            until = self._skipped.get(nid)
-                            if until is not None and until > time.time():
-                                continue
-                            if self._start_slot(slot, node):
-                                used_ids.add(nid)
-                                break
+                    starts_budget_used += 1
+                    started = True
+                    break
+            if not started and not unused:
+                break
 
     def _start_slot(self, slot: PoolSlot, node: dict[str, Any]) -> bool:
         nid = self._node_id(node)
