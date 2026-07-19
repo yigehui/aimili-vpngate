@@ -4967,7 +4967,7 @@ function renderPoolApiDocs() {
       "",
       "# 手动用用户名密码测试固定槽位出口",
       "curl -x \"http://$USER:$PASS@POOL_PUBLIC_HOST:52000\" https://ifconfig.me"
-    ].join("\\n");
+    ].join("\n");
   }
 }
 
