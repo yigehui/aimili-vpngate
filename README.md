@@ -36,9 +36,49 @@ AimiliVPN 是一款基于官方 VPNGate 开放协议的高性能、零依赖 VPN
 
 #### 🌟 正式稳定版本 (main 分支)
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/yigehui/aimili-vpngate/main/install.sh)
 ```
 > 💡 **小贴士**：部署完成后，终端会输出管理网页的专属链接（含随机安全后缀，如 `http://your_vps_ip:8787/u71e9IXp4TPx`）。在终端中输入 `ml` 命令可以随时调出交互式命令行管理菜单。
+
+### 🧩 项目内服务器部署脚本
+
+如果你想使用和上面截图一样的远程脚本方式，也可以直接拉取项目内的部署脚本：
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/yigehui/aimili-vpngate/main/scripts/deploy_server.sh)
+```
+
+代理池模式一键部署：
+
+```bash
+AIMILI_MODE=pool \
+POOL_PUBLIC_HOST=你的VPS公网IP或域名 \
+POOL_SIZE=50 \
+POOL_PORT_BASE=52000 \
+POOL_PROXY_USER=你的代理用户名 \
+POOL_PROXY_PASS=你的代理密码 \
+bash <(curl -Ls https://raw.githubusercontent.com/yigehui/aimili-vpngate/main/scripts/deploy_server.sh)
+```
+
+如果你已经把当前项目上传/克隆到了服务器，也可以直接使用项目内脚本部署：
+
+```bash
+chmod +x scripts/deploy_server.sh
+sudo AIMILI_MODE=gateway ./scripts/deploy_server.sh
+```
+
+代理池模式部署示例：
+
+```bash
+sudo AIMILI_MODE=pool \
+  POOL_PUBLIC_HOST=你的VPS公网IP或域名 \
+  POOL_SIZE=50 \
+  POOL_PORT_BASE=52000 \
+  POOL_LISTEN_HOST=0.0.0.0 \
+  ./scripts/deploy_server.sh
+```
+
+脚本会安装依赖、部署代码、写入 `/etc/default/aimilivpn`、创建 systemd/OpenRC 服务并尝试放行防火墙端口。也可以在服务器安装目录复制 `.env.example` 为 `.env` 后配置运行参数，完整说明见 `docs/server-deployment.md`。
 
 ---
 
@@ -104,6 +144,14 @@ export POOL_LISTEN_HOST=0.0.0.0
 python3 vpngate_manager.py
 ```
 
+也可以复制根目录 `.env.example` 为 `.env` 后直接配置：
+
+```bash
+cp .env.example .env
+nano .env
+systemctl restart aimilivpn
+```
+
 凭据文件：`vpngate_data/pool_secrets.json`（权限建议 600）。首次启动会生成 `api_token`、`proxy_user`、`proxy_pass`。
 
 防火墙需放行 UI 端口（默认 `8787`）以及 `52000-52049/tcp`（按 `POOL_SIZE` 调整）：
@@ -123,13 +171,13 @@ ufw allow 52000:52049/tcp
 | --- | --- | --- |
 | GET | `/api/pool/status` | 槽位统计 |
 | GET | `/api/pool/health` | 存活探测 |
-| GET | `/api/pool/proxies` | 可用列表；`country=JP,KR`、`limit`、`offset`、`sort=latency\|country\|port` |
-| GET | `/api/pool/proxies/random` | 随机一个可用代理；可带 `country`；无可用时 404 |
+| GET | `/api/pool/proxies` | 可用列表；`country=JP,KR`、`ip_type=residential\|hosting\|mobile`、`limit`、`offset`、`sort=latency\|country\|port` |
+| GET | `/api/pool/proxies/random` | 随机一个可用代理；可带 `country`、`ip_type`；无可用时 404 |
 
 ```bash
 TOKEN=$(python3 -c "import json;print(json.load(open('vpngate_data/pool_secrets.json'))['api_token'])")
 curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/status"
-curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/proxies?country=JP&limit=10"
+curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/proxies?country=JP&ip_type=residential&limit=10"
 curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/proxies/random?country=US"
 # 使用返回的 http/socks5 URL，例如：
 curl -x "http://USER:PASS@$HOST:52003" https://ifconfig.me
@@ -218,7 +266,7 @@ Run the corresponding command on your Linux VPS as root:
 
 #### 🌟 Stable Release (main branch)
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/yigehui/aimili-vpngate/main/install.sh)
 ```
 
 > 💡 **Quick Note**: Once installed, copy the printed URL from the terminal to access the Web UI. Type the `ml` command in the terminal to summon the interactive CLI management console.
@@ -280,8 +328,8 @@ API (on the UI port, no web session; use Bearer / `X-API-Token`):
 
 - `GET /api/pool/status`
 - `GET /api/pool/health`
-- `GET /api/pool/proxies?country=JP,KR&limit=10&sort=latency`
-- `GET /api/pool/proxies/random?country=US`
+- `GET /api/pool/proxies?country=JP,KR&ip_type=residential&limit=10&sort=latency`
+- `GET /api/pool/proxies/random?country=US&ip_type=hosting`
 
 ```bash
 TOKEN=$(python3 -c "import json;print(json.load(open('vpngate_data/pool_secrets.json'))['api_token'])")

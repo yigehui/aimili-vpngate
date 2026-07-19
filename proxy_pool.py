@@ -26,6 +26,7 @@ StartOpenVpnFn = Callable[[str, str], tuple[bool, str, Any]]
 StopOpenVpnFn = Callable[[Any], None]
 CreateListenerFn = Callable[..., Any]
 WriteConfigFn = Callable[[dict[str, Any], Path], None]
+HealthCheckFn = Callable[[Any], tuple[bool, str, dict[str, Any]] | bool]
 
 
 def extract_api_token(headers: dict[str, str] | Any) -> str | None:
@@ -189,6 +190,7 @@ def parse_pool_query(qs: dict[str, list[str]]) -> dict[str, Any]:
         "offset": _int_field("offset", 0),
         "sort": _first("sort", "latency") or "latency",
         "protocol": _first("protocol", "all") or "all",
+        "ip_type": _first("ip_type", _first("type", "all")) or "all",
         "detail": detail,
     }
 
@@ -202,8 +204,12 @@ class PoolSlot:
         self.node_ip = ""
         self.country = ""
         self.country_name = ""
+        self.ip_type = ""
         self.latency_ms = 0
         self.updated_at = 0.0
+        self.last_health_at = 0.0
+        self.health_latency_ms = 0
+        self.exit_ip = ""
         self.process: Any = None
         self.listener: Any = None
         self.fail_count = 0
@@ -236,6 +242,8 @@ class PoolManager:
         create_listener: CreateListenerFn,
         log: LogFn,
         write_config: WriteConfigFn | None = None,
+        health_check: HealthCheckFn | None = None,
+        health_check_interval: int = 60,
         config_dir: str | Path | None = None,
     ) -> None:
         self.pool_size = int(pool_size)
@@ -251,6 +259,8 @@ class PoolManager:
         self.create_listener = create_listener
         self.log = log
         self.write_config = write_config
+        self.health_check = health_check
+        self.health_check_interval = max(5, int(health_check_interval or 60))
         self.config_dir = Path(config_dir) if config_dir else None
         self.api_token = ""
         self.slots: list[PoolSlot] = [PoolSlot(i, self.port_base) for i in range(self.pool_size)]
@@ -258,6 +268,7 @@ class PoolManager:
         self._last_candidates: list[dict[str, Any]] = []
         self._skipped: dict[str, float] = {}
         self._started = False
+        self._fill_thread: threading.Thread | None = None
         self._temp_config_dir: tempfile.TemporaryDirectory[str] | None = None
 
     def start(self) -> None:
@@ -276,13 +287,16 @@ class PoolManager:
                 self._temp_config_dir = None
 
     def tick_health(self) -> None:
-        """Check READY slots; after consecutive failures, stop and replace."""
+        """Check READY slots and request background refill when capacity is empty."""
+        to_probe: list[PoolSlot] = []
+        now = time.time()
         with self._lock:
-            to_replace: list[PoolSlot] = []
+            to_replace: list[tuple[PoolSlot, str]] = []
             for slot in self.slots:
                 if slot.state != SLOT_READY:
                     continue
                 unhealthy = False
+                reason = "health: process/listener dead"
                 if slot.process is None:
                     unhealthy = True
                 else:
@@ -301,27 +315,32 @@ class PoolManager:
                                 unhealthy = True
                         except Exception:
                             unhealthy = True
+                if not unhealthy and self.health_check is not None and now - slot.last_health_at >= self.health_check_interval:
+                    to_probe.append(slot)
+                    continue
                 if unhealthy:
                     slot.fail_count += 1
+                    slot.last_error = reason
                     if slot.fail_count >= 2:
-                        to_replace.append(slot)
+                        to_replace.append((slot, reason))
                 else:
                     slot.fail_count = 0
 
-            for slot in to_replace:
+            for slot, reason in to_replace:
                 old_id = slot.node_id
-                last_error = "health: process/listener dead"
                 self._stop_slot(slot)
-                slot.last_error = last_error
+                slot.last_error = reason
                 if old_id:
                     self._skipped[old_id] = time.time() + 60
                 try:
-                    self.log("PoolSlot", f"health replace slot={slot.index} node={old_id}")
+                    self.log("PoolSlot", f"health replace slot={slot.index} node={old_id}: {reason}")
                 except Exception:
                     pass
 
-            if to_replace:
-                self._fill_empty_slots()
+        for slot in to_probe:
+            self._probe_ready_slot(slot)
+
+        self._request_fill_slots()
 
     def list_proxies(
         self,
@@ -329,9 +348,10 @@ class PoolManager:
         limit: int = 0,
         offset: int = 0,
         sort: str = "latency",
+        ip_type: str = "all",
     ) -> dict[str, Any]:
         with self._lock:
-            slots = self._filtered_ready(country)
+            slots = self._filtered_ready(country, ip_type)
             slots = self._sort_slots(slots, sort)
             total = len(slots)
             off = max(0, int(offset or 0))
@@ -348,9 +368,9 @@ class PoolManager:
                 "proxies": proxies,
             }
 
-    def random_proxy(self, country: str = "") -> dict[str, Any] | None:
+    def random_proxy(self, country: str = "", ip_type: str = "all") -> dict[str, Any] | None:
         with self._lock:
-            slots = self._filtered_ready(country)
+            slots = self._filtered_ready(country, ip_type)
             if not slots:
                 return None
             return self._proxy_dict(random.choice(slots))
@@ -389,7 +409,11 @@ class PoolManager:
                         "state": s.state,
                         "node_id": s.node_id,
                         "country": s.country,
+                        "ip_type": s.ip_type,
                         "latency_ms": s.latency_ms,
+                        "health_latency_ms": s.health_latency_ms,
+                        "exit_ip": s.exit_ip,
+                        "last_health_at": s.last_health_at,
                         "fail_count": s.fail_count,
                         "last_error": s.last_error,
                     }
@@ -407,7 +431,10 @@ class PoolManager:
             "host": host,
             "country": slot.country,
             "country_name": slot.country_name,
+            "ip_type": slot.ip_type,
             "latency_ms": slot.latency_ms,
+            "health_latency_ms": slot.health_latency_ms,
+            "exit_ip": slot.exit_ip,
             "protocol": "http,socks5",
             "node_ip": slot.node_ip,
             "updated_at": slot.updated_at,
@@ -443,13 +470,28 @@ class PoolManager:
                     return True
         return False
 
-    def _filtered_ready(self, country: str) -> list[PoolSlot]:
+    def _ip_type_match(self, slot_ip_type: str, requested: str) -> bool:
+        req = (requested or "all").strip().casefold()
+        if req in ("", "all", "any"):
+            return True
+        value = (slot_ip_type or "").strip().casefold()
+        if req in ("residential", "resi", "res", "\u4f4f\u5b85", "\u4f4f\u5b85ip"):
+            return value in ("residential", "mobile")
+        if req in ("hosting", "datacenter", "dc", "\u673a\u623f", "\u673a\u623fip"):
+            return value == "hosting"
+        if req == "mobile":
+            return value == "mobile"
+        return value == req
+
+    def _filtered_ready(self, country: str, ip_type: str = "all") -> list[PoolSlot]:
         filters = self._parse_countries(country)
         ready: list[PoolSlot] = []
         for slot in self.slots:
             if slot.state != SLOT_READY:
                 continue
             if not self._country_match(slot.country, filters):
+                continue
+            if not self._ip_type_match(slot.ip_type, ip_type):
                 continue
             ready.append(slot)
         return ready
@@ -514,52 +556,76 @@ class PoolManager:
                 if slot.state == SLOT_READY and slot.node_id and slot.node_id not in available_ids:
                     self._stop_slot(slot)
 
-            self._fill_empty_slots()
+        self._request_fill_slots()
 
-    def _fill_empty_slots(self) -> None:
-        """Fill EMPTY slots from unused _last_candidates, respecting max_starting."""
+    def _request_fill_slots(self) -> None:
+        if not self._started:
+            return
+        with self._lock:
+            if self._fill_thread is not None and self._fill_thread.is_alive():
+                return
+            self._fill_thread = threading.Thread(target=self._fill_worker, name="proxy-pool-fill", daemon=True)
+            self._fill_thread.start()
+
+    def _fill_worker(self) -> None:
+        while True:
+            tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
+            with self._lock:
+                if not self._started:
+                    return
+                capacity = self.max_starting - sum(1 for s in self.slots if s.state == SLOT_STARTING)
+                for _ in range(max(0, capacity)):
+                    task = self._reserve_start_task_locked()
+                    if task is None:
+                        break
+                    tasks.append(task)
+            if not tasks:
+                return
+
+            threads: list[threading.Thread] = []
+            for slot, node in tasks:
+                t = threading.Thread(
+                    target=self._start_reserved_slot,
+                    args=(slot, node),
+                    name=f"proxy-pool-slot-{slot.index}",
+                    daemon=True,
+                )
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join()
+
+    def _reserve_start_task_locked(self) -> tuple[PoolSlot, dict[str, Any]] | None:
         candidates = list(self._last_candidates or [])
         used_ids = {
             s.node_id
             for s in self.slots
             if s.state in (SLOT_READY, SLOT_STARTING) and s.node_id
         }
-        unused = [n for n in candidates if self._node_id(n) not in used_ids]
-
-        starting_count = sum(1 for s in self.slots if s.state == SLOT_STARTING)
-        # Per-call start budget also counts successful starts that become READY immediately.
-        starts_budget_used = 0
         empty_slots = [s for s in self.slots if s.state == SLOT_EMPTY]
-
+        if not empty_slots:
+            return None
+        now = time.time()
         for slot in empty_slots:
-            if starts_budget_used + starting_count >= self.max_starting:
-                break
-            if not unused:
-                break
-            started = False
-            while unused and slot.state == SLOT_EMPTY:
-                node = unused.pop(0)
+            for node in candidates:
                 nid = self._node_id(node)
-                if nid in used_ids:
+                if not nid or nid in used_ids:
                     continue
                 until = self._skipped.get(nid)
-                if until is not None and until > time.time():
+                if until is not None and until > now:
                     continue
-                if self._start_slot(slot, node):
-                    used_ids.add(nid)
-                    starts_budget_used += 1
-                    started = True
-                    break
-            if not started and not unused:
-                break
+                self._assign_slot_metadata(slot, node)
+                return slot, node
+        return None
 
-    def _start_slot(self, slot: PoolSlot, node: dict[str, Any]) -> bool:
+    def _assign_slot_metadata(self, slot: PoolSlot, node: dict[str, Any]) -> None:
         nid = self._node_id(node)
         slot.state = SLOT_STARTING
         slot.node_id = nid
         slot.node_ip = str(node.get("ip") or node.get("node_ip") or "")
         slot.country = str(node.get("country_short") or node.get("country") or "")
         slot.country_name = str(node.get("country") or node.get("country_name") or slot.country)
+        slot.ip_type = str(node.get("ip_type") or "")
         try:
             slot.latency_ms = int(self._latency_key(node))
             if slot.latency_ms >= 10**9:
@@ -568,7 +634,15 @@ class PoolManager:
             slot.latency_ms = 0
         slot.last_error = ""
         slot.fail_count = 0
+        slot.last_health_at = 0.0
+        slot.health_latency_ms = 0
+        slot.exit_ip = ""
 
+    def _start_reserved_slot(self, slot: PoolSlot, node: dict[str, Any]) -> bool:
+        nid = self._node_id(node)
+        process = None
+        listener = None
+        path: Path | None = None
         try:
             root = self._config_root()
             safe_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in nid) or f"slot{slot.index}"
@@ -577,20 +651,19 @@ class PoolManager:
                 self.write_config(node, path)
             else:
                 path.write_text(str(node.get("config_text") or ""), encoding="utf-8")
-            slot.config_path = path
 
             ok, msg, process = self.start_openvpn(str(path), slot.tun_name)
             if not ok:
-                slot.last_error = msg or "start_openvpn failed"
-                self._skipped[nid] = time.time() + 60
-                self._reset_slot_fields(slot)
+                with self._lock:
+                    slot.last_error = msg or "start_openvpn failed"
+                    self._skipped[nid] = time.time() + 60
+                    self._reset_slot_fields(slot)
                 try:
-                    self.log("PoolSlot", f"start failed slot={slot.index} node={nid}: {slot.last_error}")
+                    self.log("PoolSlot", f"start failed slot={slot.index} node={nid}: {msg}")
                 except Exception:
                     pass
                 return False
 
-            slot.process = process
             listener = self.create_listener(
                 host=self.listen_host,
                 port=slot.port,
@@ -605,35 +678,73 @@ class PoolManager:
                     listener.start(background=True)
                 except TypeError:
                     listener.start()
-            slot.listener = listener
-            slot.updated_at = time.time()
-            slot.state = SLOT_READY
+            with self._lock:
+                slot.process = process
+                slot.listener = listener
+                slot.config_path = path
+                slot.updated_at = time.time()
+                slot.state = SLOT_READY
             try:
                 self.log("PoolSlot", f"READY slot={slot.index} port={slot.port} node={nid}")
             except Exception:
                 pass
             return True
         except Exception as exc:
-            slot.last_error = str(exc)
-            self._skipped[nid] = time.time() + 60
-            # best-effort cleanup
-            if slot.listener is not None:
+            if listener is not None:
                 try:
-                    slot.listener.stop()
+                    listener.stop()
                 except Exception:
                     pass
-            if slot.process is not None:
+            if process is not None:
                 try:
-                    self.stop_openvpn(slot.process)
+                    self.stop_openvpn(process)
                 except Exception:
                     pass
-            self._reset_slot_fields(slot)
+            with self._lock:
+                slot.last_error = str(exc)
+                self._skipped[nid] = time.time() + 60
+                self._reset_slot_fields(slot)
             try:
                 self.log("PoolSlot", f"start exception slot={slot.index} node={nid}: {exc}")
             except Exception:
                 pass
             return False
 
+    def _probe_ready_slot(self, slot: PoolSlot) -> None:
+        if self.health_check is None:
+            return
+        try:
+            checked = self.health_check(slot)
+            if isinstance(checked, tuple):
+                ok, message, meta = checked
+            else:
+                ok, message, meta = bool(checked), "", {}
+        except Exception as exc:
+            ok, message, meta = False, str(exc), {}
+        with self._lock:
+            if slot.state != SLOT_READY:
+                return
+            slot.last_health_at = time.time()
+            if ok:
+                slot.fail_count = 0
+                slot.last_error = ""
+                if isinstance(meta, dict):
+                    slot.health_latency_ms = int(meta.get("latency_ms") or slot.health_latency_ms or 0)
+                    slot.exit_ip = str(meta.get("exit_ip") or meta.get("ip") or slot.exit_ip or "")
+                return
+            slot.fail_count += 1
+            slot.last_error = message or "health_check failed"
+            if slot.fail_count >= 2:
+                old_id = slot.node_id
+                reason = slot.last_error
+                self._stop_slot(slot)
+                slot.last_error = reason
+                if old_id:
+                    self._skipped[old_id] = time.time() + 60
+                try:
+                    self.log("PoolSlot", f"health replace slot={slot.index} node={old_id}: {reason}")
+                except Exception:
+                    pass
     def _stop_slot(self, slot: PoolSlot) -> None:
         slot.state = SLOT_DRAINING
         if slot.listener is not None:
@@ -658,8 +769,12 @@ class PoolManager:
         slot.node_ip = ""
         slot.country = ""
         slot.country_name = ""
+        slot.ip_type = ""
         slot.latency_ms = 0
         slot.updated_at = 0
+        slot.last_health_at = 0
+        slot.health_latency_ms = 0
+        slot.exit_ip = ""
         slot.process = None
         slot.listener = None
         slot.config_path = None

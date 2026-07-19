@@ -75,6 +75,29 @@ class DualStackHTTPServer(ThreadingHTTPServer):
                 pass
         super().server_bind()
 
+ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
+
+def load_dotenv_file(path: Path) -> None:
+    if not path.is_file():
+        return
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+    except Exception as exc:
+        print(f"[配置警告] 读取 .env 文件失败: {exc}", flush=True)
+
+load_dotenv_file(ROOT_DIR / ".env")
+
 import vpn_utils
 import proxy_server
 import proxy_pool
@@ -122,7 +145,6 @@ UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
-ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
@@ -1329,8 +1351,12 @@ active_test_indexes = set()
 test_indexes_lock = threading.Lock()
 
 def get_free_test_index() -> int:
+    # Pool slots own tun0..tunN. In pool mode keep transient probes far away
+    # from fixed proxy-pool devices to avoid OpenVPN device-name collisions.
+    start_idx = 1000 if SERVICE_MODE == "pool" else 2
+    end_idx = start_idx + 200
     with test_indexes_lock:
-        for idx in range(2, 100):
+        for idx in range(start_idx, end_idx):
             if idx not in active_test_indexes:
                 active_test_indexes.add(idx)
                 return idx
@@ -3208,6 +3234,10 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
           网关设置
         </a>
+        <a href="javascript:void(0)" onclick="openPoolApiDocsModal()">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 9l3 3-3 3m5 0h3M5 5h14a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2z" /></svg>
+          代理池文档
+        </a>
         <a href="javascript:void(0)" onclick="openLogsModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
           日志
@@ -3539,6 +3569,82 @@ INDEX_HTML = r"""<!doctype html>
       
       <div style="display: flex; justify-content: flex-end; margin-top: 20px;">
         <button type="button" onclick="closeGatewayModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Proxy Pool API Docs Modal -->
+  <div id="pool_api_docs_modal" class="modal">
+    <div class="modal-content" style="max-width: 860px; width: 95%;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 9l3 3-3 3m5 0h3M5 5h14a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2z" /></svg>
+          代理池模式接口说明
+        </h3>
+        <button type="button" onclick="closePoolApiDocsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+
+      <div id="pool_api_runtime_summary" style="background: rgba(99,102,241,0.08); border: 1px solid rgba(99,102,241,0.18); border-radius: 10px; padding: 12px 14px; margin-bottom: 16px; font-size: 13px; color: var(--text-secondary); line-height: 1.6;">
+        正在读取当前运行状态...
+      </div>
+
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 16px;">
+        <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 12px;">
+          <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 6px;">启用方式</div>
+          <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.6;">服务器环境变量设置 <span class="mono">SERVICE_MODE=pool</span>，并配置 <span class="mono">POOL_PUBLIC_HOST</span> 后重启服务。</div>
+        </div>
+        <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 12px;">
+          <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 6px;">认证方式</div>
+          <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.6;">接口不使用网页登录态，使用 <span class="mono">Authorization: Bearer TOKEN</span> 或 <span class="mono">X-API-Token</span>。</div>
+        </div>
+        <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 12px;">
+          <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 6px;">Token / 用户名 / 密码</div>
+          <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.6;">配置优先级：环境变量 <span class="mono">POOL_API_TOKEN</span> / <span class="mono">POOL_PROXY_USER</span> / <span class="mono">POOL_PROXY_PASS</span> 优先；未设置时使用 <span class="mono">vpngate_data/pool_secrets.json</span>，首次池模式启动自动生成。</div>
+        </div>
+      </div>
+
+      <div style="overflow-x: auto; border: 1px solid var(--border-color); border-radius: 10px; margin-bottom: 16px;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+          <thead>
+            <tr style="background: rgba(255,255,255,0.04);">
+              <th style="text-align:left; padding: 10px;">方法</th>
+              <th style="text-align:left; padding: 10px;">接口</th>
+              <th style="text-align:left; padding: 10px;">说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td style="padding: 10px;" class="mono">GET</td><td style="padding: 10px;" class="mono">/api/pool/health</td><td style="padding: 10px;">服务存活检测</td></tr>
+            <tr><td style="padding: 10px;" class="mono">GET</td><td style="padding: 10px;" class="mono">/api/pool/status?detail=1</td><td style="padding: 10px;">池状态、槽位数量、详细槽位健康信息</td></tr>
+            <tr><td style="padding: 10px;" class="mono">GET</td><td style="padding: 10px;" class="mono">/api/pool/proxies</td><td style="padding: 10px;">获取可用代理列表</td></tr>
+            <tr><td style="padding: 10px;" class="mono">GET</td><td style="padding: 10px;" class="mono">/api/pool/proxies/random</td><td style="padding: 10px;">随机获取一个可用代理，无可用时返回 404</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 14px; margin-bottom: 16px;">
+        <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 8px;">代理池用户名密码在哪里配置</div>
+        <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.7;">
+          <div>1. 推荐在服务器安装目录配置 <span class="mono">/opt/aimilivpn/.env</span>：复制 <span class="mono">.env.example</span> 后填写 <span class="mono">POOL_PROXY_USER=你的用户名</span> 和 <span class="mono">POOL_PROXY_PASS=你的密码</span>，然后重启服务。</div>
+          <div>2. systemd 部署也可以写在 <span class="mono">/etc/default/aimilivpn</span>；部署脚本生成的服务会同时读取 <span class="mono">/etc/default/aimilivpn</span> 和 <span class="mono">/opt/aimilivpn/.env</span>。</div>
+          <div>3. 如果没有设置用户名密码，程序会自动生成并保存到：<span class="mono">/opt/aimilivpn/vpngate_data/pool_secrets.json</span>。</div>
+          <div>4. API 返回代理时，如果 <span class="mono">POOL_API_RETURN_CREDENTIALS=true</span>，结果里会包含 <span class="mono">username</span>、<span class="mono">password</span>、<span class="mono">http</span>、<span class="mono">socks5</span> 字段。</div>
+        </div>
+      </div>
+
+      <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 14px; margin-bottom: 16px;">
+        <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 8px;">查询参数</div>
+        <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.7;">
+          <span class="mono">country=JP,KR,US</span>：按国家代码过滤；<span class="mono">ip_type=residential|hosting|mobile</span>：按 IP 类型过滤，其中 <span class="mono">residential</span> 会包含住宅与移动；<span class="mono">limit</span> / <span class="mono">offset</span>：分页；<span class="mono">sort=latency|country|port</span>：排序。
+        </div>
+      </div>
+
+      <div style="background: #050811; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 14px; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12px; line-height: 1.7; color: #a5b4fc; white-space: pre-wrap; word-break: break-all; margin-bottom: 16px;" id="pool_api_examples"></div>
+
+      <div style="display: flex; justify-content: space-between; gap: 12px; align-items: center;">
+        <button type="button" onclick="copyPoolApiExamples()" class="btn-primary" style="height: 38px; padding: 0 16px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">复制示例</button>
+        <button type="button" onclick="closePoolApiDocsModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
       </div>
     </div>
   </div>
@@ -4705,6 +4811,68 @@ function closeGatewayModal() {
   }
 }
 
+function openPoolApiDocsModal() {
+  $("admin_dropdown").style.display = "none";
+  $("pool_api_docs_modal").style.display = "flex";
+  renderPoolApiDocs();
+}
+
+function closePoolApiDocsModal() {
+  $("pool_api_docs_modal").style.display = "none";
+}
+
+function renderPoolApiDocs() {
+  const summary = $("pool_api_runtime_summary");
+  const examples = $("pool_api_examples");
+  const origin = window.location.origin;
+  const pool = state && state.pool ? state.pool : null;
+  const mode = state && state.service_mode ? state.service_mode : "gateway";
+  if (summary) {
+    if (mode === "pool" && pool) {
+      const slots = pool.slots || {};
+      summary.innerHTML = `当前运行模式：<strong style="color: var(--success);">pool</strong>；池大小：<span class="mono">${esc(pool.pool_size)}</span>；端口起点：<span class="mono">${esc(pool.port_base)}</span>；Ready：<span class="mono">${esc(slots.ready || 0)}</span>；Starting：<span class="mono">${esc(slots.starting || 0)}</span>；Public Host：<span class="mono">${esc(pool.public_host || "-")}</span>`;
+    } else {
+      summary.innerHTML = `当前运行模式：<strong style="color: var(--warning);">${esc(mode)}</strong>。代理池接口只有在服务器以 <span class="mono">SERVICE_MODE=pool</span> 启动后才可用。`;
+    }
+  }
+  if (examples) {
+    examples.textContent = [
+      "# 读取服务器上的 Token 和代理用户名密码",
+      "TOKEN=$(python3 -c \"import json;print(json.load(open('/opt/aimilivpn/vpngate_data/pool_secrets.json'))['api_token'])\")",
+      "USER=$(python3 -c \"import json;print(json.load(open('/opt/aimilivpn/vpngate_data/pool_secrets.json'))['proxy_user'])\")",
+      "PASS=$(python3 -c \"import json;print(json.load(open('/opt/aimilivpn/vpngate_data/pool_secrets.json'))['proxy_pass'])\")",
+      "",
+      "# 查看池状态和槽位健康详情",
+      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/status?detail=1"`,
+      "",
+      "# 获取日本住宅/移动类型代理列表",
+      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies?country=JP&ip_type=residential&limit=10&sort=latency"`,
+      "",
+      "# 随机获取一个美国机房代理",
+      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies/random?country=US&ip_type=hosting"`,
+      "",
+      "# 手动用用户名密码测试固定槽位出口",
+      "curl -x \"http://$USER:$PASS@POOL_PUBLIC_HOST:52000\" https://ifconfig.me"
+    ].join("\\n");
+  }
+}
+
+function copyPoolApiExamples() {
+  const examples = $("pool_api_examples");
+  if (!examples) return;
+  navigator.clipboard.writeText(examples.textContent || "").then(() => {
+    alert("代理池接口示例已复制。");
+  }).catch(() => {
+    const ta = document.createElement("textarea");
+    ta.value = examples.textContent || "";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    alert("代理池接口示例已复制。");
+  });
+}
+
 async function loadGatewayStatus() {
   try {
     const res = await fetch("./api/gateway_status");
@@ -5158,7 +5326,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(pool_manager.status(detail=bool(q.get("detail"))))
             return
         if effective_path in ("/api/pool/proxies/random", "/api/pool/proxies/random/"):
-            item = pool_manager.random_proxy(country=q.get("country") or "")
+            item = pool_manager.random_proxy(country=q.get("country") or "", ip_type=q.get("ip_type") or "all")
             if item is None:
                 self.send_json({"ok": False, "error": "no_proxy_available"}, HTTPStatus.NOT_FOUND)
                 return
@@ -5171,6 +5339,7 @@ class Handler(BaseHTTPRequestHandler):
                     limit=int(q.get("limit") or 0),
                     offset=int(q.get("offset") or 0),
                     sort=str(q.get("sort") or "latency"),
+                    ip_type=str(q.get("ip_type") or "all"),
                 )
             )
             return
@@ -5829,6 +5998,29 @@ def pool_stop_openvpn(process) -> None:
     stop_process(process)
 
 
+def pool_check_slot_health(slot: proxy_pool.PoolSlot):
+    host = "127.0.0.1"
+    port = int(slot.port)
+    user = urllib.parse.quote(pool_manager.proxy_user if pool_manager is not None else "", safe="")
+    password = urllib.parse.quote(pool_manager.proxy_pass if pool_manager is not None else "", safe="")
+    auth = f"{user}:{password}@" if (user or password) else ""
+    proxy_url = f"http://{auth}{host}:{port}"
+    handlers = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    opener = urllib.request.build_opener(handlers)
+    started = time.time()
+    req = urllib.request.Request(
+        "https://api.ipify.org?format=json",
+        headers={"User-Agent": "aimili-vpngate-pool-health/1.0"},
+    )
+    with opener.open(req, timeout=10) as resp:
+        body = resp.read(1024 * 16).decode("utf-8", errors="replace")
+    data = json.loads(body)
+    exit_ip = str(data.get("ip") or "").strip()
+    if not exit_ip:
+        return False, "health_check: empty exit ip", {}
+    return True, "ok", {"exit_ip": exit_ip, "latency_ms": int((time.time() - started) * 1000)}
+
+
 def build_pool_manager() -> proxy_pool.PoolManager:
     secrets_path = DATA_DIR / "pool_secrets.json"
     cfg = proxy_pool.load_or_create_pool_config(secrets_path)
@@ -5837,7 +6029,7 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         flush=True,
     )
     if not str(cfg.get("public_host") or "").strip():
-        print("[Pool] 警告: public_host 为空，API 返回的代理 host 可能不可达；请设置 POOL_PUBLIC_HOST", flush=True)
+        raise RuntimeError("POOL_PUBLIC_HOST 不能为空：池模式 API 需要返回可被客户端访问的代理 host")
     mgr = proxy_pool.PoolManager(
         pool_size=int(cfg.get("pool_size", 50)),
         port_base=int(cfg.get("port_base", 52000)),
@@ -5852,6 +6044,8 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         create_listener=lambda **kw: proxy_server.create_proxy_listener(**kw),
         log=lambda module, msg: log_to_json("INFO", module, msg),
         write_config=pool_write_config,
+        health_check=pool_check_slot_health,
+        health_check_interval=60,
         config_dir=CONFIG_DIR / "pool",
     )
     mgr.api_token = str(cfg.get("api_token") or "")

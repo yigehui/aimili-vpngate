@@ -26,6 +26,7 @@ build/
 # ---- 运行时数据 ----
 vpngate_data/
 logs/
+.env
 *.log
 *.tmp
 *.pid
