@@ -82,6 +82,61 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
 
 ---
 
+### 🏊 代理池模式 (SERVICE_MODE=pool)
+
+除默认的**单隧道网关模式**（`SERVICE_MODE=gateway`，出口 `7928`）外，可切换为**代理池模式**：最多 50 个可用节点各自占用固定端口（默认 `52000` 起），对外提供 HTTP/SOCKS5 双协议代理，全局一套用户名密码；并通过 Token API 查询列表 / 随机取代理。
+
+> ⚠️ 网关模式与池模式**互斥**，不能同时运行。池模式会为每个槽位启动独立 OpenVPN（`tun0`…）与监听端口，建议 4C/24G 及以上 VPS，并限制并发启动（默认 `POOL_MAX_STARTING=5`）。
+
+#### 启用方式
+
+```bash
+# systemd 示例：编辑 /etc/default/aimilivpn 或 unit 环境变量后重启
+export SERVICE_MODE=pool
+export POOL_SIZE=50
+export POOL_PORT_BASE=52000
+export POOL_PUBLIC_HOST=你的VPS公网IP
+export POOL_LISTEN_HOST=0.0.0.0
+# 可选：自定义 API Token / 代理账号；留空则首次启动写入 vpngate_data/pool_secrets.json
+# export POOL_API_TOKEN=...
+# export POOL_PROXY_USER=...
+# export POOL_PROXY_PASS=...
+python3 vpngate_manager.py
+```
+
+凭据文件：`vpngate_data/pool_secrets.json`（权限建议 600）。首次启动会生成 `api_token`、`proxy_user`、`proxy_pass`。
+
+防火墙需放行 UI 端口（默认 `8787`）以及 `52000-52049/tcp`（按 `POOL_SIZE` 调整）：
+
+```bash
+ufw allow 8787/tcp
+ufw allow 52000:52049/tcp
+```
+
+#### Token API（池模式）
+
+接口挂在管理端口上，**不**走 Web 会话与安全后缀；使用 Header：
+
+- `Authorization: Bearer <api_token>` 或 `X-API-Token: <api_token>`
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/pool/status` | 槽位统计 |
+| GET | `/api/pool/health` | 存活探测 |
+| GET | `/api/pool/proxies` | 可用列表；`country=JP,KR`、`limit`、`offset`、`sort=latency\|country\|port` |
+| GET | `/api/pool/proxies/random` | 随机一个可用代理；可带 `country`；无可用时 404 |
+
+```bash
+TOKEN=$(python3 -c "import json;print(json.load(open('vpngate_data/pool_secrets.json'))['api_token'])")
+curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/status"
+curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/proxies?country=JP&limit=10"
+curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/proxies/random?country=US"
+# 使用返回的 http/socks5 URL，例如：
+curl -x "http://USER:PASS@$HOST:52003" https://ifconfig.me
+```
+
+---
+
 ### 🛠️ 核心功能与操作说明
 
 * **合并操作面板**：将“更新节点”与“立即检测补齐”合并，一键触发多线程拉取与测速。
@@ -201,6 +256,40 @@ To prevent unauthorized scanning and abuse of the proxy port on the public inter
   Configure your scrapers, frameworks, or utility tools on this VPS to send traffic via `127.0.0.1:7928`.
 
 > 💡 **Quick Note**: If you really need to open this proxy port to the public internet, you can set the environment variable `export LOCAL_PROXY_HOST="::"` before running the manager.
+
+---
+
+### 🏊 Proxy Pool Mode (`SERVICE_MODE=pool`)
+
+Besides the default **single-tunnel gateway** (`SERVICE_MODE=gateway`, local exit on `7928`), you can switch to **proxy pool mode**: up to 50 healthy nodes each get a fixed dual-protocol HTTP/SOCKS5 port (default from `52000`), one global proxy username/password, and a token API for list/random queries.
+
+> ⚠️ Gateway and pool modes are **mutually exclusive**. Pool mode runs one OpenVPN + listener per slot (`tun0`…); prefer 4C/24G+ VPS and keep `POOL_MAX_STARTING` modest (default 5).
+
+```bash
+export SERVICE_MODE=pool
+export POOL_SIZE=50
+export POOL_PORT_BASE=52000
+export POOL_PUBLIC_HOST=YOUR_VPS_PUBLIC_IP
+export POOL_LISTEN_HOST=0.0.0.0
+python3 vpngate_manager.py
+```
+
+Secrets are stored in `vpngate_data/pool_secrets.json` (generated on first pool boot). Open firewall for the UI port and `52000-52049/tcp`.
+
+API (on the UI port, no web session; use Bearer / `X-API-Token`):
+
+- `GET /api/pool/status`
+- `GET /api/pool/health`
+- `GET /api/pool/proxies?country=JP,KR&limit=10&sort=latency`
+- `GET /api/pool/proxies/random?country=US`
+
+```bash
+TOKEN=$(python3 -c "import json;print(json.load(open('vpngate_data/pool_secrets.json'))['api_token'])")
+curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/proxies?country=JP&limit=10"
+curl -x "http://USER:PASS@$HOST:52003" https://ifconfig.me
+```
+
+---
 
 ---
 

@@ -5850,7 +5850,7 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         start_openvpn=pool_start_openvpn,
         stop_openvpn=pool_stop_openvpn,
         create_listener=lambda **kw: proxy_server.create_proxy_listener(**kw),
-        log=lambda level, msg: log_to_json(level, "Pool", msg),
+        log=lambda module, msg: log_to_json("INFO", module, msg),
         write_config=pool_write_config,
         config_dir=CONFIG_DIR / "pool",
     )

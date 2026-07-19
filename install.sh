@@ -145,6 +145,12 @@ ExecStart=/usr/bin/python3 vpngate_manager.py
 Restart=always
 RestartSec=5
 EnvironmentFile=-/etc/default/aimilivpn
+# Optional pool mode (default is gateway). Uncomment to enable multi-port proxy pool:
+# Environment=SERVICE_MODE=pool
+# Environment=POOL_SIZE=50
+# Environment=POOL_PORT_BASE=52000
+# Environment=POOL_PUBLIC_HOST=YOUR_VPS_PUBLIC_IP
+# Environment=POOL_LISTEN_HOST=0.0.0.0
 
 [Install]
 WantedBy=multi-user.target
