@@ -77,6 +77,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+import proxy_pool
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -143,6 +144,13 @@ last_collector_heartbeat = 0.0
 last_checker_heartbeat = 0.0
 last_pinger_heartbeat = 0.0
 server_start_time = time.time()
+
+SERVICE_MODE = os.environ.get("SERVICE_MODE", "gateway").strip().lower()
+if SERVICE_MODE not in ("gateway", "pool"):
+    print(f"[配置警告] SERVICE_MODE={SERVICE_MODE!r} 无效，使用 gateway", flush=True)
+    SERVICE_MODE = "gateway"
+
+pool_manager: proxy_pool.PoolManager | None = None
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -380,7 +388,12 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["fav_fail_fallback"] = False
-    
+    state["service_mode"] = SERVICE_MODE
+    if SERVICE_MODE == "pool" and pool_manager is not None:
+        state["pool"] = pool_manager.status()
+    else:
+        state["pool"] = None
+
     return state
 
 def safe_name(value: str) -> str:
@@ -1722,28 +1735,29 @@ def maintain_valid_nodes(force: bool = False) -> str:
             return msg
         is_connecting = True
     try:
-        if force:
-            with lock:
-                stop_active_openvpn()
-            reconnect_fixed_node_if_needed(load_ui_config())
-        elif not active_openvpn_running():
-            ui_cfg = load_ui_config()
-            routing_mode = ui_cfg.get("routing_mode", "auto")
-            connection_enabled = ui_cfg.get("connection_enabled", True)
-            if connection_enabled:
-                if routing_mode == "fixed_ip":
-                    reconnect_fixed_node_if_needed(ui_cfg)
-                else:
-                    has_active_id = False
-                    with lock:
-                        if active_openvpn_node_id:
-                            has_active_id = True
-                            stop_active_openvpn()
-                    if has_active_id:
-                        print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
-                        is_connecting = False
-                        auto_switch_node()
-                        is_connecting = True
+        if SERVICE_MODE != "pool":
+            if force:
+                with lock:
+                    stop_active_openvpn()
+                reconnect_fixed_node_if_needed(load_ui_config())
+            elif not active_openvpn_running():
+                ui_cfg = load_ui_config()
+                routing_mode = ui_cfg.get("routing_mode", "auto")
+                connection_enabled = ui_cfg.get("connection_enabled", True)
+                if connection_enabled:
+                    if routing_mode == "fixed_ip":
+                        reconnect_fixed_node_if_needed(ui_cfg)
+                    else:
+                        has_active_id = False
+                        with lock:
+                            if active_openvpn_node_id:
+                                has_active_id = True
+                                stop_active_openvpn()
+                        if has_active_id:
+                            print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
+                            is_connecting = False
+                            auto_switch_node()
+                            is_connecting = True
 
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
@@ -1815,7 +1829,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
         initial_tested_ids: set[str] = set()
         ui_cfg = load_ui_config()
         should_fast_connect = (
-            ui_cfg.get("connection_enabled", True)
+            SERVICE_MODE != "pool"
+            and ui_cfg.get("connection_enabled", True)
             and ui_cfg.get("routing_mode", "auto") != "fixed_ip"
             and not active_openvpn_running()
         )
@@ -1899,23 +1914,28 @@ def maintain_valid_nodes(force: bool = False) -> str:
             print(f"[周期检测] {status_report}", flush=True)
             log_to_json("INFO", "Main", status_report)
             
-            if active_node != "无" and not active_openvpn_running():
-                warn_msg = f"[诊断警告] 活动节点 {active_node} 被标记为活动状态，但 OpenVPN 进程实际并未正常运行！"
-                print(warn_msg, flush=True)
-                log_to_json("WARNING", "Main", warn_msg)
-            
-            if not active_openvpn_running():
-                ui_cfg = load_ui_config()
-                connection_enabled = ui_cfg.get("connection_enabled", True)
-                if connection_enabled:
-                    routing_mode = ui_cfg.get("routing_mode", "auto")
-                    
-                    if routing_mode != "fixed_ip":
-                        available_candidates = [n for n in merged if n.get("probe_status") == "available"]
-                        available_candidates = apply_routing_filters(available_candidates, ui_cfg)
-                        
-                        if available_candidates:
-                            auto_switch_node()
+            if SERVICE_MODE != "pool":
+                if active_node != "无" and not active_openvpn_running():
+                    warn_msg = f"[诊断警告] 活动节点 {active_node} 被标记为活动状态，但 OpenVPN 进程实际并未正常运行！"
+                    print(warn_msg, flush=True)
+                    log_to_json("WARNING", "Main", warn_msg)
+
+                if not active_openvpn_running():
+                    ui_cfg = load_ui_config()
+                    connection_enabled = ui_cfg.get("connection_enabled", True)
+                    if connection_enabled:
+                        routing_mode = ui_cfg.get("routing_mode", "auto")
+
+                        if routing_mode != "fixed_ip":
+                            available_candidates = [n for n in merged if n.get("probe_status") == "available"]
+                            available_candidates = apply_routing_filters(available_candidates, ui_cfg)
+
+                            if available_candidates:
+                                auto_switch_node()
+
+        if SERVICE_MODE == "pool" and pool_manager is not None:
+            available = [n for n in read_nodes() if n.get("probe_status") == "available"]
+            pool_manager.sync_from_nodes(available)
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} non-active nodes."
@@ -4974,6 +4994,8 @@ def check_proxy_health() -> dict[str, Any]:
 
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting
+    if SERVICE_MODE == "pool":
+        return
     time.sleep(30)
     while True:
         last_checker_heartbeat = time.time()
@@ -5030,6 +5052,8 @@ def background_proxy_checker() -> None:
 
 def active_node_pinger() -> None:
     global last_pinger_heartbeat
+    if SERVICE_MODE == "pool":
+        return
     while True:
         last_pinger_heartbeat = time.time()
         try:
@@ -5091,8 +5115,10 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def validate_path(self) -> str:
-        secret_path = self.get_secret_path()
         request_path = urllib.parse.urlsplit(self.path).path
+        if request_path.startswith("/api/pool/") or request_path == "/api/pool":
+            return request_path
+        secret_path = self.get_secret_path()
         if not secret_path:
             return request_path
         if request_path == f"/{secret_path}":
@@ -5106,6 +5132,49 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.NOT_FOUND)
         self.end_headers()
         return ""
+
+    def _handle_pool_api(self, effective_path: str) -> None:
+        global pool_manager
+        if SERVICE_MODE != "pool" or pool_manager is None:
+            self.send_json({"ok": False, "error": "pool_mode_disabled"}, HTTPStatus.FORBIDDEN)
+            return
+        cfg_token = getattr(pool_manager, "api_token", "") or ""
+        provided = proxy_pool.extract_api_token(self.headers)
+        if not proxy_pool.token_matches(cfg_token, provided):
+            self.send_json({"ok": False, "error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+        parsed = urllib.parse.urlsplit(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        try:
+            q = proxy_pool.parse_pool_query(qs)
+        except ValueError as exc:
+            self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if effective_path in ("/api/pool/health", "/api/pool/health/"):
+            self.send_json({"ok": True, "mode": "pool"})
+            return
+        if effective_path in ("/api/pool/status", "/api/pool/status/"):
+            self.send_json(pool_manager.status(detail=bool(q.get("detail"))))
+            return
+        if effective_path in ("/api/pool/proxies/random", "/api/pool/proxies/random/"):
+            item = pool_manager.random_proxy(country=q.get("country") or "")
+            if item is None:
+                self.send_json({"ok": False, "error": "no_proxy_available"}, HTTPStatus.NOT_FOUND)
+                return
+            self.send_json({"ok": True, "proxy": item})
+            return
+        if effective_path in ("/api/pool/proxies", "/api/pool/proxies/"):
+            self.send_json(
+                pool_manager.list_proxies(
+                    country=q.get("country") or "",
+                    limit=int(q.get("limit") or 0),
+                    offset=int(q.get("offset") or 0),
+                    sort=str(q.get("sort") or "latency"),
+                )
+            )
+            return
+        self.send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
@@ -5140,8 +5209,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         effective_path = self.validate_path()
-        if effective_path == "": return
-        
+        if effective_path == "":
+            return
+
+        if effective_path.startswith("/api/pool"):
+            self._handle_pool_api(effective_path)
+            return
+
         if not self.is_authorized():
             if effective_path in ("/", "/index.html"):
                 self.send_bytes(LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8")
@@ -5735,10 +5809,70 @@ class Tee:
     def __getattr__(self, attr: str) -> Any:
         return getattr(self.stdout, attr)
 
+def pool_write_config(node: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(node.get("config_text") or "", encoding="utf-8")
+
+
+def pool_start_openvpn(config_path: str, dev: str):
+    # route_nopull=True ALWAYS in pool mode (no default route steal)
+    return run_openvpn_until_ready(
+        config_path,
+        keep_alive=True,
+        route_nopull=True,
+        timeout=OPENVPN_TEST_TIMEOUT_SECONDS,
+        dev=dev,
+    )
+
+
+def pool_stop_openvpn(process) -> None:
+    stop_process(process)
+
+
+def build_pool_manager() -> proxy_pool.PoolManager:
+    secrets_path = DATA_DIR / "pool_secrets.json"
+    cfg = proxy_pool.load_or_create_pool_config(secrets_path)
+    print(
+        f"[Pool] token/user loaded (token length={len(cfg['api_token'])}, user={cfg['proxy_user']})",
+        flush=True,
+    )
+    if not str(cfg.get("public_host") or "").strip():
+        print("[Pool] 警告: public_host 为空，API 返回的代理 host 可能不可达；请设置 POOL_PUBLIC_HOST", flush=True)
+    mgr = proxy_pool.PoolManager(
+        pool_size=int(cfg.get("pool_size", 50)),
+        port_base=int(cfg.get("port_base", 52000)),
+        public_host=str(cfg.get("public_host") or ""),
+        listen_host=str(cfg.get("listen_host") or "0.0.0.0"),
+        proxy_user=str(cfg["proxy_user"]),
+        proxy_pass=str(cfg["proxy_pass"]),
+        return_credentials=bool(cfg.get("return_credentials", True)),
+        max_starting=int(cfg.get("max_starting", 5)),
+        start_openvpn=pool_start_openvpn,
+        stop_openvpn=pool_stop_openvpn,
+        create_listener=lambda **kw: proxy_server.create_proxy_listener(**kw),
+        log=lambda level, msg: log_to_json(level, "Pool", msg),
+        write_config=pool_write_config,
+        config_dir=CONFIG_DIR / "pool",
+    )
+    mgr.api_token = str(cfg.get("api_token") or "")
+    return mgr
+
+
+def pool_health_loop() -> None:
+    while True:
+        try:
+            if pool_manager is not None:
+                pool_manager.tick_health()
+        except Exception as exc:
+            log_to_json("ERROR", "Pool", f"health loop: {exc}")
+        time.sleep(15)
+
+
 def main() -> None:
+    global pool_manager
     ensure_dirs()
     kill_existing_openvpn_processes()
-    
+
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
     sys.stdout = tee
@@ -5758,63 +5892,82 @@ def main() -> None:
             "is_connecting": True,
             "active_node_latency": "正在准备",
             "blacklisted_nodes": 0,
+            "service_mode": SERVICE_MODE,
         },
     )
-    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
-    
-    # Wait for the gateway to officially start
-    print("[网关] 正在启动代理网关...", flush=True)
-    gateway_ready = False
-    is_ipv6 = ":" in LOCAL_PROXY_HOST
-    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    for _ in range(30):
-        s = None
-        try:
-            s = socket.socket(af, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            connect_host = LOCAL_PROXY_HOST
-            if connect_host in ("::", "0.0.0.0", ""):
-                connect_host = "::1" if is_ipv6 else "127.0.0.1"
+
+    if SERVICE_MODE == "pool":
+        pool_manager = build_pool_manager()
+        pool_manager.start()
+        print(
+            f"[Pool] mode enabled size={pool_manager.pool_size} base_port={pool_manager.port_base}",
+            flush=True,
+        )
+        threading.Thread(target=collector_loop, daemon=True).start()
+        threading.Thread(target=pool_health_loop, daemon=True).start()
+    else:
+        threading.Thread(
+            target=proxy_server.start_proxy_server,
+            args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT),
+            daemon=True,
+        ).start()
+
+        # Wait for the gateway to officially start
+        print("[网关] 正在启动代理网关...", flush=True)
+        gateway_ready = False
+        is_ipv6 = ":" in LOCAL_PROXY_HOST
+        af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+        for _ in range(30):
+            s = None
             try:
-                s.connect((connect_host, LOCAL_PROXY_PORT))
-                gateway_ready = True
-                break
+                s = socket.socket(af, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                connect_host = LOCAL_PROXY_HOST
+                if connect_host in ("::", "0.0.0.0", ""):
+                    connect_host = "::1" if is_ipv6 else "127.0.0.1"
+                try:
+                    s.connect((connect_host, LOCAL_PROXY_PORT))
+                    gateway_ready = True
+                    break
+                except Exception:
+                    if connect_host == "::1":
+                        try:
+                            s.close()
+                            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            s.settimeout(0.5)
+                            s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
+                            gateway_ready = True
+                            break
+                        except Exception:
+                            pass
+                    raise
             except Exception:
-                if connect_host == "::1":
+                time.sleep(0.5)
+            finally:
+                if s is not None:
                     try:
                         s.close()
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.settimeout(0.5)
-                        s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
-                        gateway_ready = True
-                        break
                     except Exception:
                         pass
-                raise
-        except Exception:
-            time.sleep(0.5)
-        finally:
-            if s is not None:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-            
-    if gateway_ready:
-        print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)
-    else:
-        print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
-    threading.Thread(target=collector_loop, daemon=True).start()
-    threading.Thread(target=background_proxy_checker, daemon=True).start()
-    threading.Thread(target=active_node_pinger, daemon=True).start()
-    
+        if gateway_ready:
+            print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)
+        else:
+            print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
+
+        threading.Thread(target=collector_loop, daemon=True).start()
+        threading.Thread(target=background_proxy_checker, daemon=True).start()
+        threading.Thread(target=active_node_pinger, daemon=True).start()
+
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
     ui_port = bounded_int(ui_cfg.get("port"), UI_PORT, 1, 65535)
-    
+
     print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
-    print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
+    if SERVICE_MODE == "pool":
+        print(f"Mode: pool (API /api/pool/*)", flush=True)
+    else:
+        print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
     DualStackHTTPServer((ui_host, ui_port), Handler).serve_forever()
 
 if __name__ == "__main__":
