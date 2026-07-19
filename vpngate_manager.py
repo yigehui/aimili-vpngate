@@ -213,6 +213,46 @@ def read_json(path: Path, default: Any) -> Any:
         except (OSError, json.JSONDecodeError):
             return default
 
+def mask_secret(value: str, left: int = 6, right: int = 4) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    if len(text) <= left + right:
+        return "*" * len(text)
+    return f"{text[:left]}{'*' * 8}{text[-right:]}"
+
+def persist_pool_api_token(new_token: str) -> None:
+    global pool_manager
+    token = str(new_token or "").strip()
+    if len(token) < 16:
+        raise ValueError("API Token 至少需要 16 个字符")
+    if not re.match(r"^[A-Za-z0-9._~+=:@/-]+$", token):
+        raise ValueError("API Token 只能包含字母、数字和常见 URL 安全符号")
+
+    secrets_path = DATA_DIR / "pool_secrets.json"
+    with lock:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        data = read_json(secrets_path, {})
+        if not isinstance(data, dict):
+            data = {}
+        data["api_token"] = token
+        if pool_manager is not None:
+            data.setdefault("proxy_user", pool_manager.proxy_user)
+            data.setdefault("proxy_pass", pool_manager.proxy_pass)
+            data.setdefault("pool_size", pool_manager.pool_size)
+            data.setdefault("port_base", pool_manager.port_base)
+            data.setdefault("public_host", pool_manager.public_host)
+            data.setdefault("listen_host", pool_manager.listen_host)
+            data.setdefault("return_credentials", pool_manager.return_credentials)
+            data.setdefault("max_starting", pool_manager.max_starting)
+        write_json(secrets_path, data)
+        try:
+            os.chmod(secrets_path, 0o600)
+        except OSError:
+            pass
+        if pool_manager is not None:
+            pool_manager.api_token = token
+
 import hashlib
 import random
 
@@ -3203,8 +3243,8 @@ INDEX_HTML = r"""<!doctype html>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content">
-        <a href="https://github.com/baoweise-bot/aimili-vpngate" target="_blank">正式版</a>
-        <a href="https://github.com/baoweise-bot/aimili-vpngate/tree/bate" target="_blank">测试版</a>
+        <a href="https://github.com/yigehui/aimili-vpngate" target="_blank">正式版</a>
+        <a href="https://github.com/yigehui/aimili-vpngate/tree/bate" target="_blank">测试版</a>
       </div>
     </div>
     <a href="https://t.me/arestemple" target="_blank" class="btn-telegram">
@@ -3237,6 +3277,10 @@ INDEX_HTML = r"""<!doctype html>
         <a href="javascript:void(0)" onclick="openPoolApiDocsModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 9l3 3-3 3m5 0h3M5 5h14a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2z" /></svg>
           代理池文档
+        </a>
+        <a href="javascript:void(0)" onclick="openPoolManageModal()">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M4 12h16M4 17h16" /></svg>
+          代理池管理
         </a>
         <a href="javascript:void(0)" onclick="openLogsModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
@@ -3645,6 +3689,76 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display: flex; justify-content: space-between; gap: 12px; align-items: center;">
         <button type="button" onclick="copyPoolApiExamples()" class="btn-primary" style="height: 38px; padding: 0 16px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">复制示例</button>
         <button type="button" onclick="closePoolApiDocsModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Proxy Pool Manage Modal -->
+  <div id="pool_manage_modal" class="modal">
+    <div class="modal-content" style="max-width: 1180px; width: 96%;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px;">
+        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7h16M4 12h16M4 17h16" /></svg>
+          代理池管理
+        </h3>
+        <button type="button" onclick="closePoolManageModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+
+      <div id="pool_manage_notice" style="display:none; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.18); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; font-size: 13px; color: var(--text-secondary);"></div>
+
+      <div style="display: grid; grid-template-columns: minmax(260px, 1fr) minmax(320px, 1.4fr); gap: 14px; margin-bottom: 16px;">
+        <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 14px;">
+          <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 10px;">运行状态</div>
+          <div id="pool_manage_summary" style="font-size: 12px; color: var(--text-secondary); line-height: 1.8;">正在读取...</div>
+        </div>
+        <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 14px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px;">
+            <div>
+              <div style="font-weight: 700; color: var(--text-primary);">API Token</div>
+              <div id="pool_token_hint" style="font-size: 12px; color: var(--text-secondary); margin-top: 3px;">可在网页登录后直接修改代理池接口 Token。</div>
+            </div>
+            <button type="button" onclick="generatePoolApiToken()" class="btn-primary" style="height: 34px; padding: 0 12px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">随机生成</button>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <input id="pool_api_token_input" type="text" placeholder="输入新的 API Token，至少 16 位" style="flex: 1; height: 38px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--border-color); background: rgba(0,0,0,0.2); color: var(--text-primary);" />
+            <button type="button" onclick="savePoolApiToken()" class="btn-primary" style="height: 38px; padding: 0 16px;">保存 Token</button>
+          </div>
+          <div id="pool_token_result" style="display:none; margin-top: 8px; font-size: 12px;"></div>
+        </div>
+      </div>
+
+      <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap;">
+        <div style="font-weight: 700; color: var(--text-primary);">端口 / 槽位代理列表</div>
+        <button type="button" onclick="loadPoolManageStatus()" class="btn-primary" style="height: 34px; padding: 0 14px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">刷新</button>
+      </div>
+      <div style="overflow-x: auto; border: 1px solid var(--border-color); border-radius: 10px; max-height: 520px;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1080px;">
+          <thead style="position: sticky; top: 0; background: #111827; z-index: 1;">
+            <tr>
+              <th style="text-align:left; padding: 10px;">槽位</th>
+              <th style="text-align:left; padding: 10px;">端口</th>
+              <th style="text-align:left; padding: 10px;">状态</th>
+              <th style="text-align:left; padding: 10px;">国家</th>
+              <th style="text-align:left; padding: 10px;">IP 类型</th>
+              <th style="text-align:left; padding: 10px;">节点</th>
+              <th style="text-align:left; padding: 10px;">延迟</th>
+              <th style="text-align:left; padding: 10px;">健康</th>
+              <th style="text-align:left; padding: 10px;">出口 IP</th>
+              <th style="text-align:left; padding: 10px;">最近检测</th>
+              <th style="text-align:left; padding: 10px;">失败</th>
+              <th style="text-align:left; padding: 10px;">代理地址</th>
+            </tr>
+          </thead>
+          <tbody id="pool_manage_tbody">
+            <tr><td colspan="12" style="padding: 14px; color: var(--text-secondary);">正在读取...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div style="display: flex; justify-content: flex-end; gap: 12px; align-items: center; margin-top: 16px;">
+        <button type="button" onclick="closePoolManageModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
       </div>
     </div>
   </div>
@@ -4873,6 +4987,167 @@ function copyPoolApiExamples() {
   });
 }
 
+function copyText(text) {
+  navigator.clipboard.writeText(text || "").then(() => {
+    alert("已复制。");
+  }).catch(() => {
+    const ta = document.createElement("textarea");
+    ta.value = text || "";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    alert("已复制。");
+  });
+}
+
+let poolManagePollInterval = null;
+
+function poolStatusBadge(stateName) {
+  const st = String(stateName || "EMPTY");
+  const color = st === "READY" ? "var(--success)" : (st === "STARTING" ? "var(--warning)" : (st === "DRAINING" ? "#60a5fa" : "var(--text-secondary)"));
+  return `<span style="display:inline-flex; align-items:center; gap:5px; color:${color}; font-weight:700;"><span style="width:7px;height:7px;border-radius:999px;background:${color};display:inline-block;"></span>${esc(st)}</span>`;
+}
+
+function buildPoolProxyUrl(slot, pool) {
+  const host = pool && pool.public_host ? pool.public_host : window.location.hostname;
+  const port = slot && slot.port ? slot.port : "";
+  if (!port) return "";
+  return `http://${host}:${port}`;
+}
+
+function renderPoolManage(data) {
+  const notice = $("pool_manage_notice");
+  const summary = $("pool_manage_summary");
+  const tokenInput = $("pool_api_token_input");
+  const tokenHint = $("pool_token_hint");
+  const tbody = $("pool_manage_tbody");
+  if (!data || !data.ok) {
+    if (notice) {
+      notice.style.display = "block";
+      notice.textContent = data && data.error ? data.error : "代理池状态读取失败";
+    }
+    if (summary) summary.textContent = "不可用";
+    if (tbody) tbody.innerHTML = `<tr><td colspan="12" style="padding:14px;color:var(--text-secondary);">代理池不可用</td></tr>`;
+    return;
+  }
+  const pool = data.pool || {};
+  const slots = pool.slots || {};
+  if (notice) {
+    if (data.service_mode !== "pool") {
+      notice.style.display = "block";
+      notice.innerHTML = `当前不是 pool 模式：<span class="mono">${esc(data.service_mode || "-")}</span>。需要以 <span class="mono">SERVICE_MODE=pool</span> 启动后才会有端口槽位。`;
+    } else {
+      notice.style.display = "none";
+      notice.textContent = "";
+    }
+  }
+  if (summary) {
+    summary.innerHTML = [
+      `模式：<span class="mono">${esc(data.service_mode || "-")}</span>`,
+      `池大小：<span class="mono">${esc(pool.pool_size || 0)}</span>`,
+      `端口范围：<span class="mono">${esc(pool.port_base || "-")} - ${esc((pool.port_base || 0) + (pool.pool_size || 0) - 1 || "-")}</span>`,
+      `Ready / Starting / Empty：<span class="mono">${esc(slots.ready || 0)} / ${esc(slots.starting || 0)} / ${esc(slots.empty || 0)}</span>`,
+      `Public Host：<span class="mono">${esc(pool.public_host || "-")}</span>`,
+      `代理认证：<span class="mono">${pool.proxy_auth ? "已启用" : "未启用"}</span>`
+    ].join("<br>");
+  }
+  if (tokenHint) {
+    tokenHint.innerHTML = `当前 Token：<span class="mono">${esc(data.api_token_masked || "-")}</span>${data.env_token_set ? "；检测到环境变量 POOL_API_TOKEN，重启后会优先使用环境变量值。" : ""}`;
+  }
+  if (tokenInput && !tokenInput.value) {
+    tokenInput.placeholder = data.api_token_masked ? `当前：${data.api_token_masked}` : "输入新的 API Token，至少 16 位";
+  }
+  const details = Array.isArray(pool.slot_detail) ? pool.slot_detail : [];
+  if (!tbody) return;
+  if (!details.length) {
+    tbody.innerHTML = `<tr><td colspan="12" style="padding:14px;color:var(--text-secondary);">暂无槽位详情。请确认当前为 pool 模式。</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = details.map(slot => {
+    const proxyUrl = buildPoolProxyUrl(slot, pool);
+    const err = slot.last_error ? `<div style="max-width:220px;color:var(--danger);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(slot.last_error)}">${esc(slot.last_error)}</div>` : "";
+    return `<tr style="border-top: 1px solid rgba(255,255,255,0.05);">
+      <td style="padding: 9px;" class="mono">#${esc(slot.index)}</td>
+      <td style="padding: 9px;" class="mono">${esc(slot.port)}</td>
+      <td style="padding: 9px;">${poolStatusBadge(slot.state)}</td>
+      <td style="padding: 9px;">${esc(slot.country || "-")}</td>
+      <td style="padding: 9px;">${esc(slot.ip_type || "-")}</td>
+      <td style="padding: 9px; max-width: 150px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(slot.node_id || "")}">${esc(slot.node_id || "-")}</td>
+      <td style="padding: 9px;" class="mono">${slot.latency_ms ? esc(slot.latency_ms + "ms") : "-"}</td>
+      <td style="padding: 9px;" class="mono">${slot.health_latency_ms ? esc(slot.health_latency_ms + "ms") : "-"}</td>
+      <td style="padding: 9px;" class="mono">${esc(slot.exit_ip || "-")}</td>
+      <td style="padding: 9px;">${time(slot.last_health_at)}</td>
+      <td style="padding: 9px;" class="mono">${esc(slot.fail_count || 0)}${err}</td>
+      <td style="padding: 9px;"><span class="mono">${esc(proxyUrl || "-")}</span>${proxyUrl ? ` <button type="button" onclick="copyText('${esc(proxyUrl)}')" style="margin-left:6px;border:1px solid var(--border-color);background:rgba(255,255,255,0.04);color:var(--text-secondary);border-radius:6px;cursor:pointer;">复制</button>` : ""}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadPoolManageStatus() {
+  try {
+    const res = await fetch("./api/pool_admin/status");
+    const data = await res.json();
+    renderPoolManage(data);
+  } catch (e) {
+    renderPoolManage({ok:false, error:"连接服务器失败"});
+  }
+}
+
+function openPoolManageModal() {
+  $("admin_dropdown").style.display = "none";
+  $("pool_manage_modal").style.display = "flex";
+  loadPoolManageStatus();
+  if (poolManagePollInterval) clearInterval(poolManagePollInterval);
+  poolManagePollInterval = setInterval(loadPoolManageStatus, 5000);
+}
+
+function closePoolManageModal() {
+  $("pool_manage_modal").style.display = "none";
+  if (poolManagePollInterval) {
+    clearInterval(poolManagePollInterval);
+    poolManagePollInterval = null;
+  }
+}
+
+function generatePoolApiToken() {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-";
+  const arr = new Uint8Array(48);
+  crypto.getRandomValues(arr);
+  $("pool_api_token_input").value = Array.from(arr, b => chars[b % chars.length]).join("");
+}
+
+async function savePoolApiToken() {
+  const input = $("pool_api_token_input");
+  const result = $("pool_token_result");
+  const token = (input.value || "").trim();
+  if (result) {
+    result.style.display = "block";
+    result.style.color = "var(--text-secondary)";
+    result.textContent = "正在保存...";
+  }
+  try {
+    const res = await fetch("./api/pool_admin/update_token", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({api_token: token})
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "保存失败");
+    if (result) {
+      result.style.color = "var(--success)";
+      result.textContent = "API Token 已保存并即时生效。";
+    }
+    input.value = "";
+    await loadPoolManageStatus();
+  } catch (e) {
+    if (result) {
+      result.style.color = "var(--danger)";
+      result.textContent = e.message || "保存失败";
+    }
+  }
+}
+
 async function loadGatewayStatus() {
   try {
     const res = await fetch("./api/gateway_status");
@@ -5345,6 +5620,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
 
+    def _pool_admin_status(self) -> dict[str, Any]:
+        if SERVICE_MODE == "pool" and pool_manager is not None:
+            pool_status = pool_manager.status(detail=True)
+            token = getattr(pool_manager, "api_token", "") or ""
+        else:
+            pool_status = None
+            token = ""
+        return {
+            "ok": True,
+            "service_mode": SERVICE_MODE,
+            "pool": pool_status,
+            "api_token_masked": mask_secret(token),
+            "env_token_set": bool(os.environ.get("POOL_API_TOKEN")),
+        }
+
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
@@ -5381,7 +5671,7 @@ class Handler(BaseHTTPRequestHandler):
         if effective_path == "":
             return
 
-        if effective_path.startswith("/api/pool"):
+        if effective_path == "/api/pool" or effective_path.startswith("/api/pool/"):
             self._handle_pool_api(effective_path)
             return
 
@@ -5535,6 +5825,8 @@ class Handler(BaseHTTPRequestHandler):
                     pinger_status
                 ]
             })
+        elif effective_path == "/api/pool_admin/status":
+            self.send_json(self._pool_admin_status())
         elif effective_path == "/api/logs":
             logs_dir = DATA_DIR / "logs"
             date_str = time.strftime("%Y-%m-%d", time.localtime())
@@ -5622,6 +5914,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.is_authorized():
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
+        if effective_path == "/api/pool_admin/update_token":
+            try:
+                payload = self.read_json_body()
+                new_token = str(payload.get("api_token") or "").strip()
+                persist_pool_api_token(new_token)
+                self.send_json({
+                    "ok": True,
+                    "api_token_masked": mask_secret(new_token),
+                    "env_token_set": bool(os.environ.get("POOL_API_TOKEN")),
+                    "message": "API Token 已保存并即时生效",
+                })
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         if effective_path == "/api/update_credentials":

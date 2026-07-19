@@ -69,8 +69,16 @@ install_deps() {
   case "$mgr" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update -q || true
-      apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 rsync
+      apt-get clean || true
+      rm -rf /var/lib/apt/lists/*
+      apt-get update -o Acquire::Retries=3 -q
+      apt-get install -y --fix-missing openvpn curl git ca-certificates iptables iproute2 psmisc python3 rsync || {
+        echo -e "${YELLOW}apt install failed, cleaning indexes and retrying...${PLAIN}"
+        apt-get clean || true
+        rm -rf /var/lib/apt/lists/*
+        apt-get update -o Acquire::Retries=3 -q
+        apt-get install -y --fix-missing openvpn curl git ca-certificates iptables iproute2 psmisc python3 rsync
+      }
       ;;
     apk)
       apk update || true
