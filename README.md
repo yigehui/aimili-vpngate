@@ -137,6 +137,7 @@ export POOL_SIZE=50
 export POOL_PORT_BASE=52000
 export POOL_PUBLIC_HOST=你的VPS公网IP
 export POOL_LISTEN_HOST=0.0.0.0
+export POOL_REQUIRE_EXIT_IP=true
 # 可选：自定义 API Token / 代理账号；留空则首次启动写入 vpngate_data/pool_secrets.json
 # export POOL_API_TOKEN=...
 # export POOL_PROXY_USER=...
@@ -171,13 +172,13 @@ ufw allow 52000:52049/tcp
 | --- | --- | --- |
 | GET | `/api/pool/status` | 槽位统计 |
 | GET | `/api/pool/health` | 存活探测 |
-| GET | `/api/pool/proxies` | 可用列表；`country=JP,KR`、`ip_type=residential\|hosting\|mobile`、`limit`、`offset`、`sort=latency\|country\|port` |
-| GET | `/api/pool/proxies/random` | 随机一个可用代理；可带 `country`、`ip_type`；无可用时 404 |
+| GET | `/api/pool/proxies` | 可用列表；`country=JP,KR`、`ip_type=residential\|hosting\|mobile`、`limit`、`offset`、`sort=latency\|country\|port`、`require_exit_ip=0\|1` |
+| GET | `/api/pool/proxies/random` | 随机一个可用代理；可带 `country`、`ip_type`、`require_exit_ip`；无可用时 404 |
 
 ```bash
 TOKEN=$(python3 -c "import json;print(json.load(open('vpngate_data/pool_secrets.json'))['api_token'])")
 curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/status"
-curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/proxies?country=JP&ip_type=residential&limit=10"
+curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/proxies?country=JP&ip_type=residential&limit=10&require_exit_ip=1"
 curl -s -H "Authorization: Bearer $TOKEN" "http://$HOST:8787/api/pool/proxies/random?country=US"
 # 使用返回的 http/socks5 URL，例如：
 curl -x "http://USER:PASS@$HOST:52003" https://ifconfig.me
@@ -322,7 +323,7 @@ export POOL_LISTEN_HOST=0.0.0.0
 python3 vpngate_manager.py
 ```
 
-Secrets are stored in `vpngate_data/pool_secrets.json` (generated on first pool boot). Open firewall for the UI port and `52000-52049/tcp`.
+Secrets are stored in `vpngate_data/pool_secrets.json` (generated on first pool boot). `POOL_REQUIRE_EXIT_IP=true` is the default: pool APIs only expose slots after the health checker has confirmed their real exit IP. Open firewall for the UI port and `52000-52049/tcp`.
 
 API (on the UI port, no web session; use Bearer / `X-API-Token`):
 

@@ -5060,10 +5060,10 @@ function renderPoolApiDocs() {
       `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/status?detail=1"`,
       "",
       "# 获取日本住宅/移动类型代理列表，fallback_unknown=1 表示严格住宅为空时回退可用未知类型槽位",
-      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies?country=JP&ip_type=residential&fallback_unknown=1&limit=10&sort=latency"`,
+      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies?country=JP&ip_type=residential&fallback_unknown=1&limit=10&sort=latency&require_exit_ip=1"`,
       "",
       "# 随机获取一个住宅优先代理",
-      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies/random?ip_type=residential&fallback_unknown=1"`,
+      `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies/random?ip_type=residential&fallback_unknown=1&require_exit_ip=1"`,
       "",
       "# 随机获取一个美国机房代理",
       `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies/random?country=US&ip_type=hosting"`,
@@ -5708,6 +5708,7 @@ class Handler(BaseHTTPRequestHandler):
                 country=q.get("country") or "",
                 ip_type=q.get("ip_type") or "all",
                 fallback_unknown=bool(q.get("fallback_unknown")),
+                require_exit_ip=q.get("require_exit_ip"),
             )
             if item is None:
                 self.send_json({"ok": False, "error": "no_proxy_available"}, HTTPStatus.NOT_FOUND)
@@ -5723,6 +5724,7 @@ class Handler(BaseHTTPRequestHandler):
                     sort=str(q.get("sort") or "latency"),
                     ip_type=str(q.get("ip_type") or "all"),
                     fallback_unknown=bool(q.get("fallback_unknown")),
+                    require_exit_ip=q.get("require_exit_ip"),
                 )
             )
             return
@@ -6498,6 +6500,7 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         return_credentials=bool(cfg.get("return_credentials", True)),
         max_starting=int(cfg.get("max_starting", 5)),
         slot_start_timeout=int(cfg.get("slot_start_timeout", 90)),
+        require_exit_ip=bool(cfg.get("require_exit_ip", True)),
         start_openvpn=pool_start_openvpn,
         stop_openvpn=pool_stop_openvpn,
         create_listener=lambda **kw: proxy_server.create_proxy_listener(**kw),

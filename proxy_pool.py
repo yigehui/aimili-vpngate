@@ -56,7 +56,7 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
     Env overrides (preferred when set):
       POOL_API_TOKEN, POOL_PROXY_USER, POOL_PROXY_PASS, POOL_SIZE, POOL_PORT_BASE,
       POOL_PUBLIC_HOST, POOL_LISTEN_HOST, POOL_API_RETURN_CREDENTIALS, POOL_MAX_STARTING,
-      POOL_SLOT_START_TIMEOUT
+      POOL_SLOT_START_TIMEOUT, POOL_REQUIRE_EXIT_IP
     """
     path = Path(path)
     file_data: dict[str, Any] = {}
@@ -137,6 +137,7 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
         ),
         "max_starting": _pick_int("POOL_MAX_STARTING", "max_starting", 5),
         "slot_start_timeout": _pick_int("POOL_SLOT_START_TIMEOUT", "slot_start_timeout", 90),
+        "require_exit_ip": _pick_bool("POOL_REQUIRE_EXIT_IP", "require_exit_ip", True),
     }
 
     # Persist secrets when file missing or we generated new secrets
@@ -154,6 +155,7 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
             "return_credentials": cfg["return_credentials"],
             "max_starting": cfg["max_starting"],
             "slot_start_timeout": cfg["slot_start_timeout"],
+            "require_exit_ip": cfg["require_exit_ip"],
         }
         path.write_text(json.dumps(to_write, indent=2) + "\n", encoding="utf-8")
         try:
@@ -194,6 +196,12 @@ def parse_pool_query(qs: dict[str, list[str]]) -> dict[str, Any]:
     strict_raw = _first("strict", "").strip().lower()
     if strict_raw in ("0", "false", "no", "off"):
         fallback_unknown = True
+    require_exit_raw = _first("require_exit_ip", _first("strict_exit_ip", "")).strip().lower()
+    require_exit_ip = None
+    if require_exit_raw in ("1", "true", "yes", "on"):
+        require_exit_ip = True
+    elif require_exit_raw in ("0", "false", "no", "off"):
+        require_exit_ip = False
 
     return {
         "country": _first("country", ""),
@@ -204,6 +212,7 @@ def parse_pool_query(qs: dict[str, list[str]]) -> dict[str, Any]:
         "ip_type": _first("ip_type", _first("type", "all")) or "all",
         "detail": detail,
         "fallback_unknown": fallback_unknown,
+        "require_exit_ip": require_exit_ip,
     }
 
 
@@ -251,6 +260,7 @@ class PoolManager:
         return_credentials: bool,
         max_starting: int,
         slot_start_timeout: int = 90,
+        require_exit_ip: bool = True,
         start_openvpn: StartOpenVpnFn,
         stop_openvpn: StopOpenVpnFn,
         create_listener: CreateListenerFn,
@@ -269,6 +279,7 @@ class PoolManager:
         self.return_credentials = bool(return_credentials)
         self.max_starting = max(1, int(max_starting))
         self.slot_start_timeout = max(30, int(slot_start_timeout or 90))
+        self.require_exit_ip = bool(require_exit_ip)
         self.start_openvpn = start_openvpn
         self.stop_openvpn = stop_openvpn
         self.create_listener = create_listener
@@ -377,12 +388,14 @@ class PoolManager:
         sort: str = "latency",
         ip_type: str = "all",
         fallback_unknown: bool = False,
+        require_exit_ip: bool | None = None,
     ) -> dict[str, Any]:
         with self._lock:
-            slots = self._filtered_ready(country, ip_type)
+            strict_exit = self.require_exit_ip if require_exit_ip is None else bool(require_exit_ip)
+            slots = self._filtered_ready(country, ip_type, require_exit_ip=strict_exit)
             fallback_unknown_used = False
             if fallback_unknown and not slots and self._can_fallback_unknown(ip_type):
-                slots = self._filtered_ready(country, ip_type, include_unknown_ip_type=True)
+                slots = self._filtered_ready(country, ip_type, include_unknown_ip_type=True, require_exit_ip=strict_exit)
                 fallback_unknown_used = bool(slots)
             slots = self._sort_slots(slots, sort)
             total = len(slots)
@@ -399,6 +412,7 @@ class PoolManager:
                 "count": len(proxies),
                 "ip_type": ip_type or "all",
                 "fallback_unknown_used": fallback_unknown_used,
+                "require_exit_ip": strict_exit,
                 "proxies": proxies,
             }
 
@@ -407,17 +421,20 @@ class PoolManager:
         country: str = "",
         ip_type: str = "all",
         fallback_unknown: bool = False,
+        require_exit_ip: bool | None = None,
     ) -> dict[str, Any] | None:
         with self._lock:
-            slots = self._filtered_ready(country, ip_type)
+            strict_exit = self.require_exit_ip if require_exit_ip is None else bool(require_exit_ip)
+            slots = self._filtered_ready(country, ip_type, require_exit_ip=strict_exit)
             fallback_unknown_used = False
             if fallback_unknown and not slots and self._can_fallback_unknown(ip_type):
-                slots = self._filtered_ready(country, ip_type, include_unknown_ip_type=True)
+                slots = self._filtered_ready(country, ip_type, include_unknown_ip_type=True, require_exit_ip=strict_exit)
                 fallback_unknown_used = bool(slots)
             if not slots:
                 return None
             item = self._proxy_dict(random.choice(slots))
             item["fallback_unknown_used"] = fallback_unknown_used
+            item["require_exit_ip"] = strict_exit
             return item
 
     def status(self, detail: bool = False) -> dict[str, Any]:
@@ -445,6 +462,7 @@ class PoolManager:
                 "slots": counts,
                 "proxy_auth": bool(self.proxy_user or self.proxy_pass),
                 "public_host": self.public_host,
+                "require_exit_ip": self.require_exit_ip,
             }
             if detail:
                 result["slot_detail"] = [
@@ -540,11 +558,14 @@ class PoolManager:
         country: str,
         ip_type: str = "all",
         include_unknown_ip_type: bool = False,
+        require_exit_ip: bool = False,
     ) -> list[PoolSlot]:
         filters = self._parse_countries(country)
         ready: list[PoolSlot] = []
         for slot in self.slots:
             if slot.state != SLOT_READY:
+                continue
+            if require_exit_ip and not (slot.exit_ip or "").strip():
                 continue
             if not self._country_match(slot.country, filters):
                 continue

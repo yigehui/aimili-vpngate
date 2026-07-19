@@ -25,6 +25,7 @@ def _ready_slot(index: int, country: str, latency: int, node_id: str | None = No
     slot.latency_ms = latency
     slot.node_id = node_id or f"{country}_node_{index}"
     slot.node_ip = f"1.2.3.{index}"
+    slot.exit_ip = f"1.2.3.{index}"
     slot.updated_at = 1000 + index
     return slot
 
@@ -66,6 +67,17 @@ class PoolQueryTests(unittest.TestCase):
         self.assertEqual(item["node_ip"], "9.9.9.9")
         self.assertEqual(item["proxy_ip"], "9.9.9.9")
         self.assertEqual(item["entry_ip"], "1.2.3.0")
+
+
+    def test_require_exit_ip_filters_pending_health_slots(self) -> None:
+        self.mgr.slots[0].exit_ip = ""
+        strict = self.mgr.list_proxies(country="JP", sort="port")
+        self.assertEqual(strict["require_exit_ip"], True)
+        self.assertEqual(strict["total"], 1)
+        self.assertEqual(strict["proxies"][0]["port"], 52002)
+        loose = self.mgr.list_proxies(country="JP", sort="port", require_exit_ip=False)
+        self.assertEqual(loose["require_exit_ip"], False)
+        self.assertEqual(loose["total"], 2)
 
     def test_list_country_filter_and_limit(self) -> None:
         result = self.mgr.list_proxies(country="JP", limit=1, offset=0, sort="latency")
@@ -109,6 +121,7 @@ class PoolQueryTests(unittest.TestCase):
         unknown.ip_type = ""
         unknown.latency_ms = 30
         unknown.node_id = "KR_unknown"
+        unknown.exit_ip = "3.3.3.3"
         strict = self.mgr.list_proxies(country="KR", ip_type="residential")
         self.assertEqual(strict["total"], 0)
         fallback = self.mgr.list_proxies(country="KR", ip_type="residential", fallback_unknown=True)
