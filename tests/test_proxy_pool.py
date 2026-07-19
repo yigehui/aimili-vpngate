@@ -59,6 +59,14 @@ class PoolQueryTests(unittest.TestCase):
         self.assertEqual(self.mgr.slots[0].port, 52000)
         self.assertEqual(self.mgr.slots[2].port, 52002)
 
+    def test_proxy_dict_uses_exit_ip_as_node_ip(self) -> None:
+        self.mgr.slots[0].exit_ip = "9.9.9.9"
+        result = self.mgr.list_proxies(country="JP", limit=1, sort="port")
+        item = result["proxies"][0]
+        self.assertEqual(item["node_ip"], "9.9.9.9")
+        self.assertEqual(item["proxy_ip"], "9.9.9.9")
+        self.assertEqual(item["entry_ip"], "1.2.3.0")
+
     def test_list_country_filter_and_limit(self) -> None:
         result = self.mgr.list_proxies(country="JP", limit=1, offset=0, sort="latency")
         self.assertEqual(result["ok"], True)

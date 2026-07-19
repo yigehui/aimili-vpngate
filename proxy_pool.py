@@ -55,7 +55,8 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
 
     Env overrides (preferred when set):
       POOL_API_TOKEN, POOL_PROXY_USER, POOL_PROXY_PASS, POOL_SIZE, POOL_PORT_BASE,
-      POOL_PUBLIC_HOST, POOL_LISTEN_HOST, POOL_API_RETURN_CREDENTIALS, POOL_MAX_STARTING
+      POOL_PUBLIC_HOST, POOL_LISTEN_HOST, POOL_API_RETURN_CREDENTIALS, POOL_MAX_STARTING,
+      POOL_SLOT_START_TIMEOUT
     """
     path = Path(path)
     file_data: dict[str, Any] = {}
@@ -135,6 +136,7 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
             "POOL_API_RETURN_CREDENTIALS", "return_credentials", True
         ),
         "max_starting": _pick_int("POOL_MAX_STARTING", "max_starting", 5),
+        "slot_start_timeout": _pick_int("POOL_SLOT_START_TIMEOUT", "slot_start_timeout", 90),
     }
 
     # Persist secrets when file missing or we generated new secrets
@@ -151,6 +153,7 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
             "listen_host": cfg["listen_host"],
             "return_credentials": cfg["return_credentials"],
             "max_starting": cfg["max_starting"],
+            "slot_start_timeout": cfg["slot_start_timeout"],
         }
         path.write_text(json.dumps(to_write, indent=2) + "\n", encoding="utf-8")
         try:
@@ -216,6 +219,7 @@ class PoolSlot:
         self.ip_type = ""
         self.latency_ms = 0
         self.updated_at = 0.0
+        self.starting_at = 0.0
         self.last_health_at = 0.0
         self.health_latency_ms = 0
         self.exit_ip = ""
@@ -246,6 +250,7 @@ class PoolManager:
         proxy_pass: str,
         return_credentials: bool,
         max_starting: int,
+        slot_start_timeout: int = 90,
         start_openvpn: StartOpenVpnFn,
         stop_openvpn: StopOpenVpnFn,
         create_listener: CreateListenerFn,
@@ -263,6 +268,7 @@ class PoolManager:
         self.proxy_pass = proxy_pass
         self.return_credentials = bool(return_credentials)
         self.max_starting = max(1, int(max_starting))
+        self.slot_start_timeout = max(30, int(slot_start_timeout or 90))
         self.start_openvpn = start_openvpn
         self.stop_openvpn = stop_openvpn
         self.create_listener = create_listener
@@ -302,6 +308,18 @@ class PoolManager:
         with self._lock:
             to_replace: list[tuple[PoolSlot, str]] = []
             for slot in self.slots:
+                if slot.state == SLOT_STARTING:
+                    if slot.starting_at > 0 and now - slot.starting_at > self.slot_start_timeout:
+                        old_id = slot.node_id
+                        self._stop_slot(slot)
+                        slot.last_error = f"start timeout after {self.slot_start_timeout}s"
+                        if old_id:
+                            self._skipped[old_id] = time.time() + 60
+                        try:
+                            self.log("PoolSlot", f"start timeout reset slot={slot.index} node={old_id}")
+                        except Exception:
+                            pass
+                    continue
                 if slot.state != SLOT_READY:
                     continue
                 unhealthy = False
@@ -451,6 +469,7 @@ class PoolManager:
     def _proxy_dict(self, slot: PoolSlot) -> dict[str, Any]:
         host = self.public_host
         port = slot.port
+        proxy_ip = slot.exit_ip or slot.node_ip
         item: dict[str, Any] = {
             "id": slot.node_id,
             "slot": slot.index,
@@ -462,8 +481,10 @@ class PoolManager:
             "latency_ms": slot.latency_ms,
             "health_latency_ms": slot.health_latency_ms,
             "exit_ip": slot.exit_ip,
+            "entry_ip": slot.node_ip,
+            "proxy_ip": proxy_ip,
             "protocol": "http,socks5",
-            "node_ip": slot.node_ip,
+            "node_ip": proxy_ip,
             "updated_at": slot.updated_at,
         }
         if self.return_credentials:
@@ -631,7 +652,7 @@ class PoolManager:
                 t.start()
                 threads.append(t)
             for t in threads:
-                t.join()
+                t.join(timeout=self.slot_start_timeout)
 
     def _reserve_start_task_locked(self) -> tuple[PoolSlot, dict[str, Any]] | None:
         candidates = list(self._last_candidates or [])
@@ -659,6 +680,7 @@ class PoolManager:
     def _assign_slot_metadata(self, slot: PoolSlot, node: dict[str, Any]) -> None:
         nid = self._node_id(node)
         slot.state = SLOT_STARTING
+        slot.starting_at = time.time()
         slot.node_id = nid
         slot.node_ip = str(node.get("ip") or node.get("node_ip") or "")
         slot.country = str(node.get("country_short") or node.get("country") or "")
@@ -717,6 +739,16 @@ class PoolManager:
                 except TypeError:
                     listener.start()
             with self._lock:
+                if slot.state != SLOT_STARTING or slot.node_id != nid:
+                    try:
+                        listener.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self.stop_openvpn(process)
+                    except Exception:
+                        pass
+                    return False
                 slot.process = process
                 slot.listener = listener
                 slot.config_path = path
@@ -739,9 +771,10 @@ class PoolManager:
                 except Exception:
                     pass
             with self._lock:
-                slot.last_error = str(exc)
-                self._skipped[nid] = time.time() + 60
-                self._reset_slot_fields(slot)
+                if slot.node_id == nid:
+                    slot.last_error = str(exc)
+                    self._skipped[nid] = time.time() + 60
+                    self._reset_slot_fields(slot)
             try:
                 self.log("PoolSlot", f"start exception slot={slot.index} node={nid}: {exc}")
             except Exception:
@@ -810,6 +843,7 @@ class PoolManager:
         slot.ip_type = ""
         slot.latency_ms = 0
         slot.updated_at = 0
+        slot.starting_at = 0
         slot.last_health_at = 0
         slot.health_latency_ms = 0
         slot.exit_ip = ""

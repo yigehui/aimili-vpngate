@@ -265,6 +265,7 @@ def persist_pool_api_token(new_token: str) -> None:
             data.setdefault("listen_host", pool_manager.listen_host)
             data.setdefault("return_credentials", pool_manager.return_credentials)
             data.setdefault("max_starting", pool_manager.max_starting)
+            data.setdefault("slot_start_timeout", pool_manager.slot_start_timeout)
         write_json(secrets_path, data)
         try:
             os.chmod(secrets_path, 0o600)
@@ -6496,6 +6497,7 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         proxy_pass=str(cfg["proxy_pass"]),
         return_credentials=bool(cfg.get("return_credentials", True)),
         max_starting=int(cfg.get("max_starting", 5)),
+        slot_start_timeout=int(cfg.get("slot_start_timeout", 90)),
         start_openvpn=pool_start_openvpn,
         stop_openvpn=pool_stop_openvpn,
         create_listener=lambda **kw: proxy_server.create_proxy_listener(**kw),
