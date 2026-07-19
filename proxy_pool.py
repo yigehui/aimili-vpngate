@@ -5,7 +5,10 @@ Does not import vpngate_manager. OpenVPN/listener lifecycle is injected.
 """
 from __future__ import annotations
 
+import json
+import os
 import random
+import secrets
 import tempfile
 import threading
 import time
@@ -23,6 +26,171 @@ StartOpenVpnFn = Callable[[str, str], tuple[bool, str, Any]]
 StopOpenVpnFn = Callable[[Any], None]
 CreateListenerFn = Callable[..., Any]
 WriteConfigFn = Callable[[dict[str, Any], Path], None]
+
+
+def extract_api_token(headers: dict[str, str] | Any) -> str | None:
+    """Extract API token from Authorization Bearer or X-API-Token headers."""
+    get = headers.get if hasattr(headers, "get") else (lambda _k, _d=None: None)
+    auth = get("Authorization") or get("authorization")
+    if auth:
+        scheme, _, rest = str(auth).strip().partition(" ")
+        if scheme.lower() == "bearer" and rest:
+            return rest.strip()
+    tok = get("X-API-Token") or get("x-api-token")
+    if tok:
+        return str(tok).strip() or None
+    return None
+
+
+def token_matches(expected: str, provided: str | None) -> bool:
+    """Constant-time compare of expected vs provided API token."""
+    if not expected or provided is None:
+        return False
+    return secrets.compare_digest(str(expected), str(provided))
+
+
+def load_or_create_pool_config(path: Path) -> dict[str, Any]:
+    """Load pool secrets/config from JSON, creating defaults if missing.
+
+    Env overrides (preferred when set):
+      POOL_API_TOKEN, POOL_PROXY_USER, POOL_PROXY_PASS, POOL_SIZE, POOL_PORT_BASE,
+      POOL_PUBLIC_HOST, POOL_LISTEN_HOST, POOL_API_RETURN_CREDENTIALS, POOL_MAX_STARTING
+    """
+    path = Path(path)
+    file_data: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                file_data = loaded
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            file_data = {}
+
+    api_token = (
+        os.environ.get("POOL_API_TOKEN")
+        or file_data.get("api_token")
+        or ""
+    )
+    proxy_user = (
+        os.environ.get("POOL_PROXY_USER")
+        or file_data.get("proxy_user")
+        or ""
+    )
+    proxy_pass = (
+        os.environ.get("POOL_PROXY_PASS")
+        or file_data.get("proxy_pass")
+        or ""
+    )
+
+    created = False
+    if not api_token:
+        api_token = secrets.token_urlsafe(32)
+        created = True
+    if not proxy_user:
+        proxy_user = "pool_" + secrets.token_urlsafe(8)
+        created = True
+    if not proxy_pass:
+        proxy_pass = secrets.token_urlsafe(16)
+        created = True
+
+    # Numeric / host fields: env overrides file, else defaults
+    def _pick_int(env_name: str, file_key: str, default: int) -> int:
+        raw = os.environ.get(env_name)
+        if raw is not None and str(raw).strip() != "":
+            return int(str(raw).strip())
+        if file_key in file_data and file_data[file_key] is not None and str(file_data[file_key]).strip() != "":
+            return int(file_data[file_key])
+        return default
+
+    def _pick_str(env_name: str, file_key: str, default: str) -> str:
+        raw = os.environ.get(env_name)
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip()
+        val = file_data.get(file_key)
+        if val is not None and str(val).strip() != "":
+            return str(val).strip()
+        return default
+
+    def _pick_bool(env_name: str, file_key: str, default: bool) -> bool:
+        raw = os.environ.get(env_name)
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip().lower() in ("1", "true", "yes", "on")
+        if file_key in file_data and file_data[file_key] is not None:
+            val = file_data[file_key]
+            if isinstance(val, bool):
+                return val
+            return str(val).strip().lower() in ("1", "true", "yes", "on")
+        return default
+
+    cfg: dict[str, Any] = {
+        "api_token": str(api_token),
+        "proxy_user": str(proxy_user),
+        "proxy_pass": str(proxy_pass),
+        "pool_size": _pick_int("POOL_SIZE", "pool_size", 50),
+        "port_base": _pick_int("POOL_PORT_BASE", "port_base", 52000),
+        "public_host": _pick_str("POOL_PUBLIC_HOST", "public_host", ""),
+        "listen_host": _pick_str("POOL_LISTEN_HOST", "listen_host", "0.0.0.0"),
+        "return_credentials": _pick_bool(
+            "POOL_API_RETURN_CREDENTIALS", "return_credentials", True
+        ),
+        "max_starting": _pick_int("POOL_MAX_STARTING", "max_starting", 5),
+    }
+
+    # Persist secrets when file missing or we generated new secrets
+    if not path.is_file() or created:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Store secret-ish fields + useful defaults for re-read consistency
+        to_write = {
+            "api_token": cfg["api_token"],
+            "proxy_user": cfg["proxy_user"],
+            "proxy_pass": cfg["proxy_pass"],
+            "pool_size": cfg["pool_size"],
+            "port_base": cfg["port_base"],
+            "public_host": cfg["public_host"],
+            "listen_host": cfg["listen_host"],
+            "return_credentials": cfg["return_credentials"],
+            "max_starting": cfg["max_starting"],
+        }
+        path.write_text(json.dumps(to_write, indent=2) + "\n", encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    return cfg
+
+
+def parse_pool_query(qs: dict[str, list[str]]) -> dict[str, Any]:
+    """Parse pool API query parameters from parse_qs-style dict.
+
+    Raises ValueError on invalid integer fields.
+    """
+    def _first(key: str, default: str = "") -> str:
+        vals = qs.get(key) if qs else None
+        if not vals:
+            return default
+        return str(vals[0]) if vals[0] is not None else default
+
+    def _int_field(key: str, default: int = 0) -> int:
+        raw = _first(key, "")
+        if raw == "" or raw is None:
+            return default
+        try:
+            return int(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid {key}: {raw!r}") from exc
+
+    detail_raw = _first("detail", "").strip().lower()
+    detail = detail_raw in ("1", "true", "yes", "on")
+
+    return {
+        "country": _first("country", ""),
+        "limit": _int_field("limit", 0),
+        "offset": _int_field("offset", 0),
+        "sort": _first("sort", "latency") or "latency",
+        "protocol": _first("protocol", "all") or "all",
+        "detail": detail,
+    }
 
 
 class PoolSlot:
