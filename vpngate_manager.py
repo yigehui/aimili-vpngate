@@ -3403,7 +3403,7 @@ INDEX_HTML = r"""<!doctype html>
     <!-- 分页控制栏 -->
     <div class="pagination-container" style="padding: 16px; display: none; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
-        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
+        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条筛选结果 / 总数 <span id="total_node_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
       </div>
       <div style="display: flex; gap: 8px; align-items: center;">
         <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
@@ -3827,6 +3827,21 @@ INDEX_HTML = r"""<!doctype html>
         </table>
       </div>
 
+      <div id="pool_manage_pagination" style="padding: 14px 0 0 0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+        <div style="font-size: 13px; color: var(--text-secondary);">
+          显示第 <span id="pool_page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="pool_page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="pool_filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条槽位
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <button id="pool_btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
+          <button id="pool_btn_prev_page" class="connect-btn" style="height: 32px; padding: 0 10px;">上一页</button>
+          <span style="font-size: 13px; color: var(--text-secondary); margin: 0 8px;">
+            页码 <strong id="pool_current_page_val" style="color: var(--primary);">1</strong> / <strong id="pool_total_pages_val">1</strong>
+          </span>
+          <button id="pool_btn_next_page" class="connect-btn" style="height: 32px; padding: 0 10px;">下一页</button>
+          <button id="pool_btn_last_page" class="connect-btn" style="height: 32px; padding: 0 10px;">尾页</button>
+        </div>
+      </div>
+
       <div style="display: flex; justify-content: flex-end; gap: 12px; align-items: center; margin-top: 16px;">
         <button type="button" onclick="closePoolManageModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
       </div>
@@ -3883,8 +3898,11 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
-const pageSize = 99999;
+const pageSize = 50;
 let currentPageNodes = [];
+let poolManagePage = 1;
+const poolManagePageSize = 20;
+let poolManageLastData = null;
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -4257,6 +4275,7 @@ function render(){
   $("page_start").textContent = shown.length > 0 ? startIndex + 1 : 0;
   $("page_end").textContent = endIndex;
   $("filtered_count").textContent = shown.length;
+  $("total_node_count").textContent = nodes.length;
   $("current_page_val").textContent = currentPage;
   $("total_pages_val").textContent = totalPages;
   
@@ -5146,7 +5165,25 @@ function poolStatusBadge(stateName) {
   return `<span style="display:inline-flex; align-items:center; gap:5px; color:${color}; font-weight:700;"><span style="width:7px;height:7px;border-radius:999px;background:${color};display:inline-block;"></span>${esc(st)}</span>`;
 }
 
+function updatePoolManagePagination(total, startIndex, endIndex, totalPages) {
+  const setText = (id, value) => { const el = $(id); if (el) el.textContent = value; };
+  setText("pool_page_start", total > 0 ? startIndex + 1 : 0);
+  setText("pool_page_end", endIndex);
+  setText("pool_filtered_count", total);
+  setText("pool_current_page_val", poolManagePage);
+  setText("pool_total_pages_val", totalPages);
+  const first = $("pool_btn_first_page");
+  const prev = $("pool_btn_prev_page");
+  const next = $("pool_btn_next_page");
+  const last = $("pool_btn_last_page");
+  if (first) first.disabled = poolManagePage === 1;
+  if (prev) prev.disabled = poolManagePage === 1;
+  if (next) next.disabled = poolManagePage === totalPages;
+  if (last) last.disabled = poolManagePage === totalPages;
+}
+
 function renderPoolManage(data) {
+  poolManageLastData = data;
   const notice = $("pool_manage_notice");
   const summary = $("pool_manage_summary");
   const tokenInput = $("pool_api_token_input");
@@ -5159,6 +5196,7 @@ function renderPoolManage(data) {
     }
     if (summary) summary.textContent = "不可用";
     if (tbody) tbody.innerHTML = `<tr><td colspan="11" style="padding:14px;color:var(--text-secondary);">代理池不可用</td></tr>`;
+    updatePoolManagePagination(0, 0, 0, 1);
     return;
   }
   const pool = data.pool || {};
@@ -5192,9 +5230,17 @@ function renderPoolManage(data) {
   if (!tbody) return;
   if (!details.length) {
     tbody.innerHTML = `<tr><td colspan="11" style="padding:14px;color:var(--text-secondary);">暂无槽位详情。请确认当前为 pool 模式。</td></tr>`;
+    updatePoolManagePagination(0, 0, 0, 1);
     return;
   }
-  tbody.innerHTML = details.map(slot => {
+  const totalPoolPages = Math.ceil(details.length / poolManagePageSize) || 1;
+  if (poolManagePage > totalPoolPages) poolManagePage = totalPoolPages;
+  if (poolManagePage < 1) poolManagePage = 1;
+  const poolStartIndex = (poolManagePage - 1) * poolManagePageSize;
+  const poolEndIndex = Math.min(poolStartIndex + poolManagePageSize, details.length);
+  const pageDetails = details.slice(poolStartIndex, poolEndIndex);
+  updatePoolManagePagination(details.length, poolStartIndex, poolEndIndex, totalPoolPages);
+  tbody.innerHTML = pageDetails.map(slot => {
     const err = slot.last_error ? `<div style="max-width:220px;color:var(--danger);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(slot.last_error)}">${esc(slot.last_error)}</div>` : "";
     return `<tr style="border-top: 1px solid rgba(255,255,255,0.05);">
       <td style="padding: 9px;" class="mono">#${esc(slot.index)}</td>
@@ -5212,6 +5258,23 @@ function renderPoolManage(data) {
   }).join("");
 }
 
+function rerenderPoolManagePage() {
+  if (poolManageLastData) renderPoolManage(poolManageLastData);
+}
+
+$("pool_btn_first_page").onclick = () => { poolManagePage = 1; rerenderPoolManagePage(); };
+$("pool_btn_prev_page").onclick = () => { if (poolManagePage > 1) { poolManagePage--; rerenderPoolManagePage(); } };
+$("pool_btn_next_page").onclick = () => {
+  const details = poolManageLastData && poolManageLastData.pool && Array.isArray(poolManageLastData.pool.slot_detail) ? poolManageLastData.pool.slot_detail : [];
+  const totalPages = Math.ceil(details.length / poolManagePageSize) || 1;
+  if (poolManagePage < totalPages) { poolManagePage++; rerenderPoolManagePage(); }
+};
+$("pool_btn_last_page").onclick = () => {
+  const details = poolManageLastData && poolManageLastData.pool && Array.isArray(poolManageLastData.pool.slot_detail) ? poolManageLastData.pool.slot_detail : [];
+  poolManagePage = Math.ceil(details.length / poolManagePageSize) || 1;
+  rerenderPoolManagePage();
+};
+
 async function loadPoolManageStatus() {
   try {
     const res = await fetch("./api/pool_admin/status");
@@ -5225,6 +5288,7 @@ async function loadPoolManageStatus() {
 function openPoolManageModal() {
   $("admin_dropdown").style.display = "none";
   $("pool_manage_modal").style.display = "flex";
+  poolManagePage = 1;
   loadPoolManageStatus();
   if (poolManagePollInterval) clearInterval(poolManagePollInterval);
   poolManagePollInterval = setInterval(loadPoolManageStatus, 5000);
@@ -6532,6 +6596,7 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         log=lambda module, msg: log_to_json("INFO", module, msg),
         write_config=pool_write_config,
         health_check=pool_check_slot_health,
+        cleanup_port=lambda host, port: proxy_server.stop_registered_listener(host, port),
         health_check_interval=60,
         config_dir=CONFIG_DIR / "pool",
     )

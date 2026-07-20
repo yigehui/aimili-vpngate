@@ -9,6 +9,7 @@ import json
 import os
 import random
 import secrets
+import socket
 import tempfile
 import threading
 import time
@@ -27,6 +28,7 @@ StopOpenVpnFn = Callable[[Any], None]
 CreateListenerFn = Callable[..., Any]
 WriteConfigFn = Callable[[dict[str, Any], Path], None]
 HealthCheckFn = Callable[[Any], tuple[bool, str, dict[str, Any]] | bool]
+CleanupPortFn = Callable[[str, int], bool]
 
 
 def extract_api_token(headers: dict[str, str] | Any) -> str | None:
@@ -267,6 +269,7 @@ class PoolManager:
         log: LogFn,
         write_config: WriteConfigFn | None = None,
         health_check: HealthCheckFn | None = None,
+        cleanup_port: CleanupPortFn | None = None,
         health_check_interval: int = 60,
         config_dir: str | Path | None = None,
     ) -> None:
@@ -286,6 +289,7 @@ class PoolManager:
         self.log = log
         self.write_config = write_config
         self.health_check = health_check
+        self.cleanup_port = cleanup_port
         self.health_check_interval = max(5, int(health_check_interval or 60))
         self.config_dir = Path(config_dir) if config_dir else None
         self.api_token = ""
@@ -687,6 +691,8 @@ class PoolManager:
             return None
         now = time.time()
         for slot in empty_slots:
+            if not self._prepare_empty_slot_port(slot):
+                continue
             for node in candidates:
                 nid = self._node_id(node)
                 if not nid or nid in used_ids:
@@ -697,6 +703,45 @@ class PoolManager:
                 self._assign_slot_metadata(slot, node)
                 return slot, node
         return None
+
+    def _port_is_available(self, port: int) -> bool:
+        host = self.listen_host or "0.0.0.0"
+        is_ipv6 = ":" in host or host == ""
+        af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+        sock = None
+        try:
+            sock = socket.socket(af, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if is_ipv6:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                except OSError:
+                    pass
+            sock.bind((host, int(port)))
+            return True
+        except OSError:
+            return False
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def _prepare_empty_slot_port(self, slot: PoolSlot) -> bool:
+        if self.cleanup_port is not None:
+            try:
+                self.cleanup_port(self.listen_host, slot.port)
+            except Exception:
+                pass
+        if self._port_is_available(slot.port):
+            return True
+        slot.last_error = f"port {slot.port} occupied"
+        try:
+            self.log("PoolSlot", f"skip empty slot={slot.index} port={slot.port}: occupied")
+        except Exception:
+            pass
+        return False
 
     def _assign_slot_metadata(self, slot: PoolSlot, node: dict[str, Any]) -> None:
         nid = self._node_id(node)
@@ -735,6 +780,11 @@ class PoolManager:
 
             ok, msg, process = self.start_openvpn(str(path), slot.tun_name)
             if not ok:
+                if process is not None:
+                    try:
+                        self.stop_openvpn(process)
+                    except Exception:
+                        pass
                 with self._lock:
                     slot.last_error = msg or "start_openvpn failed"
                     self._skipped[nid] = time.time() + 60
@@ -744,6 +794,14 @@ class PoolManager:
                 except Exception:
                     pass
                 return False
+
+            with self._lock:
+                if slot.state != SLOT_STARTING or slot.node_id != nid:
+                    try:
+                        self.stop_openvpn(process)
+                    except Exception:
+                        pass
+                    return False
 
             listener = self.create_listener(
                 host=self.listen_host,

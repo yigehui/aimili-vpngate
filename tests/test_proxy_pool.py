@@ -305,6 +305,42 @@ class PoolLifecycleTests(unittest.TestCase):
         _wait_ready(mgr, 2)
         self.assertEqual(sum(1 for s in mgr.slots if s.state == proxy_pool.SLOT_READY), 2)
 
+    def test_refill_skips_empty_slot_when_port_is_occupied(self) -> None:
+        cleanup_calls: list[int] = []
+        mgr = proxy_pool.PoolManager(
+            pool_size=2,
+            port_base=52000,
+            public_host="127.0.0.1",
+            listen_host="127.0.0.1",
+            proxy_user="u",
+            proxy_pass="p",
+            return_credentials=True,
+            max_starting=2,
+            start_openvpn=lambda config_path, dev: (True, "ok", mock.Mock(poll=mock.Mock(return_value=None))),
+            stop_openvpn=mock.Mock(),
+            create_listener=lambda **kwargs: mock.Mock(
+                start=mock.Mock(return_value=kwargs["port"]),
+                is_alive=mock.Mock(return_value=True),
+                stop=mock.Mock(),
+            ),
+            log=lambda *a, **k: None,
+            write_config=lambda node, path: path.write_text(node.get("config_text") or "", encoding="utf-8"),
+            cleanup_port=lambda host, port: cleanup_calls.append(port) or False,
+        )
+        mgr._port_is_available = mock.Mock(side_effect=lambda port: int(port) != 52000)  # type: ignore[method-assign]
+        mgr.start()
+        mgr.sync_from_nodes([
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "config_text": "a", "probe_status": "available"},
+            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 6, "config_text": "b", "probe_status": "available"},
+        ])
+        _wait_ready(mgr, 1)
+        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_EMPTY)
+        self.assertIn("occupied", mgr.slots[0].last_error)
+        self.assertEqual(mgr.slots[1].state, proxy_pool.SLOT_READY)
+        self.assertIn(52000, cleanup_calls)
+
     def test_shutdown_stops_all(self) -> None:
         mgr = self._mgr()
         mgr.start()

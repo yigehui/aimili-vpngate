@@ -22,6 +22,28 @@ def parse_positive_int(value: str | None, default: int) -> int:
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
+_LISTENER_REGISTRY_LOCK = threading.RLock()
+_LISTENER_REGISTRY: dict[int, list["ProxyListener"]] = {}
+
+
+def stop_registered_listener(host: str, port: int) -> bool:
+    """Stop any in-process listener currently registered on this port."""
+    try:
+        port_i = int(port)
+    except (TypeError, ValueError):
+        return False
+    with _LISTENER_REGISTRY_LOCK:
+        listeners = list(_LISTENER_REGISTRY.get(port_i) or [])
+    stopped = False
+    for listener in listeners:
+        try:
+            if listener.is_alive():
+                listener.stop()
+                stopped = True
+        except Exception:
+            pass
+    return stopped
+
 def parse_int(value: Any) -> int:
     try:
         return int(value)
@@ -625,6 +647,10 @@ class ProxyListener:
         self._stop.clear()
         self._open_server_socket()
         self._alive = True
+        with _LISTENER_REGISTRY_LOCK:
+            bucket = _LISTENER_REGISTRY.setdefault(int(self.bound_port), [])
+            if self not in bucket:
+                bucket.append(self)
         if background:
             self._thread = threading.Thread(target=self._accept_loop, daemon=True)
             self._thread.start()
@@ -643,6 +669,15 @@ class ProxyListener:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
         self._alive = False
+        with _LISTENER_REGISTRY_LOCK:
+            bucket = _LISTENER_REGISTRY.get(int(self.bound_port))
+            if bucket:
+                try:
+                    bucket.remove(self)
+                except ValueError:
+                    pass
+                if not bucket:
+                    _LISTENER_REGISTRY.pop(int(self.bound_port), None)
 
     def is_alive(self) -> bool:
         return self._alive and not self._stop.is_set()
