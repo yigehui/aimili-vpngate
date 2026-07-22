@@ -31,6 +31,27 @@ HealthCheckFn = Callable[[Any], tuple[bool, str, dict[str, Any]] | bool]
 CleanupPortFn = Callable[[str, int], bool]
 
 
+class ShadowCandidate:
+    def __init__(self, *, index: int, tun_name: str, port: int) -> None:
+        self.index = index
+        self.tun_name = tun_name
+        self.port = port
+        self.node_id = ""
+        self.node_ip = ""
+        self.country = ""
+        self.country_name = ""
+        self.ip_type = ""
+        self.entry_ip_type = ""
+        self.latency_ms = 0
+        self.exit_ip = ""
+        self.health_latency_ms = 0
+        self.last_error = ""
+        self.started_at = 0.0
+        self.process: Any = None
+        self.listener: Any = None
+        self.config_path: Path | None = None
+
+
 def extract_api_token(headers: dict[str, str] | Any) -> str | None:
     """Extract API token from Authorization Bearer or X-API-Token headers."""
     get = headers.get if hasattr(headers, "get") else (lambda _k, _d=None: None)
@@ -138,7 +159,11 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
             "POOL_API_RETURN_CREDENTIALS", "return_credentials", True
         ),
         "max_starting": _pick_int("POOL_MAX_STARTING", "max_starting", 5),
+        "max_shadow_starting": _pick_int("POOL_MAX_SHADOW_STARTING", "max_shadow_starting", 5),
         "slot_start_timeout": _pick_int("POOL_SLOT_START_TIMEOUT", "slot_start_timeout", 90),
+        "replacement_grace_seconds": _pick_int("POOL_REPLACEMENT_GRACE_SECONDS", "replacement_grace_seconds", 180),
+        "shadow_port_base": _pick_int("POOL_SHADOW_PORT_BASE", "shadow_port_base", 53000),
+        "shadow_port_count": _pick_int("POOL_SHADOW_PORT_COUNT", "shadow_port_count", 200),
         "require_exit_ip": _pick_bool("POOL_REQUIRE_EXIT_IP", "require_exit_ip", True),
     }
 
@@ -156,7 +181,11 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
             "listen_host": cfg["listen_host"],
             "return_credentials": cfg["return_credentials"],
             "max_starting": cfg["max_starting"],
+            "max_shadow_starting": cfg["max_shadow_starting"],
             "slot_start_timeout": cfg["slot_start_timeout"],
+            "replacement_grace_seconds": cfg["replacement_grace_seconds"],
+            "shadow_port_base": cfg["shadow_port_base"],
+            "shadow_port_count": cfg["shadow_port_count"],
             "require_exit_ip": cfg["require_exit_ip"],
         }
         path.write_text(json.dumps(to_write, indent=2) + "\n", encoding="utf-8")
@@ -222,6 +251,7 @@ class PoolSlot:
     def __init__(self, index: int, port_base: int) -> None:
         self.index = index
         self.port_base = port_base
+        self.device_name = f"tun{self.index}"
         self.state = SLOT_EMPTY
         self.node_id = ""
         self.node_ip = ""
@@ -240,6 +270,11 @@ class PoolSlot:
         self.fail_count = 0
         self.last_error = ""
         self.config_path: Path | None = None
+        self.replacement_pending = False
+        self.replacement_reason = ""
+        self.replacement_requested_at = 0.0
+        self.replacement_deadline_at = 0.0
+        self.shadow: ShadowCandidate | None = None
 
     @property
     def port(self) -> int:
@@ -247,7 +282,7 @@ class PoolSlot:
 
     @property
     def tun_name(self) -> str:
-        return f"tun{self.index}"
+        return self.device_name
 
 
 class PoolManager:
@@ -273,6 +308,10 @@ class PoolManager:
         cleanup_port: CleanupPortFn | None = None,
         health_check_interval: int = 60,
         config_dir: str | Path | None = None,
+        max_shadow_starting: int = 5,
+        replacement_grace_seconds: int = 180,
+        shadow_port_base: int = 53000,
+        shadow_port_count: int = 200,
     ) -> None:
         self.pool_size = int(pool_size)
         self.port_base = int(port_base)
@@ -293,6 +332,10 @@ class PoolManager:
         self.cleanup_port = cleanup_port
         self.health_check_interval = max(5, int(health_check_interval or 60))
         self.config_dir = Path(config_dir) if config_dir else None
+        self.max_shadow_starting = max(1, int(max_shadow_starting or 5))
+        self.replacement_grace_seconds = max(0, int(replacement_grace_seconds or 180))
+        self.shadow_port_base = int(shadow_port_base or 53000)
+        self.shadow_port_count = max(1, int(shadow_port_count or 200))
         self.api_token = ""
         self.slots: list[PoolSlot] = [PoolSlot(i, self.port_base) for i in range(self.pool_size)]
         self._lock = threading.RLock()
@@ -316,6 +359,115 @@ class PoolManager:
                 except Exception:
                     pass
                 self._temp_config_dir = None
+
+    def _shadow_tun_name(self, slot: PoolSlot) -> str:
+        return f"tun{self.pool_size + slot.index}"
+
+    def _shadow_port(self, slot: PoolSlot) -> int:
+        return self.shadow_port_base + (slot.index % self.shadow_port_count)
+
+    def _shadow_inflight_count_locked(self) -> int:
+        return sum(1 for s in self.slots if s.shadow is not None)
+
+    def _cleanup_shadow_locked(self, slot: PoolSlot, keep_process: bool = False) -> None:
+        shadow = slot.shadow
+        if shadow is None:
+            return
+        if shadow.listener is not None:
+            try:
+                stop = getattr(shadow.listener, "stop", None)
+                if callable(stop):
+                    stop()
+            except Exception:
+                pass
+            shadow.listener = None
+        if not keep_process and shadow.process is not None:
+            try:
+                self.stop_openvpn(shadow.process)
+            except Exception:
+                pass
+            shadow.process = None
+        slot.shadow = None
+
+    def _reset_replacement_fields_locked(self, slot: PoolSlot) -> None:
+        slot.replacement_pending = False
+        slot.replacement_reason = ""
+        slot.replacement_requested_at = 0.0
+        slot.replacement_deadline_at = 0.0
+        self._cleanup_shadow_locked(slot)
+
+    def _shadow_meta_from_node(self, shadow: ShadowCandidate, node: dict[str, Any]) -> None:
+        shadow.node_id = self._node_id(node)
+        shadow.node_ip = str(node.get("ip") or node.get("node_ip") or "")
+        shadow.country = str(node.get("country_short") or node.get("country") or "")
+        shadow.country_name = str(node.get("country") or node.get("country_name") or shadow.country)
+        shadow.ip_type = str(node.get("ip_type") or "")
+        shadow.entry_ip_type = shadow.ip_type
+        try:
+            shadow.latency_ms = int(self._latency_key(node))
+            if shadow.latency_ms >= 10**9:
+                shadow.latency_ms = 0
+        except Exception:
+            shadow.latency_ms = 0
+
+    def _reserve_shadow_node_locked(self, slot: PoolSlot) -> dict[str, Any] | None:
+        candidates = list(self._last_candidates or [])
+        used_ids = {
+            s.node_id
+            for s in self.slots
+            if s.node_id and s.state in (SLOT_READY, SLOT_STARTING)
+        }
+        used_ids.update(
+            s.shadow.node_id
+            for s in self.slots
+            if s.shadow is not None and s.shadow.node_id
+        )
+        now = time.time()
+        for node in candidates:
+            nid = self._node_id(node)
+            if not nid or nid == slot.node_id or nid in used_ids:
+                continue
+            until = self._skipped.get(nid)
+            if until is not None and until > now:
+                continue
+            return node
+        return None
+
+    def _request_slot_replacement_locked(self, slot: PoolSlot, reason: str, now: float | None = None) -> None:
+        current = time.time() if now is None else now
+        if not slot.replacement_pending:
+            slot.replacement_pending = True
+            slot.replacement_reason = reason
+            slot.replacement_requested_at = current
+            slot.replacement_deadline_at = current + self.replacement_grace_seconds
+        else:
+            slot.replacement_reason = reason
+
+        if current >= slot.replacement_deadline_at:
+            old_id = slot.node_id
+            self._stop_slot(slot)
+            slot.last_error = reason
+            if old_id:
+                self._skipped[old_id] = time.time() + 60
+            return
+
+        if slot.shadow is not None:
+            return
+        if self._shadow_inflight_count_locked() >= self.max_shadow_starting:
+            return
+        node = self._reserve_shadow_node_locked(slot)
+        if node is None:
+            return
+        shadow = ShadowCandidate(index=slot.index, tun_name=self._shadow_tun_name(slot), port=self._shadow_port(slot))
+        self._shadow_meta_from_node(shadow, node)
+        slot.shadow = shadow
+        thread = threading.Thread(
+            target=self._start_shadow_for_slot,
+            args=(slot, node),
+            name=f"proxy-pool-shadow-{slot.index}",
+            daemon=True,
+        )
+        thread.start()
 
     def tick_health(self) -> None:
         """Check READY slots and request background refill when capacity is empty."""
@@ -371,14 +523,21 @@ class PoolManager:
 
             for slot, reason in to_replace:
                 old_id = slot.node_id
-                self._stop_slot(slot)
-                slot.last_error = reason
-                if old_id:
-                    self._skipped[old_id] = time.time() + 60
-                try:
-                    self.log("PoolSlot", f"health replace slot={slot.index} node={old_id}: {reason}")
-                except Exception:
-                    pass
+                if slot.process is not None and slot.listener is not None:
+                    self._request_slot_replacement_locked(slot, reason, now)
+                    try:
+                        self.log("PoolSlot", f"health replacement pending slot={slot.index} node={old_id}: {reason}")
+                    except Exception:
+                        pass
+                else:
+                    self._stop_slot(slot)
+                    slot.last_error = reason
+                    if old_id:
+                        self._skipped[old_id] = time.time() + 60
+                    try:
+                        self.log("PoolSlot", f"health replace slot={slot.index} node={old_id}: {reason}")
+                    except Exception:
+                        pass
 
         for slot in to_probe:
             self._probe_ready_slot(slot)
@@ -485,6 +644,10 @@ class PoolManager:
                         "last_health_at": s.last_health_at,
                         "fail_count": s.fail_count,
                         "last_error": s.last_error,
+                        "replacement_pending": s.replacement_pending,
+                        "replacement_reason": s.replacement_reason,
+                        "replacement_deadline_at": s.replacement_deadline_at,
+                        "shadow_node_id": s.shadow.node_id if s.shadow is not None else "",
                     }
                     for s in self.slots
                 ]
@@ -751,6 +914,7 @@ class PoolManager:
     def _assign_slot_metadata(self, slot: PoolSlot, node: dict[str, Any]) -> None:
         nid = self._node_id(node)
         slot.state = SLOT_STARTING
+        slot.device_name = f"tun{slot.index}"
         slot.starting_at = time.time()
         slot.node_id = nid
         slot.node_ip = str(node.get("ip") or node.get("node_ip") or "")
@@ -769,6 +933,7 @@ class PoolManager:
         slot.last_health_at = 0.0
         slot.health_latency_ms = 0
         slot.exit_ip = ""
+        self._reset_replacement_fields_locked(slot)
 
     def _start_reserved_slot(self, slot: PoolSlot, node: dict[str, Any]) -> bool:
         nid = self._node_id(node)
@@ -866,6 +1031,214 @@ class PoolManager:
                 pass
             return False
 
+    def _start_shadow_for_slot(self, slot: PoolSlot, node: dict[str, Any]) -> bool:
+        shadow: ShadowCandidate | None
+        with self._lock:
+            shadow = slot.shadow
+            if shadow is None or not slot.replacement_pending:
+                return False
+            if shadow.node_id != self._node_id(node):
+                return False
+        nid = self._node_id(node)
+        process = None
+        listener = None
+        path: Path | None = None
+        try:
+            root = self._config_root()
+            safe_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in nid) or f"shadow{slot.index}"
+            path = root / f"pool_shadow_{slot.index}_{safe_id}.ovpn"
+            if self.write_config is not None:
+                self.write_config(node, path)
+            else:
+                path.write_text(str(node.get("config_text") or ""), encoding="utf-8")
+
+            ok, msg, process = self.start_openvpn(str(path), shadow.tun_name)
+            if not ok:
+                if process is not None:
+                    try:
+                        self.stop_openvpn(process)
+                    except Exception:
+                        pass
+                with self._lock:
+                    if slot.shadow is not None and slot.shadow.node_id == nid:
+                        slot.last_error = msg or "shadow start_openvpn failed"
+                        self._skipped[nid] = time.time() + 60
+                        self._cleanup_shadow_locked(slot)
+                return False
+
+            listener = self.create_listener(
+                host=self.listen_host,
+                port=shadow.port,
+                username=self.proxy_user,
+                password=self.proxy_pass,
+                bind_device=shadow.tun_name,
+                require_auth=True,
+                max_connections=None,
+            )
+            if hasattr(listener, "start"):
+                try:
+                    listener.start(background=True)
+                except TypeError:
+                    listener.start()
+
+            meta: dict[str, Any] = {}
+            if self.health_check is not None:
+                try:
+                    checked = self.health_check(shadow)
+                    if isinstance(checked, tuple):
+                        ok, msg, meta = checked
+                    else:
+                        ok, msg, meta = bool(checked), "", {}
+                except Exception as exc:
+                    ok, msg, meta = False, str(exc), {}
+                if not ok:
+                    try:
+                        stop = getattr(listener, "stop", None)
+                        if callable(stop):
+                            stop()
+                    except Exception:
+                        pass
+                    try:
+                        self.stop_openvpn(process)
+                    except Exception:
+                        pass
+                    with self._lock:
+                        if slot.shadow is not None and slot.shadow.node_id == nid:
+                            slot.last_error = msg or "shadow health_check failed"
+                            self._skipped[nid] = time.time() + 60
+                            self._cleanup_shadow_locked(slot)
+                    return False
+
+            with self._lock:
+                current_shadow = slot.shadow
+                if current_shadow is None or current_shadow.node_id != nid or not slot.replacement_pending:
+                    try:
+                        stop = getattr(listener, "stop", None)
+                        if callable(stop):
+                            stop()
+                    except Exception:
+                        pass
+                    try:
+                        self.stop_openvpn(process)
+                    except Exception:
+                        pass
+                    return False
+                current_shadow.process = process
+                current_shadow.listener = listener
+                current_shadow.config_path = path
+                current_shadow.started_at = time.time()
+                current_shadow.exit_ip = str(meta.get("exit_ip") or meta.get("ip") or "")
+                current_shadow.health_latency_ms = int(meta.get("latency_ms") or 0)
+                current_shadow.last_error = ""
+                exit_ip_type = str(meta.get("ip_type") or "").strip()
+                if exit_ip_type:
+                    current_shadow.ip_type = exit_ip_type
+                self._cutover_shadow_locked(slot)
+            return True
+        except Exception as exc:
+            if listener is not None:
+                try:
+                    stop = getattr(listener, "stop", None)
+                    if callable(stop):
+                        stop()
+                except Exception:
+                    pass
+            if process is not None:
+                try:
+                    self.stop_openvpn(process)
+                except Exception:
+                    pass
+            with self._lock:
+                if slot.shadow is not None and slot.shadow.node_id == nid:
+                    slot.last_error = str(exc)
+                    self._skipped[nid] = time.time() + 60
+                    self._cleanup_shadow_locked(slot)
+            return False
+
+    def _cutover_shadow_locked(self, slot: PoolSlot) -> bool:
+        shadow = slot.shadow
+        if shadow is None or shadow.process is None:
+            return False
+        old_listener = slot.listener
+        old_process = slot.process
+        old_tun = slot.tun_name
+        new_public_listener = None
+        try:
+            if old_listener is not None:
+                stop = getattr(old_listener, "stop", None)
+                if callable(stop):
+                    stop()
+            if shadow.listener is not None:
+                stop_shadow = getattr(shadow.listener, "stop", None)
+                if callable(stop_shadow):
+                    stop_shadow()
+                shadow.listener = None
+            new_public_listener = self.create_listener(
+                host=self.listen_host,
+                port=slot.port,
+                username=self.proxy_user,
+                password=self.proxy_pass,
+                bind_device=shadow.tun_name,
+                require_auth=True,
+                max_connections=None,
+            )
+            if hasattr(new_public_listener, "start"):
+                try:
+                    new_public_listener.start(background=True)
+                except TypeError:
+                    new_public_listener.start()
+        except Exception:
+            if new_public_listener is not None:
+                try:
+                    stop = getattr(new_public_listener, "stop", None)
+                    if callable(stop):
+                        stop()
+                except Exception:
+                    pass
+            slot.listener = None
+            try:
+                slot.listener = self.create_listener(
+                    host=self.listen_host,
+                    port=slot.port,
+                    username=self.proxy_user,
+                    password=self.proxy_pass,
+                    bind_device=old_tun,
+                    require_auth=True,
+                    max_connections=None,
+                )
+                if hasattr(slot.listener, "start"):
+                    try:
+                        slot.listener.start(background=True)
+                    except TypeError:
+                        slot.listener.start()
+            except Exception:
+                slot.listener = None
+            return False
+
+        slot.device_name = shadow.tun_name
+        slot.node_id = shadow.node_id
+        slot.node_ip = shadow.node_ip
+        slot.country = shadow.country
+        slot.country_name = shadow.country_name
+        slot.ip_type = shadow.ip_type
+        slot.entry_ip_type = shadow.entry_ip_type
+        slot.latency_ms = shadow.latency_ms
+        slot.exit_ip = shadow.exit_ip
+        slot.health_latency_ms = shadow.health_latency_ms
+        slot.process = shadow.process
+        slot.listener = new_public_listener
+        slot.config_path = shadow.config_path
+        slot.updated_at = time.time()
+        slot.fail_count = 0
+        slot.last_error = ""
+        if old_process is not None:
+            try:
+                self.stop_openvpn(old_process)
+            except Exception:
+                pass
+        self._reset_replacement_fields_locked(slot)
+        return True
+
     def _probe_ready_slot(self, slot: PoolSlot) -> None:
         if self.health_check is None:
             return
@@ -894,18 +1267,15 @@ class PoolManager:
             slot.fail_count += 1
             slot.last_error = message or "health_check failed"
             if slot.fail_count >= 2:
-                old_id = slot.node_id
                 reason = slot.last_error
-                self._stop_slot(slot)
-                slot.last_error = reason
-                if old_id:
-                    self._skipped[old_id] = time.time() + 60
+                self._request_slot_replacement_locked(slot, reason, time.time())
                 try:
-                    self.log("PoolSlot", f"health replace slot={slot.index} node={old_id}: {reason}")
+                    self.log("PoolSlot", f"health replacement pending slot={slot.index} node={slot.node_id}: {reason}")
                 except Exception:
                     pass
     def _stop_slot(self, slot: PoolSlot) -> None:
         slot.state = SLOT_DRAINING
+        self._cleanup_shadow_locked(slot)
         if slot.listener is not None:
             try:
                 stop = getattr(slot.listener, "stop", None)
@@ -924,6 +1294,7 @@ class PoolManager:
 
     def _reset_slot_fields(self, slot: PoolSlot) -> None:
         slot.state = SLOT_EMPTY
+        slot.device_name = f"tun{slot.index}"
         slot.node_id = ""
         slot.node_ip = ""
         slot.country = ""
@@ -939,3 +1310,8 @@ class PoolManager:
         slot.process = None
         slot.listener = None
         slot.config_path = None
+        slot.replacement_pending = False
+        slot.replacement_reason = ""
+        slot.replacement_requested_at = 0.0
+        slot.replacement_deadline_at = 0.0
+        slot.shadow = None

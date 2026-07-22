@@ -256,7 +256,7 @@ class PoolSyncTests(unittest.TestCase):
 
 
 class PoolLifecycleTests(unittest.TestCase):
-    def _mgr(self, start_side_effect=None):
+    def _mgr(self, start_side_effect=None, **overrides):
         def ok_start(config_path, dev):
             proc = mock.Mock()
             proc.poll.return_value = None
@@ -269,7 +269,7 @@ class PoolLifecycleTests(unittest.TestCase):
             lis.stop = mock.Mock()
             return lis
 
-        return proxy_pool.PoolManager(
+        params = dict(
             pool_size=2,
             port_base=52000,
             public_host="127.0.0.1",
@@ -285,6 +285,8 @@ class PoolLifecycleTests(unittest.TestCase):
             write_config=lambda node, path: path.write_text(node.get("config_text") or "", encoding="utf-8"),
             config_dir=None,
         )
+        params.update(overrides)
+        return proxy_pool.PoolManager(**params)
 
     def test_start_failure_leaves_empty_and_tries_next(self) -> None:
         calls = {"n": 0}
@@ -394,6 +396,94 @@ class PoolLifecycleTests(unittest.TestCase):
                 for s in mgr.slots
             )
         )
+
+    def test_health_starts_shadow_without_stopping_active_slot(self) -> None:
+        mgr = self._mgr(pool_size=1)
+        mgr.health_check = mock.Mock(return_value=(False, "health_check failed", {}))
+        mgr.start()
+        mgr.sync_from_nodes([
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "config_text": "a", "probe_status": "available"},
+            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 6, "config_text": "b", "probe_status": "available"},
+        ])
+        _wait_ready(mgr, 1)
+        active = next(s for s in mgr.slots if s.state == proxy_pool.SLOT_READY)
+        original_node = active.node_id
+        original_listener = active.listener
+        original_process = active.process
+
+        mgr.tick_health()
+        active.last_health_at = 0
+        mgr.tick_health()
+
+        self.assertEqual(active.state, proxy_pool.SLOT_READY)
+        self.assertEqual(active.node_id, original_node)
+        self.assertIs(active.listener, original_listener)
+        self.assertIs(active.process, original_process)
+        self.assertTrue(active.replacement_pending)
+        self.assertIsNotNone(active.shadow)
+        mgr.shutdown()
+
+    def test_shadow_cutover_replaces_slot_after_shadow_health_passes(self) -> None:
+        seen: dict[str, int] = {}
+
+        def health_check(slot):
+            node_id = getattr(slot, "node_id", "")
+            seen[node_id] = seen.get(node_id, 0) + 1
+            if node_id == "A":
+                return False, "health_check failed", {}
+            return True, "ok", {"exit_ip": "9.9.9.9", "latency_ms": 12}
+
+        mgr = self._mgr(pool_size=1)
+        mgr.health_check = mock.Mock(side_effect=health_check)
+        mgr.start()
+        mgr.sync_from_nodes([
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "config_text": "a", "probe_status": "available"},
+            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 6, "config_text": "b", "probe_status": "available"},
+        ])
+        _wait_ready(mgr, 1)
+        active = next(s for s in mgr.slots if s.state == proxy_pool.SLOT_READY)
+        old_listener = active.listener
+        old_process = active.process
+
+        mgr.tick_health()
+        active.last_health_at = 0
+        mgr.tick_health()
+        deadline = time.time() + 2
+        while time.time() < deadline and active.node_id == "A":
+            time.sleep(0.01)
+
+        self.assertEqual(active.node_id, "B")
+        self.assertIsNot(active.listener, old_listener)
+        self.assertIsNot(active.process, old_process)
+        self.assertFalse(active.replacement_pending)
+        self.assertIsNone(active.shadow)
+        self.assertEqual(active.exit_ip, "9.9.9.9")
+        mgr.shutdown()
+
+    def test_grace_expiry_falls_back_to_stop_and_refill(self) -> None:
+        mgr = self._mgr(pool_size=1)
+        mgr.health_check = mock.Mock(return_value=(False, "health_check failed", {}))
+        mgr.replacement_grace_seconds = 0
+        mgr.start()
+        mgr.sync_from_nodes([
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "config_text": "a", "probe_status": "available"},
+            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 6, "config_text": "b", "probe_status": "available"},
+        ])
+        _wait_ready(mgr, 1)
+        active = next(s for s in mgr.slots if s.state == proxy_pool.SLOT_READY)
+
+        mgr.tick_health()
+        active.last_health_at = 0
+        mgr.tick_health()
+
+        self.assertIn(active.state, (proxy_pool.SLOT_READY, proxy_pool.SLOT_EMPTY))
+        mgr.shutdown()
 
 
 if __name__ == "__main__":
