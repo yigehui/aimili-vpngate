@@ -113,6 +113,25 @@ class PoolQueryTests(unittest.TestCase):
         assert item is not None
         self.assertEqual(item["country"], "US")
 
+    def test_health_check_updates_ip_type_from_exit_ip(self) -> None:
+        self.mgr.health_check = mock.Mock(return_value=(
+            True,
+            "ok",
+            {"exit_ip": "9.9.9.9", "ip_type": "hosting", "latency_ms": 12},
+        ))
+        self.mgr.slots[0].ip_type = "residential"
+        self.mgr.slots[0].entry_ip_type = "residential"
+
+        self.mgr._probe_ready_slot(self.mgr.slots[0])
+
+        self.assertEqual(self.mgr.slots[0].exit_ip, "9.9.9.9")
+        self.assertEqual(self.mgr.slots[0].ip_type, "hosting")
+        self.assertEqual(self.mgr.slots[0].entry_ip_type, "residential")
+        item = self.mgr.list_proxies(country="JP", sort="port", ip_type="hosting")["proxies"][0]
+        self.assertEqual(item["port"], 52000)
+        self.assertEqual(item["ip_type_source"], "exit_ip")
+        self.assertEqual(item["entry_ip_type"], "residential")
+
     def test_ip_type_fallback_unknown(self) -> None:
         unknown = self.mgr.slots[3]
         unknown.state = proxy_pool.SLOT_READY

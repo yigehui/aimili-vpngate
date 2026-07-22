@@ -1814,13 +1814,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
         msg = "节点维护任务正在运行，请稍后再试"
         set_state(last_check_message=msg)
         return msg
+    maintenance_marks_connecting = SERVICE_MODE != "pool"
     with lock:
         if is_connecting:
             maintenance_lock.release()
             msg = "当前已有连接或节点测试任务正在运行，请稍后再试"
             set_state(last_check_message=msg)
             return msg
-        is_connecting = True
+        if maintenance_marks_connecting:
+            is_connecting = True
     try:
         if SERVICE_MODE != "pool":
             if force:
@@ -1847,7 +1849,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             is_connecting = True
 
         try:
-            set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
+            set_state(is_connecting=maintenance_marks_connecting, last_check_message="正在拉取最新的免费 VPN 节点列表...")
             candidates = fetch_candidates()
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
@@ -1980,9 +1982,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
         print(f"[周期检测] {msg}", flush=True)
         log_to_json("INFO", "Main", msg)
         
-        set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
+        set_state(is_connecting=maintenance_marks_connecting, last_check_message="正在并发检测所有节点可用性...")
         test_multiple_nodes(to_test_ids)
-        is_connecting = False
+        if maintenance_marks_connecting:
+            is_connecting = False
         
         with lock:
             merged = read_nodes()
@@ -2036,7 +2039,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
     except Exception as e:
         raise e
     finally:
-        is_connecting = False
+        if maintenance_marks_connecting:
+            is_connecting = False
         maintenance_lock.release()
 
 
@@ -6567,7 +6571,20 @@ def pool_check_slot_health(slot: proxy_pool.PoolSlot):
     exit_ip = str(data.get("ip") or "").strip()
     if not exit_ip:
         return False, "health_check: empty exit ip", {}
-    return True, "ok", {"exit_ip": exit_ip, "latency_ms": int((time.time() - started) * 1000)}
+
+    meta = {"exit_ip": exit_ip, "latency_ms": int((time.time() - started) * 1000)}
+    # Pool mode must classify the actual egress IP, not the VPNGate entry IP.
+    # A VPNGate entry can look residential while the NAT egress is hosting, or vice versa.
+    try:
+        exit_node = {"ip": exit_ip}
+        vpn_utils.enrich_ip_info([exit_node])
+        for key in ("ip_type", "quality", "owner", "asn", "as_name", "location"):
+            value = exit_node.get(key)
+            if value:
+                meta[key] = value
+    except Exception as exc:
+        print(f"[PoolHealth] enrich exit ip failed slot={getattr(slot, 'index', '?')} exit_ip={exit_ip}: {exc}", flush=True)
+    return True, "ok", meta
 
 
 def build_pool_manager() -> proxy_pool.PoolManager:

@@ -228,6 +228,7 @@ class PoolSlot:
         self.country = ""
         self.country_name = ""
         self.ip_type = ""
+        self.entry_ip_type = ""
         self.latency_ms = 0
         self.updated_at = 0.0
         self.starting_at = 0.0
@@ -477,6 +478,7 @@ class PoolManager:
                         "node_id": s.node_id,
                         "country": s.country,
                         "ip_type": s.ip_type,
+                        "entry_ip_type": s.entry_ip_type,
                         "latency_ms": s.latency_ms,
                         "health_latency_ms": s.health_latency_ms,
                         "exit_ip": s.exit_ip,
@@ -500,6 +502,9 @@ class PoolManager:
             "country": slot.country,
             "country_name": slot.country_name,
             "ip_type": slot.ip_type,
+            "entry_ip_type": slot.entry_ip_type,
+            "exit_ip_type": slot.ip_type if slot.exit_ip else "",
+            "ip_type_source": "exit_ip" if slot.exit_ip else "entry_ip",
             "latency_ms": slot.latency_ms,
             "health_latency_ms": slot.health_latency_ms,
             "exit_ip": slot.exit_ip,
@@ -752,6 +757,7 @@ class PoolManager:
         slot.country = str(node.get("country_short") or node.get("country") or "")
         slot.country_name = str(node.get("country") or node.get("country_name") or slot.country)
         slot.ip_type = str(node.get("ip_type") or "")
+        slot.entry_ip_type = slot.ip_type
         try:
             slot.latency_ms = int(self._latency_key(node))
             if slot.latency_ms >= 10**9:
@@ -881,6 +887,9 @@ class PoolManager:
                 if isinstance(meta, dict):
                     slot.health_latency_ms = int(meta.get("latency_ms") or slot.health_latency_ms or 0)
                     slot.exit_ip = str(meta.get("exit_ip") or meta.get("ip") or slot.exit_ip or "")
+                    exit_ip_type = str(meta.get("ip_type") or "").strip()
+                    if exit_ip_type:
+                        slot.ip_type = exit_ip_type
                 return
             slot.fail_count += 1
             slot.last_error = message or "health_check failed"
@@ -920,6 +929,7 @@ class PoolManager:
         slot.country = ""
         slot.country_name = ""
         slot.ip_type = ""
+        slot.entry_ip_type = ""
         slot.latency_ms = 0
         slot.updated_at = 0
         slot.starting_at = 0
