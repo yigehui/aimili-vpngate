@@ -709,17 +709,30 @@ class PoolManager:
         return False
 
     def _ip_type_match(self, slot_ip_type: str, requested: str) -> bool:
-        req = (requested or "all").strip().casefold()
-        if req in ("", "all", "any"):
+        reqs = [
+            part.strip().casefold()
+            for part in str(requested or "all").replace("|", ",").split(",")
+            if part.strip()
+        ]
+        if not reqs or any(req in ("all", "any") for req in reqs):
             return True
         value = (slot_ip_type or "").strip().casefold()
-        if req in ("residential", "resi", "res", "\u4f4f\u5b85", "\u4f4f\u5b85ip"):
-            return value in ("residential", "mobile")
-        if req in ("hosting", "datacenter", "dc", "\u673a\u623f", "\u673a\u623fip"):
-            return value == "hosting"
-        if req == "mobile":
-            return value == "mobile"
-        return value == req
+        for req in reqs:
+            if req in ("residential", "resi", "res", "\u4f4f\u5b85", "\u4f4f\u5b85ip"):
+                if value in ("residential", "mobile"):
+                    return True
+                continue
+            if req in ("hosting", "datacenter", "dc", "\u673a\u623f", "\u673a\u623fip"):
+                if value == "hosting":
+                    return True
+                continue
+            if req == "mobile":
+                if value == "mobile":
+                    return True
+                continue
+            if value == req:
+                return True
+        return False
 
     def _can_fallback_unknown(self, requested: str) -> bool:
         req = (requested or "all").strip().casefold()

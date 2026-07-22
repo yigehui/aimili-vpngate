@@ -112,6 +112,10 @@ class PoolQueryTests(unittest.TestCase):
         self.assertIsNotNone(item)
         assert item is not None
         self.assertEqual(item["country"], "US")
+        mixed = self.mgr.list_proxies(ip_type="residential|hosting")
+        self.assertEqual(mixed["total"], 3)
+        mixed2 = self.mgr.list_proxies(ip_type="residential,mobile")
+        self.assertEqual(mixed2["total"], 2)
 
     def test_health_check_updates_ip_type_from_exit_ip(self) -> None:
         self.mgr.health_check = mock.Mock(return_value=(
