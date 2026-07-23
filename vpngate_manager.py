@@ -142,12 +142,21 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 MIRROR_SITES_URL = os.environ.get("MIRROR_SITES_URL", "https://www.vpngate.net/en/sites.aspx")
+DEFAULT_MIRROR_API_URLS = [
+    "http://160.251.62.107:46080/api/iphone/",
+    "http://150.40.105.5:32536/api/iphone/",
+    "http://150.40.105.8:61446/api/iphone/",
+    "http://150.40.105.25:65488/api/iphone/",
+    "http://126251132176.joetsu.ne.jp:16166/api/iphone/",
+    "http://118.32.241.238:38392/api/iphone/",
+]
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1800, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1800, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 MERGE_MIRROR_SOURCES = env_bool("MERGE_MIRROR_SOURCES", True)
 MAX_MIRROR_SOURCES = env_int("MAX_MIRROR_SOURCES", 6, 0, 20)
+MIRROR_DISCOVERY_TIMEOUT_SECONDS = env_int("MIRROR_DISCOVERY_TIMEOUT_SECONDS", 5, 1, 30)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
@@ -168,6 +177,7 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
+MIRROR_CACHE_FILE = DATA_DIR / "mirror_api_urls.json"
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
@@ -806,20 +816,51 @@ def discover_mirror_api_urls(sites_url: str | None = None, api_url: str | None =
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
     )
-    with urllib.request.urlopen(request, timeout=12) as response:
+    with urllib.request.urlopen(request, timeout=MIRROR_DISCOVERY_TIMEOUT_SECONDS) as response:
         html = response.read().decode("utf-8", errors="replace")
     return extract_mirror_api_urls(html, api_url=api_url)
+
+def load_cached_mirror_api_urls() -> list[str]:
+    raw = read_json(MIRROR_CACHE_FILE, [])
+    if not isinstance(raw, list):
+        return []
+    urls: list[str] = []
+    seen = set()
+    for item in raw:
+        url = str(item or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+def save_cached_mirror_api_urls(urls: list[str]) -> None:
+    cleaned = [str(url or "").strip() for url in urls if str(url or "").strip()]
+    if not cleaned:
+        return
+    DATA_DIR.mkdir(exist_ok=True, parents=True)
+    write_json(MIRROR_CACHE_FILE, cleaned)
 
 def get_candidate_api_urls() -> list[str]:
     urls = [API_URL]
     if MERGE_MIRROR_SOURCES:
         try:
             mirror_urls = discover_mirror_api_urls(api_url=API_URL)
-            if MAX_MIRROR_SOURCES > 0:
-                urls.extend(mirror_urls[:MAX_MIRROR_SOURCES])
+            if mirror_urls:
+                save_cached_mirror_api_urls(mirror_urls)
+                if MAX_MIRROR_SOURCES > 0:
+                    urls.extend(mirror_urls[:MAX_MIRROR_SOURCES])
         except Exception as exc:
             print(f"[fetch_candidates] 获取官方镜像站列表失败，继续使用主站: {exc}", flush=True)
             log_to_json("WARNING", "Main", f"获取官方镜像站列表失败，继续使用主站: {exc}")
+            mirror_urls = load_cached_mirror_api_urls()
+            if mirror_urls:
+                log_to_json("INFO", "Main", f"镜像站列表发现失败，回退到缓存镜像 {len(mirror_urls)} 个")
+            else:
+                mirror_urls = list(DEFAULT_MIRROR_API_URLS)
+                log_to_json("INFO", "Main", f"镜像站列表发现失败且无缓存，回退到内置镜像 {len(mirror_urls)} 个")
+            if MAX_MIRROR_SOURCES > 0:
+                urls.extend(mirror_urls[:MAX_MIRROR_SOURCES])
     deduped: list[str] = []
     seen = set()
     for url in urls:

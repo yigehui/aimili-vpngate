@@ -38,6 +38,42 @@ class VpnGateSourceDiscoveryTests(unittest.TestCase):
             ],
         )
 
+    def test_get_candidate_api_urls_persists_discovered_mirrors(self) -> None:
+        mirrors = ["http://118.32.241.238:38392/api/iphone/"]
+
+        with (
+            mock.patch.object(vpngate_manager, "MERGE_MIRROR_SOURCES", True),
+            mock.patch.object(vpngate_manager, "MAX_MIRROR_SOURCES", 6),
+            mock.patch.object(vpngate_manager, "discover_mirror_api_urls", return_value=mirrors),
+            mock.patch.object(vpngate_manager, "save_cached_mirror_api_urls") as save_mock,
+        ):
+            urls = vpngate_manager.get_candidate_api_urls()
+
+        self.assertEqual(urls, [vpngate_manager.API_URL, *mirrors])
+        save_mock.assert_called_once_with(mirrors)
+
+    def test_get_candidate_api_urls_falls_back_to_cached_then_default(self) -> None:
+        cached = ["http://cached.example/api/iphone/"]
+        with (
+            mock.patch.object(vpngate_manager, "MERGE_MIRROR_SOURCES", True),
+            mock.patch.object(vpngate_manager, "MAX_MIRROR_SOURCES", 6),
+            mock.patch.object(vpngate_manager, "discover_mirror_api_urls", side_effect=TimeoutError("timeout")),
+            mock.patch.object(vpngate_manager, "load_cached_mirror_api_urls", return_value=cached),
+            mock.patch.object(vpngate_manager, "log_to_json"),
+        ):
+            urls = vpngate_manager.get_candidate_api_urls()
+        self.assertEqual(urls, [vpngate_manager.API_URL, *cached])
+
+        with (
+            mock.patch.object(vpngate_manager, "MERGE_MIRROR_SOURCES", True),
+            mock.patch.object(vpngate_manager, "MAX_MIRROR_SOURCES", 6),
+            mock.patch.object(vpngate_manager, "discover_mirror_api_urls", side_effect=TimeoutError("timeout")),
+            mock.patch.object(vpngate_manager, "load_cached_mirror_api_urls", return_value=[]),
+            mock.patch.object(vpngate_manager, "log_to_json"),
+        ):
+            urls = vpngate_manager.get_candidate_api_urls()
+        self.assertEqual(urls, [vpngate_manager.API_URL, *vpngate_manager.DEFAULT_MIRROR_API_URLS[:6]])
+
 
 class VpnGateFetchCandidatesTests(unittest.TestCase):
     def test_fetch_candidates_merges_multiple_sources(self) -> None:
