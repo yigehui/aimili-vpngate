@@ -870,13 +870,13 @@ def get_candidate_api_urls() -> list[str]:
     return deduped
 
 def build_api_attempt_targets(source_url: str) -> list[tuple[str, bool]]:
-    attempts_targets = [
-        (source_url, True),
-        (source_url, False),
-    ]
     if source_url.startswith("https://"):
-        attempts_targets.append((source_url.replace("https://", "http://", 1), True))
-    return attempts_targets
+        return [
+            (source_url, True),
+            (source_url, False),
+            (source_url.replace("https://", "http://", 1), True),
+        ]
+    return [(source_url, True)]
 
 def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     lines = [line for line in text.splitlines() if line and not line.startswith("*")]
@@ -973,9 +973,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
     source_urls = get_candidate_api_urls()
     successful_sources = 0
     
-    # 检查本地是否有节点缓存，以确定最大重试尝试次数
-    has_cache = len(cached_nodes()) > 0
-    max_attempts = 1 if has_cache else 2
+    max_attempts = 1
         
     log_to_json("INFO", "Main", f"开始拉取官方 API 节点列表，源数量: {len(source_urls)}")
     

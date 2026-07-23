@@ -165,6 +165,56 @@ class VpnGateFetchCandidatesTests(unittest.TestCase):
             [("1.1.1.1", 443, "tcp"), ("1.1.1.1", 1195, "udp")],
         )
 
+    def test_fetch_candidates_does_not_retry_failed_http_source(self) -> None:
+        source_urls = [
+            "http://bad.example/api/iphone/",
+            "http://good.example/api/iphone/",
+        ]
+        fetch_calls: list[str] = []
+
+        def fake_fetch(url: str | None = None, use_ssl_verify: bool = True) -> str:
+            fetch_calls.append(f"{url}|{use_ssl_verify}")
+            if "bad.example" in str(url):
+                raise RuntimeError("boom")
+            return str(url)
+
+        def fake_parse(api_text: str) -> list[dict[str, str]]:
+            if "good.example" in api_text:
+                return [_row("2.2.2.2", "443", "tcp")]
+            return []
+
+        def fake_row_to_node(row: dict[str, str], config_text: str) -> dict[str, object]:
+            ip = row["IP"]
+            return {
+                "id": f"JP_{ip}_443_tcp",
+                "ip": ip,
+                "remote_port": 443,
+                "proto": "tcp",
+                "country": "日本",
+                "config_text": config_text,
+            }
+
+        with (
+            mock.patch.object(vpngate_manager, "get_candidate_api_urls", return_value=source_urls, create=True),
+            mock.patch.object(vpngate_manager, "load_blacklist", return_value={}),
+            mock.patch.object(vpngate_manager, "fetch_api_text", side_effect=fake_fetch),
+            mock.patch.object(vpngate_manager, "parse_vpngate_rows", side_effect=fake_parse),
+            mock.patch.object(vpngate_manager, "decode_config", return_value="config"),
+            mock.patch.object(vpngate_manager, "row_to_node", side_effect=fake_row_to_node),
+            mock.patch.object(vpngate_manager, "log_to_json"),
+            mock.patch.object(vpngate_manager, "set_state"),
+        ):
+            nodes = vpngate_manager.fetch_candidates()
+
+        self.assertEqual([node["ip"] for node in nodes], ["2.2.2.2"])
+        self.assertEqual(
+            fetch_calls,
+            [
+                "http://bad.example/api/iphone/|True",
+                "http://good.example/api/iphone/|True",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
