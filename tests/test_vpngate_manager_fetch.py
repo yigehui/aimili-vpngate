@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import tempfile
 import unittest
 from unittest import mock
+from pathlib import Path
 
 import vpngate_manager
 
@@ -214,6 +216,122 @@ class VpnGateFetchCandidatesTests(unittest.TestCase):
                 "http://good.example/api/iphone/|True",
             ],
         )
+
+
+class VpnGateBatchProbeTests(unittest.TestCase):
+    def _node(self, node_id: str, ip: str) -> dict[str, object]:
+        return {
+            "id": node_id,
+            "ip": ip,
+            "remote_host": ip,
+            "remote_port": 443,
+            "ping": 10,
+            "config_text": "client",
+            "probe_status": "not_checked",
+            "probe_message": "",
+            "active": False,
+        }
+
+    def test_test_multiple_nodes_syncs_available_results_to_pool(self) -> None:
+        nodes = [
+            self._node("node-1", "1.1.1.1"),
+            self._node("node-2", "2.2.2.2"),
+        ]
+
+        class ImmediateFuture:
+            def __init__(self, result: dict[str, object]) -> None:
+                self._result = result
+
+            def result(self) -> dict[str, object]:
+                return self._result
+
+        class ImmediateExecutor:
+            def __init__(self, max_workers: int) -> None:
+                self.max_workers = max_workers
+
+            def __enter__(self) -> "ImmediateExecutor":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def submit(self, fn, arg):
+                return ImmediateFuture(fn(arg))
+
+        with tempfile.TemporaryDirectory() as td:
+            nodes_file = Path(td) / "nodes.json"
+            config_dir = Path(td) / "configs"
+            vpngate_manager.write_json(nodes_file, nodes)
+            pool_manager = mock.Mock()
+
+            with (
+                mock.patch.object(vpngate_manager, "NODES_FILE", nodes_file),
+                mock.patch.object(vpngate_manager, "CONFIG_DIR", config_dir),
+                mock.patch.object(vpngate_manager, "SERVICE_MODE", "pool"),
+                mock.patch.object(vpngate_manager, "pool_manager", pool_manager),
+                mock.patch.object(vpngate_manager.vpn_utils, "ping_latency_ms", return_value=11),
+                mock.patch.object(vpngate_manager.vpn_utils, "enrich_ip_info"),
+                mock.patch.object(vpngate_manager, "get_free_test_index", return_value=7),
+                mock.patch.object(vpngate_manager, "release_test_index"),
+                mock.patch.object(
+                    vpngate_manager,
+                    "run_openvpn_until_ready",
+                    side_effect=[(True, "ok", None), (False, "fail", None)],
+                ),
+                mock.patch.object(vpngate_manager.concurrent.futures, "ThreadPoolExecutor", ImmediateExecutor),
+                mock.patch.object(vpngate_manager.concurrent.futures, "as_completed", side_effect=lambda futures: list(futures)),
+            ):
+                results = vpngate_manager.test_multiple_nodes(["node-1", "node-2"])
+
+        self.assertEqual(len(results), 2)
+        pool_manager.sync_from_nodes.assert_called()
+        synced_nodes = pool_manager.sync_from_nodes.call_args_list[-1].args[0]
+        self.assertEqual([node["id"] for node in synced_nodes], ["node-1"])
+
+    def test_test_multiple_nodes_uses_configured_parallel_workers(self) -> None:
+        nodes = [self._node(f"node-{i}", f"10.0.0.{i}") for i in range(1, 21)]
+        created_workers: list[int] = []
+
+        class ImmediateFuture:
+            def __init__(self, result: dict[str, object]) -> None:
+                self._result = result
+
+            def result(self) -> dict[str, object]:
+                return self._result
+
+        class CapturingExecutor:
+            def __init__(self, max_workers: int) -> None:
+                created_workers.append(max_workers)
+
+            def __enter__(self) -> "CapturingExecutor":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def submit(self, fn, arg):
+                return ImmediateFuture(fn(arg))
+
+        with tempfile.TemporaryDirectory() as td:
+            nodes_file = Path(td) / "nodes.json"
+            config_dir = Path(td) / "configs"
+            vpngate_manager.write_json(nodes_file, nodes)
+
+            with (
+                mock.patch.object(vpngate_manager, "NODES_FILE", nodes_file),
+                mock.patch.object(vpngate_manager, "CONFIG_DIR", config_dir),
+                mock.patch.object(vpngate_manager, "NODE_TEST_MAX_WORKERS", 12, create=True),
+                mock.patch.object(vpngate_manager.vpn_utils, "ping_latency_ms", return_value=9),
+                mock.patch.object(vpngate_manager.vpn_utils, "enrich_ip_info"),
+                mock.patch.object(vpngate_manager, "get_free_test_index", return_value=3),
+                mock.patch.object(vpngate_manager, "release_test_index"),
+                mock.patch.object(vpngate_manager, "run_openvpn_until_ready", return_value=(False, "fail", None)),
+                mock.patch.object(vpngate_manager.concurrent.futures, "ThreadPoolExecutor", CapturingExecutor),
+                mock.patch.object(vpngate_manager.concurrent.futures, "as_completed", side_effect=lambda futures: list(futures)),
+            ):
+                vpngate_manager.test_multiple_nodes([node["id"] for node in nodes])
+
+        self.assertEqual(created_workers, [12])
 
 
 if __name__ == "__main__":

@@ -158,6 +158,7 @@ MERGE_MIRROR_SOURCES = env_bool("MERGE_MIRROR_SOURCES", True)
 MAX_MIRROR_SOURCES = env_int("MAX_MIRROR_SOURCES", 6, 0, 20)
 MIRROR_DISCOVERY_TIMEOUT_SECONDS = env_int("MIRROR_DISCOVERY_TIMEOUT_SECONDS", 5, 1, 30)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
+NODE_TEST_MAX_WORKERS = env_int("NODE_TEST_MAX_WORKERS", 20, 1, 100)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
@@ -1708,7 +1709,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    max_workers = min(5, max(1, len(to_test)))
+    max_workers = min(NODE_TEST_MAX_WORKERS, max(1, len(to_test)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
@@ -1723,13 +1724,22 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "probe_message": f"Test exception: {e}",
                     "latency_ms": 0
                 }
+            available_snapshot = None
             with lock:
                 current_nodes = read_nodes()
                 for n in current_nodes:
                     if n.get("id") == nid:
                         n.update(updated_nodes_map[nid])
                         break
-                write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                sorted_nodes = sort_all_nodes(current_nodes)
+                write_json(NODES_FILE, sorted_nodes)
+                if SERVICE_MODE == "pool" and pool_manager is not None:
+                    available_snapshot = [n for n in sorted_nodes if n.get("probe_status") == "available"]
+            if available_snapshot is not None:
+                try:
+                    pool_manager.sync_from_nodes(available_snapshot)
+                except Exception as pool_exc:
+                    print(f"[test_multiple_nodes] pool sync failed: {pool_exc}", flush=True)
                 
     # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
     successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
@@ -1739,6 +1749,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         except Exception as ee:
             print(f"[test_multiple_nodes] 批量富化 IP 失败: {ee}", flush=True)
 
+    available_snapshot = None
     with lock:
         current_nodes = read_nodes()
         for n in current_nodes:
@@ -1747,6 +1758,13 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 n.update(updated_nodes_map[nid])
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
+        if SERVICE_MODE == "pool" and pool_manager is not None:
+            available_snapshot = [n for n in sorted_nodes if n.get("probe_status") == "available"]
+    if available_snapshot is not None:
+        try:
+            pool_manager.sync_from_nodes(available_snapshot)
+        except Exception as pool_exc:
+            print(f"[test_multiple_nodes] pool final sync failed: {pool_exc}", flush=True)
         
     return list(updated_nodes_map.values())
 
