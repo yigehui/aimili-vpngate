@@ -117,6 +117,18 @@ def env_int(name: str, default: int, min_value: int | None = None, max_value: in
         return default
     return value
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    print(f"[配置警告] 环境变量 {name}={raw!r} 不是有效布尔值，使用默认值 {default}", flush=True)
+    return default
+
 def bounded_int(value: Any, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     try:
         parsed = int(value)
@@ -129,10 +141,13 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 API_URL = "https://www.vpngate.net/api/iphone/"
+MIRROR_SITES_URL = os.environ.get("MIRROR_SITES_URL", "https://www.vpngate.net/en/sites.aspx")
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1800, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1800, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
+MERGE_MIRROR_SOURCES = env_bool("MERGE_MIRROR_SOURCES", True)
+MAX_MIRROR_SOURCES = env_int("MAX_MIRROR_SOURCES", 6, 0, 20)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
@@ -752,6 +767,76 @@ def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
         with urllib.request.urlopen(request, timeout=12) as response:
             return response.read().decode("utf-8", errors="replace")
 
+def extract_mirror_api_urls(html: str, api_url: str | None = None) -> list[str]:
+    target_url = api_url or API_URL
+    parsed_target = urllib.parse.urlsplit(target_url)
+    api_path = parsed_target.path or "/api/iphone/"
+    if not api_path.startswith("/"):
+        api_path = f"/{api_path}"
+    if not api_path.endswith("/"):
+        api_path += "/"
+    primary_netloc = parsed_target.netloc.lower()
+    blocked_hosts = ("vpngate.net", "softether.org", "github.com", "tsukuba.ac.jp", "win10pcap.org", "icondrawer.com")
+    mirrors: list[str] = []
+    seen = set()
+    for href in re.findall(r"""href=['"]([^'"]+)['"]""", html, re.I):
+        parsed_href = urllib.parse.urlsplit(href)
+        if parsed_href.scheme not in ("http", "https"):
+            continue
+        if not parsed_href.path.rstrip("/").endswith("/en"):
+            continue
+        netloc = parsed_href.netloc.lower()
+        host = (parsed_href.hostname or "").lower()
+        if not netloc or netloc == primary_netloc:
+            continue
+        if any(token in host for token in blocked_hosts):
+            continue
+        api_candidate = urllib.parse.urlunsplit((parsed_href.scheme, parsed_href.netloc, api_path, "", ""))
+        if api_candidate not in seen:
+            seen.add(api_candidate)
+            mirrors.append(api_candidate)
+    return mirrors
+
+def discover_mirror_api_urls(sites_url: str | None = None, api_url: str | None = None) -> list[str]:
+    target_sites_url = sites_url or MIRROR_SITES_URL
+    request = urllib.request.Request(
+        target_sites_url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=12) as response:
+        html = response.read().decode("utf-8", errors="replace")
+    return extract_mirror_api_urls(html, api_url=api_url)
+
+def get_candidate_api_urls() -> list[str]:
+    urls = [API_URL]
+    if MERGE_MIRROR_SOURCES:
+        try:
+            mirror_urls = discover_mirror_api_urls(api_url=API_URL)
+            if MAX_MIRROR_SOURCES > 0:
+                urls.extend(mirror_urls[:MAX_MIRROR_SOURCES])
+        except Exception as exc:
+            print(f"[fetch_candidates] 获取官方镜像站列表失败，继续使用主站: {exc}", flush=True)
+            log_to_json("WARNING", "Main", f"获取官方镜像站列表失败，继续使用主站: {exc}")
+    deduped: list[str] = []
+    seen = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            deduped.append(url)
+    return deduped
+
+def build_api_attempt_targets(source_url: str) -> list[tuple[str, bool]]:
+    attempts_targets = [
+        (source_url, True),
+        (source_url, False),
+    ]
+    if source_url.startswith("https://"):
+        attempts_targets.append((source_url.replace("https://", "http://", 1), True))
+    return attempts_targets
+
 def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     lines = [line for line in text.splitlines() if line and not line.startswith("*")]
     if lines and lines[0].startswith("#"):
@@ -834,63 +919,72 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "probed_at": 0,
     }
 
+def candidate_dedupe_key(node: dict[str, Any], row: dict[str, str] | None = None) -> tuple[str, int, str]:
+    ip = str(node.get("ip") or (row or {}).get("IP") or "").strip()
+    port = parse_int(node.get("remote_port"))
+    proto = str(node.get("proto") or "").strip().lower()
+    return (ip, port, proto)
+
 def fetch_candidates() -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
-    seen_ips = set()
+    seen_candidates = set()
+    source_urls = get_candidate_api_urls()
+    successful_sources = 0
     
     # 检查本地是否有节点缓存，以确定最大重试尝试次数
     has_cache = len(cached_nodes()) > 0
     max_attempts = 1 if has_cache else 2
-    
-    # 尝试 URLs 队列: 1. HTTPS(验证证书) 2. HTTPS(不验证证书) 3. HTTP
-    attempts_targets = [
-        (API_URL, True),
-        (API_URL, False)
-    ]
-    if API_URL.startswith("https://"):
-        attempts_targets.append((API_URL.replace("https://", "http://"), True))
         
-    log_to_json("INFO", "Main", "开始拉取官方 API 节点列表...")
+    log_to_json("INFO", "Main", f"开始拉取官方 API 节点列表，源数量: {len(source_urls)}")
     
     last_err = None
-    for url, verify_ssl in attempts_targets:
-        for i in range(max_attempts):
-            if i > 0:
-                time.sleep(1.5)
-            try:
-                msg = f"尝试拉取 {url} (SSL验证: {verify_ssl}, 第 {i+1} 次尝试)..."
-                print(f"[fetch_candidates] {msg}", flush=True)
-                log_to_json("INFO", "Main", msg)
-                api_text = fetch_api_text(url, verify_ssl)
-                rows = parse_vpngate_rows(api_text)
-                for row in rows[:MAX_SCAN_ROWS]:
-                    ip = row.get("IP", "")
-                    if not ip or ip in seen_ips:
-                        continue
-                    encoded = row.get("OpenVPN_ConfigData_Base64", "")
-                    if not encoded:
-                        continue
-                    try:
-                        config_text = decode_config(encoded)
-                        node = row_to_node(row, config_text)
-                    except Exception as row_exc:
-                        print(f"[fetch_candidates] 跳过损坏的节点配置记录: {row_exc}", flush=True)
-                        log_to_json("WARNING", "Main", f"跳过损坏的节点配置记录: {row_exc}")
-                        continue
-                    entry = blacklist.get(node["id"])
-                    if entry and float(entry.get("until", 0) or 0) > time.time():
-                        continue
-                    candidates.append(node)
-                    seen_ips.add(ip)
-                if candidates:
+    for source_url in source_urls:
+        source_ok = False
+        for url, verify_ssl in build_api_attempt_targets(source_url):
+            for i in range(max_attempts):
+                if i > 0:
+                    time.sleep(1.5)
+                try:
+                    msg = f"尝试拉取 {url} (SSL验证: {verify_ssl}, 第 {i+1} 次尝试)..."
+                    print(f"[fetch_candidates] {msg}", flush=True)
+                    log_to_json("INFO", "Main", msg)
+                    api_text = fetch_api_text(url, verify_ssl)
+                    rows = parse_vpngate_rows(api_text)
+                    before_count = len(candidates)
+                    for row in rows[:MAX_SCAN_ROWS]:
+                        ip = row.get("IP", "")
+                        if not ip:
+                            continue
+                        encoded = row.get("OpenVPN_ConfigData_Base64", "")
+                        if not encoded:
+                            continue
+                        try:
+                            config_text = decode_config(encoded)
+                            node = row_to_node(row, config_text)
+                        except Exception as row_exc:
+                            print(f"[fetch_candidates] 跳过损坏的节点配置记录: {row_exc}", flush=True)
+                            log_to_json("WARNING", "Main", f"跳过损坏的节点配置记录: {row_exc}")
+                            continue
+                        dedupe_key = candidate_dedupe_key(node, row)
+                        if dedupe_key in seen_candidates:
+                            continue
+                        entry = blacklist.get(node["id"])
+                        if entry and float(entry.get("until", 0) or 0) > time.time():
+                            continue
+                        candidates.append(node)
+                        seen_candidates.add(dedupe_key)
+                    source_ok = True
+                    successful_sources += 1
+                    added = len(candidates) - before_count
+                    log_to_json("INFO", "Main", f"源 {source_url} 拉取成功，新增 {added} 个候选，总计 {len(candidates)}")
                     break
-            except Exception as e:
-                last_err = e
-                print(f"[fetch_candidates] 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}", flush=True)
-                log_to_json("WARNING", "Main", f"拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}")
-        if candidates:
-            break
+                except Exception as e:
+                    last_err = e
+                    print(f"[fetch_candidates] 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}", flush=True)
+                    log_to_json("WARNING", "Main", f"拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}")
+            if source_ok:
+                break
             
     if not candidates:
         err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
@@ -910,10 +1004,10 @@ def fetch_candidates() -> list[dict[str, Any]]:
     set_state(
         last_fetch_at=time.time(),
         last_fetch_status="ok",
-        last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
+        last_fetch_message=f"Fetched {len(candidates)} unique candidates from {successful_sources}/{len(source_urls)} sources.",
         blacklisted_nodes=len(blacklist),
     )
-    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
+    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点，成功源 {successful_sources}/{len(source_urls)}")
     return candidates
 
 def cached_nodes() -> list[dict[str, Any]]:
