@@ -47,6 +47,43 @@ class ProxyListenerTests(unittest.TestCase):
         listener.stop()
         self.assertFalse(listener.is_alive())
 
+    def test_listener_stop_releases_port_for_immediate_rebind(self) -> None:
+        listener = proxy_server.create_proxy_listener(
+            "127.0.0.1",
+            0,
+            username="u1",
+            password="p1",
+            bind_device=None,
+            max_connections=4,
+            require_auth=True,
+        )
+        port = listener.start()
+        listener.stop()
+        self.assertFalse(listener.is_alive())
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+        finally:
+            probe.close()
+
+    def test_open_server_socket_sets_accept_timeout(self) -> None:
+        listener = proxy_server.create_proxy_listener(
+            "127.0.0.1",
+            52000,
+            username="u1",
+            password="p1",
+            bind_device=None,
+            max_connections=4,
+            require_auth=True,
+        )
+        fake_server = mock.MagicMock()
+        fake_server.getsockname.return_value = ("127.0.0.1", 52000)
+        with mock.patch("socket.socket", return_value=fake_server):
+            listener._open_server_socket()
+        fake_server.settimeout.assert_called_once_with(1.0)
+
     def test_create_connection_uses_bind_device(self) -> None:
         with mock.patch("proxy_server.resolve_dns_over_device", return_value="1.2.3.4"):
             with mock.patch("socket.socket") as sock_cls:

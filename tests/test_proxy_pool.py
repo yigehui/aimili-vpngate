@@ -401,6 +401,44 @@ class PoolLifecycleTests(unittest.TestCase):
             )
         )
 
+    def test_health_refills_from_latest_available_nodes_excluding_occupied(self) -> None:
+        mgr = self._mgr()
+        mgr.replacement_grace_seconds = 0
+        mgr.start()
+
+        mgr.slots[0] = _ready_slot(0, "JP", 10, node_id="A")
+        mgr.slots[1] = _ready_slot(1, "US", 20, node_id="B")
+        proc0 = mock.Mock()
+        proc0.poll.return_value = None
+        lis0 = mock.Mock()
+        lis0.is_alive.return_value = True
+        lis0.stop = mock.Mock()
+        proc1 = mock.Mock()
+        proc1.poll.return_value = None
+        lis1 = mock.Mock()
+        lis1.is_alive.return_value = True
+        lis1.stop = mock.Mock()
+        mgr.slots[0].process = proc0
+        mgr.slots[0].listener = lis0
+        mgr.slots[1].process = proc1
+        mgr.slots[1].listener = lis1
+
+        mgr.sync_from_nodes([
+            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 5, "config_text": "b", "probe_status": "available"},
+            {"id": "C", "country_short": "KR", "country": "Korea", "ip": "3.3.3.3",
+             "score_latency": 6, "config_text": "c", "probe_status": "available"},
+        ])
+
+        mgr.slots[0].process.poll.return_value = 1
+        mgr.tick_health()
+        mgr.tick_health()
+        _wait_ready(mgr, 2)
+
+        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
+        self.assertEqual(mgr.slots[0].node_id, "C")
+        self.assertEqual(mgr.slots[1].node_id, "B")
+
     def test_health_starts_shadow_without_stopping_active_slot(self) -> None:
         mgr = self._mgr(pool_size=1)
         mgr.health_check = mock.Mock(return_value=(False, "health_check failed", {}))

@@ -548,6 +548,7 @@ class ProxyListener:
                     pass
             server.bind((host, port))
             server.listen(256)
+            server.settimeout(1.0)
             bound_host, bound_port = server.getsockname()[:2]
             self.bound_port = int(bound_port)
             print(f"HTTP/SOCKS5 proxy listening on {bound_host}:{self.bound_port}", flush=True)
@@ -566,6 +567,7 @@ class ProxyListener:
                     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     server.bind(("0.0.0.0", port))
                     server.listen(256)
+                    server.settimeout(1.0)
                     self.bound_port = int(server.getsockname()[1])
                     print(f"HTTP/SOCKS5 proxy listening on 0.0.0.0:{self.bound_port} (仅 IPv4)", flush=True)
                     self._server = server
@@ -583,6 +585,7 @@ class ProxyListener:
                     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     server.bind(("127.0.0.1", port))
                     server.listen(256)
+                    server.settimeout(1.0)
                     self.bound_port = int(server.getsockname()[1])
                     print(f"HTTP/SOCKS5 proxy listening on 127.0.0.1:{self.bound_port} (仅 IPv4)", flush=True)
                     self._server = server
@@ -605,6 +608,8 @@ class ProxyListener:
         while not self._stop.is_set():
             try:
                 client, address = self._server.accept()
+            except socket.timeout:
+                continue
             except OSError as e:
                 if self._stop.is_set():
                     break
@@ -661,6 +666,10 @@ class ProxyListener:
     def stop(self) -> None:
         self._stop.set()
         if self._server is not None:
+            try:
+                self._server.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self._server.close()
             except OSError:
