@@ -446,7 +446,7 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(mgr.slots[0].node_id, "C")
         self.assertEqual(mgr.slots[1].node_id, "B")
 
-    def test_health_starts_shadow_without_stopping_active_slot(self) -> None:
+    def test_health_failure_removes_active_slot_immediately(self) -> None:
         mgr = self._mgr(pool_size=1)
         mgr.health_check = mock.Mock(return_value=(False, "health_check failed", {}))
         mgr.start()
@@ -458,18 +458,17 @@ class PoolLifecycleTests(unittest.TestCase):
         ])
         _wait_ready(mgr, 1)
         active = next(s for s in mgr.slots if s.state == proxy_pool.SLOT_READY)
-        original_node = active.node_id
         original_listener = active.listener
         original_process = active.process
 
         mgr.tick_health()
 
-        self.assertEqual(active.state, proxy_pool.SLOT_READY)
-        self.assertEqual(active.node_id, original_node)
-        self.assertIs(active.listener, original_listener)
-        self.assertIs(active.process, original_process)
-        self.assertTrue(active.replacement_pending)
-        self.assertIsNotNone(active.shadow)
+        self.assertEqual(active.state, proxy_pool.SLOT_EMPTY)
+        self.assertEqual(active.node_id, "")
+        original_listener.stop.assert_called_once()
+        mgr.stop_openvpn.assert_any_call(original_process)
+        self.assertFalse(active.replacement_pending)
+        self.assertIsNone(active.shadow)
         mgr.shutdown()
 
     def test_removed_slot_clears_health_error_text(self) -> None:
@@ -489,7 +488,7 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(mgr.slots[0].fail_count, 0)
         mgr.shutdown()
 
-    def test_shadow_cutover_replaces_slot_after_shadow_health_passes(self) -> None:
+    def test_health_failure_refills_slot_without_shadow(self) -> None:
         seen: dict[str, int] = {}
 
         def health_check(slot):
@@ -514,17 +513,19 @@ class PoolLifecycleTests(unittest.TestCase):
         old_process = active.process
 
         mgr.tick_health()
-        deadline = time.time() + 2
-        while time.time() < deadline and active.node_id == "A":
-            time.sleep(0.01)
+        _wait_ready(mgr, 1)
 
         self.assertEqual(active.node_id, "B")
         self.assertIsNot(active.listener, old_listener)
         self.assertIsNot(active.process, old_process)
         self.assertFalse(active.replacement_pending)
         self.assertIsNone(active.shadow)
+
+        active.last_health_at = 0
+        mgr.tick_health()
         self.assertEqual(active.exit_ip, "9.9.9.9")
         mgr.shutdown()
+
 
     def test_grace_expiry_falls_back_to_stop_and_refill(self) -> None:
         mgr = self._mgr(pool_size=1)

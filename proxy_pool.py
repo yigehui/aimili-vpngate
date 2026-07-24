@@ -471,13 +471,8 @@ class PoolManager:
         thread.start()
 
     def _should_drop_slot_immediately(self, reason: str) -> bool:
-        text = str(reason or "").casefold()
-        return (
-            "urlopen error" in text
-            or "错误代码 2005" in text
-            or "err_ovpn_auth_failed" in text
-            or "auth_failed" in text
-        )
+        return True
+
 
     def tick_health(self) -> None:
         """Check READY slots and request background refill when capacity is empty."""
