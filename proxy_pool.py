@@ -446,7 +446,8 @@ class PoolManager:
         if self._should_drop_slot_immediately(reason) or current >= slot.replacement_deadline_at:
             old_id = slot.node_id
             self._stop_slot(slot)
-            slot.last_error = reason
+            slot.fail_count = 0
+            slot.last_error = ""
             if old_id:
                 self._skipped[old_id] = time.time() + 60
             return
@@ -540,7 +541,8 @@ class PoolManager:
                         pass
                 else:
                     self._stop_slot(slot)
-                    slot.last_error = reason
+                    slot.fail_count = 0
+                    slot.last_error = ""
                     if old_id:
                         self._skipped[old_id] = time.time() + 60
                     try:

@@ -472,6 +472,23 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(active.shadow)
         mgr.shutdown()
 
+    def test_removed_slot_clears_health_error_text(self) -> None:
+        mgr = self._mgr(pool_size=1)
+        mgr.health_check = mock.Mock(return_value=(False, "<urlopen error timed out>", {}))
+        mgr.start()
+        mgr.sync_from_nodes([
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "config_text": "a", "probe_status": "available"},
+        ])
+        _wait_ready(mgr, 1)
+
+        mgr.tick_health()
+
+        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_EMPTY)
+        self.assertEqual(mgr.slots[0].last_error, "")
+        self.assertEqual(mgr.slots[0].fail_count, 0)
+        mgr.shutdown()
+
     def test_shadow_cutover_replaces_slot_after_shadow_health_passes(self) -> None:
         seen: dict[str, int] = {}
 
