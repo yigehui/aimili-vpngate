@@ -150,6 +150,7 @@ DEFAULT_MIRROR_API_URLS = [
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1800, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1800, 1)
 POOL_HEALTH_CHECK_INTERVAL_SECONDS = env_int("POOL_HEALTH_CHECK_INTERVAL_SECONDS", 300, 5)
+POOL_REFRESH_BATCH_SIZE = env_int("POOL_REFRESH_BATCH_SIZE", 5, 0, 200)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 MERGE_MIRROR_SOURCES = env_bool("MERGE_MIRROR_SOURCES", True)
@@ -1760,9 +1761,11 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             available_snapshot = [n for n in sorted_nodes if n.get("probe_status") == "available"]
     if available_snapshot is not None:
         try:
-            pool_manager.replace_all_slots_from_nodes(available_snapshot, probe_health=True)
+            pool_manager.sync_from_nodes(available_snapshot)
+            if POOL_REFRESH_BATCH_SIZE > 0:
+                pool_manager.rolling_replace_from_nodes(available_snapshot, batch_size=POOL_REFRESH_BATCH_SIZE)
         except Exception as pool_exc:
-            print(f"[test_multiple_nodes] pool final replace failed: {pool_exc}", flush=True)
+            print(f"[test_multiple_nodes] pool rolling refresh failed: {pool_exc}", flush=True)
         
     return list(updated_nodes_map.values())
 

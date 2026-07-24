@@ -619,6 +619,47 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(mgr.health_check.call_count, 2)
         mgr.shutdown()
 
+    def test_rolling_replace_only_replaces_one_batch(self) -> None:
+        mgr = self._mgr(pool_size=4, max_starting=4, max_shadow_starting=2)
+        mgr.health_check = mock.Mock(return_value=(True, "ok", {"exit_ip": "9.9.9.9", "latency_ms": 12}))
+        mgr.start()
+        mgr.sync_from_nodes([
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "config_text": "a", "probe_status": "available"},
+            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 6, "config_text": "b", "probe_status": "available"},
+            {"id": "C", "country_short": "KR", "country": "Korea", "ip": "3.3.3.3",
+             "score_latency": 7, "config_text": "c", "probe_status": "available"},
+            {"id": "D", "country_short": "SG", "country": "Singapore", "ip": "4.4.4.4",
+             "score_latency": 8, "config_text": "d", "probe_status": "available"},
+        ])
+        _wait_ready(mgr, 4)
+
+        started = mgr.rolling_replace_from_nodes([
+            {"id": "E", "country_short": "TH", "country": "Thailand", "ip": "5.5.5.5",
+             "score_latency": 1, "config_text": "e", "probe_status": "available"},
+            {"id": "F", "country_short": "GB", "country": "United Kingdom", "ip": "6.6.6.6",
+             "score_latency": 2, "config_text": "f", "probe_status": "available"},
+            {"id": "G", "country_short": "NL", "country": "Netherlands", "ip": "7.7.7.7",
+             "score_latency": 3, "config_text": "g", "probe_status": "available"},
+            {"id": "H", "country_short": "DE", "country": "Germany", "ip": "8.8.8.8",
+             "score_latency": 4, "config_text": "h", "probe_status": "available"},
+        ], batch_size=2)
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            ids = [s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY]
+            if len(set(ids) & {"E", "F", "G", "H"}) == 2:
+                break
+            time.sleep(0.01)
+
+        ids = [s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY]
+        self.assertEqual(started, 2)
+        self.assertEqual(len(ids), 4)
+        self.assertEqual(len(set(ids) & {"E", "F", "G", "H"}), 2)
+        self.assertEqual(len(set(ids) & {"A", "B", "C", "D"}), 2)
+        mgr.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

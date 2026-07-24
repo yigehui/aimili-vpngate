@@ -831,6 +831,52 @@ class PoolManager:
 
         self._request_fill_slots()
 
+    def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int = 5) -> int:
+        candidates = self._dedupe_nodes(list(nodes or []))
+        limit = max(0, int(batch_size or 0))
+        tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
+        now = time.time()
+        with self._lock:
+            candidates.sort(key=self._latency_key)
+            self._last_candidates = list(candidates)
+            capacity = min(limit, self.max_shadow_starting - self._shadow_inflight_count_locked())
+            if capacity <= 0:
+                return 0
+            slots = sorted(
+                [
+                    s for s in self.slots
+                    if s.state == SLOT_READY
+                    and not s.replacement_pending
+                    and s.shadow is None
+                    and s.process is not None
+                    and s.listener is not None
+                    and s.node_id
+                ],
+                key=lambda s: s.updated_at or 0,
+            )
+            for slot in slots:
+                if len(tasks) >= capacity:
+                    break
+                node = self._reserve_shadow_node_locked(slot)
+                if node is None:
+                    break
+                shadow = ShadowCandidate(index=slot.index, tun_name=self._shadow_tun_name(slot), port=self._shadow_port(slot))
+                self._shadow_meta_from_node(shadow, node)
+                slot.replacement_pending = True
+                slot.replacement_reason = "rolling refresh"
+                slot.replacement_requested_at = now
+                slot.replacement_deadline_at = now + self.replacement_grace_seconds
+                slot.shadow = shadow
+                tasks.append((slot, node))
+        for slot, node in tasks:
+            threading.Thread(
+                target=self._start_shadow_for_slot,
+                args=(slot, node),
+                name=f"proxy-pool-rolling-{slot.index}",
+                daemon=True,
+            ).start()
+        return len(tasks)
+
     def replace_all_slots_from_nodes(self, nodes: list[dict[str, Any]], probe_health: bool = True) -> None:
         with self._lock:
             candidates = self._dedupe_nodes(list(nodes or []))
@@ -1116,7 +1162,7 @@ class PoolManager:
                     if slot.shadow is not None and slot.shadow.node_id == nid:
                         slot.last_error = msg or "shadow start_openvpn failed"
                         self._skipped[nid] = time.time() + 60
-                        self._cleanup_shadow_locked(slot)
+                        self._reset_replacement_fields_locked(slot)
                 return False
 
             listener = self.create_listener(
@@ -1159,7 +1205,7 @@ class PoolManager:
                         if slot.shadow is not None and slot.shadow.node_id == nid:
                             slot.last_error = msg or "shadow health_check failed"
                             self._skipped[nid] = time.time() + 60
-                            self._cleanup_shadow_locked(slot)
+                            self._reset_replacement_fields_locked(slot)
                     return False
 
             with self._lock:
@@ -1205,7 +1251,7 @@ class PoolManager:
                 if slot.shadow is not None and slot.shadow.node_id == nid:
                     slot.last_error = str(exc)
                     self._skipped[nid] = time.time() + 60
-                    self._cleanup_shadow_locked(slot)
+                    self._reset_replacement_fields_locked(slot)
             return False
 
     def _cutover_shadow_locked(self, slot: PoolSlot) -> bool:
