@@ -759,6 +759,8 @@ class PoolManager:
         for slot in self.slots:
             if slot.state != SLOT_READY:
                 continue
+            if slot.fail_count > 0 or slot.last_error:
+                continue
             if require_exit_ip and not (slot.exit_ip or "").strip():
                 continue
             if not self._country_match(slot.country, filters):

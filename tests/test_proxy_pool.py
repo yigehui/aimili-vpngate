@@ -79,6 +79,15 @@ class PoolQueryTests(unittest.TestCase):
         self.assertEqual(loose["require_exit_ip"], False)
         self.assertEqual(loose["total"], 2)
 
+    def test_list_skips_ready_slots_with_recent_health_failure(self) -> None:
+        self.mgr.slots[0].fail_count = 1
+        self.mgr.slots[0].last_error = "<urlopen error timed out>"
+
+        result = self.mgr.list_proxies(country="JP", sort="port")
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["proxies"][0]["port"], 52002)
+
     def test_list_country_filter_and_limit(self) -> None:
         result = self.mgr.list_proxies(country="JP", limit=1, offset=0, sort="latency")
         self.assertEqual(result["ok"], True)
