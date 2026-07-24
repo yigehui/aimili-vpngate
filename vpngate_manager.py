@@ -149,6 +149,7 @@ DEFAULT_MIRROR_API_URLS = [
 ]
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1800, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1800, 1)
+POOL_HEALTH_CHECK_INTERVAL_SECONDS = env_int("POOL_HEALTH_CHECK_INTERVAL_SECONDS", 300, 5)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 MERGE_MIRROR_SOURCES = env_bool("MERGE_MIRROR_SOURCES", True)
@@ -6784,7 +6785,7 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         write_config=pool_write_config,
         health_check=pool_check_slot_health,
         cleanup_port=lambda host, port: proxy_server.stop_registered_listener(host, port),
-        health_check_interval=60,
+        health_check_interval=POOL_HEALTH_CHECK_INTERVAL_SECONDS,
         config_dir=CONFIG_DIR / "pool",
     )
     mgr.api_token = str(cfg.get("api_token") or "")
