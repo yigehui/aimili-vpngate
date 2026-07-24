@@ -443,7 +443,7 @@ class PoolManager:
         else:
             slot.replacement_reason = reason
 
-        if current >= slot.replacement_deadline_at:
+        if self._should_drop_slot_immediately(reason) or current >= slot.replacement_deadline_at:
             old_id = slot.node_id
             self._stop_slot(slot)
             slot.last_error = reason
@@ -468,6 +468,15 @@ class PoolManager:
             daemon=True,
         )
         thread.start()
+
+    def _should_drop_slot_immediately(self, reason: str) -> bool:
+        text = str(reason or "").casefold()
+        return (
+            "urlopen error" in text
+            or "错误代码 2005" in text
+            or "err_ovpn_auth_failed" in text
+            or "auth_failed" in text
+        )
 
     def tick_health(self) -> None:
         """Check READY slots and request background refill when capacity is empty."""

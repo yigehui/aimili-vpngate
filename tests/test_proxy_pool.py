@@ -527,6 +527,41 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertIn(active.state, (proxy_pool.SLOT_READY, proxy_pool.SLOT_EMPTY))
         mgr.shutdown()
 
+    def test_fatal_health_errors_release_slot_immediately_after_second_failure(self) -> None:
+        fatal_reasons = (
+            "<urlopen error timed out>",
+            "[错误代码 2005] [ERR_OVPN_AUTH_FAILED] OpenVPN 身份验证失败",
+        )
+        for reason in fatal_reasons:
+            with self.subTest(reason=reason):
+                mgr = self._mgr(pool_size=1)
+                mgr.health_check = mock.Mock(return_value=(False, reason, {}))
+                mgr.start()
+                mgr.sync_from_nodes([
+                    {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+                     "score_latency": 5, "config_text": "a", "probe_status": "available"},
+                    {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+                     "score_latency": 6, "config_text": "b", "probe_status": "available"},
+                ])
+                _wait_ready(mgr, 1)
+                active = next(s for s in mgr.slots if s.state == proxy_pool.SLOT_READY)
+                original_process = active.process
+                original_listener = active.listener
+
+                mgr.tick_health()
+                active.last_health_at = 0
+                mgr.tick_health()
+
+                deadline = time.time() + 2
+                while time.time() < deadline and active.node_id == "A":
+                    time.sleep(0.01)
+
+                original_listener.stop.assert_called()
+                mgr.stop_openvpn.assert_any_call(original_process)
+                self.assertNotEqual(active.node_id, "A")
+                self.assertFalse(active.replacement_pending)
+                mgr.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
