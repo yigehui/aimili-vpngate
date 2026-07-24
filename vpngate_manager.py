@@ -1762,9 +1762,9 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             available_snapshot = [n for n in sorted_nodes if n.get("probe_status") == "available"]
     if available_snapshot is not None:
         try:
-            pool_manager.sync_from_nodes(available_snapshot)
+            pool_manager.replace_all_slots_from_nodes(available_snapshot, probe_health=True)
         except Exception as pool_exc:
-            print(f"[test_multiple_nodes] pool final sync failed: {pool_exc}", flush=True)
+            print(f"[test_multiple_nodes] pool final replace failed: {pool_exc}", flush=True)
         
     return list(updated_nodes_map.values())
 
@@ -6712,12 +6712,30 @@ def pool_check_slot_health(slot: proxy_pool.PoolSlot):
     handlers = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
     opener = urllib.request.build_opener(handlers)
     started = time.time()
-    req = urllib.request.Request(
+    body = ""
+    last_exc: Exception | None = None
+    for url in (
         "https://api.ipify.org?format=json",
-        headers={"User-Agent": "aimili-vpngate-pool-health/1.0"},
-    )
-    with opener.open(req, timeout=10) as resp:
-        body = resp.read(1024 * 16).decode("utf-8", errors="replace")
+        "http://api.ipify.org?format=json",
+    ):
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "aimili-vpngate-pool-health/1.0"},
+        )
+        try:
+            with opener.open(req, timeout=10) as resp:
+                body = resp.read(1024 * 16).decode("utf-8", errors="replace")
+            break
+        except Exception as exc:
+            last_exc = exc
+            text = str(exc).casefold()
+            if url.startswith("https://") and "timed out" in text and ("_ssl" in text or "handshake" in text):
+                continue
+            raise
+    if not body:
+        if last_exc is not None:
+            raise last_exc
+        return False, "health_check: empty response body", {}
     data = json.loads(body)
     exit_ip = str(data.get("ip") or "").strip()
     if not exit_ip:

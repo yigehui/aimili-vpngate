@@ -562,6 +562,46 @@ class PoolLifecycleTests(unittest.TestCase):
                 self.assertFalse(active.replacement_pending)
                 mgr.shutdown()
 
+    def test_replace_all_slots_from_nodes_rebuilds_and_probes_ready_slots(self) -> None:
+        mgr = self._mgr(pool_size=2)
+        mgr.health_check = mock.Mock(side_effect=[
+            (True, "ok", {"exit_ip": "9.9.9.1", "latency_ms": 11}),
+            (True, "ok", {"exit_ip": "9.9.9.2", "latency_ms": 12}),
+        ])
+        mgr.start()
+
+        old0 = _ready_slot(0, "JP", 10, node_id="A")
+        old1 = _ready_slot(1, "US", 20, node_id="B")
+        old0.process = mock.Mock()
+        old0.process.poll.return_value = None
+        old1.process = mock.Mock()
+        old1.process.poll.return_value = None
+        old0.listener = mock.Mock(stop=mock.Mock(), is_alive=mock.Mock(return_value=True))
+        old1.listener = mock.Mock(stop=mock.Mock(), is_alive=mock.Mock(return_value=True))
+        old0_process = old0.process
+        old1_process = old1.process
+        old0_listener = old0.listener
+        old1_listener = old1.listener
+        mgr.slots[0] = old0
+        mgr.slots[1] = old1
+
+        mgr.replace_all_slots_from_nodes([
+            {"id": "C", "country_short": "KR", "country": "Korea", "ip": "3.3.3.3",
+             "score_latency": 5, "config_text": "c", "probe_status": "available"},
+            {"id": "D", "country_short": "SG", "country": "Singapore", "ip": "4.4.4.4",
+             "score_latency": 6, "config_text": "d", "probe_status": "available"},
+        ])
+
+        _wait_ready(mgr, 2)
+        self.assertEqual([s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY], ["C", "D"])
+        self.assertEqual([s.exit_ip for s in mgr.slots if s.state == proxy_pool.SLOT_READY], ["9.9.9.1", "9.9.9.2"])
+        old0_listener.stop.assert_called_once()
+        old1_listener.stop.assert_called_once()
+        mgr.stop_openvpn.assert_any_call(old0_process)
+        mgr.stop_openvpn.assert_any_call(old1_process)
+        self.assertEqual(mgr.health_check.call_count, 2)
+        mgr.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

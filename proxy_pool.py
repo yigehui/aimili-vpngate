@@ -832,6 +832,21 @@ class PoolManager:
 
         self._request_fill_slots()
 
+    def replace_all_slots_from_nodes(self, nodes: list[dict[str, Any]], probe_health: bool = True) -> None:
+        with self._lock:
+            candidates = self._dedupe_nodes(list(nodes or []))
+            candidates.sort(key=self._latency_key)
+            self._last_candidates = list(candidates)
+
+        self._wait_fill_idle()
+        with self._lock:
+            for slot in self.slots:
+                if slot.state != SLOT_EMPTY:
+                    self._stop_slot(slot)
+        self._run_fill_loop()
+        if probe_health and self.health_check is not None:
+            self.probe_ready_slots()
+
     def _request_fill_slots(self) -> None:
         if not self._started:
             return
@@ -842,6 +857,9 @@ class PoolManager:
             self._fill_thread.start()
 
     def _fill_worker(self) -> None:
+        self._run_fill_loop()
+
+    def _run_fill_loop(self) -> None:
         while True:
             tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
             with self._lock:
@@ -868,6 +886,20 @@ class PoolManager:
                 threads.append(t)
             for t in threads:
                 t.join(timeout=self.slot_start_timeout)
+
+    def _wait_fill_idle(self) -> None:
+        while True:
+            with self._lock:
+                thread = self._fill_thread
+            if thread is None or not thread.is_alive():
+                return
+            thread.join(timeout=0.05)
+
+    def probe_ready_slots(self) -> None:
+        with self._lock:
+            ready_slots = [slot for slot in self.slots if slot.state == SLOT_READY]
+        for slot in ready_slots:
+            self._probe_ready_slot(slot)
 
     def _reserve_start_task_locked(self) -> tuple[PoolSlot, dict[str, Any]] | None:
         candidates = list(self._last_candidates or [])

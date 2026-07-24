@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 from pathlib import Path
 
@@ -285,7 +286,8 @@ class VpnGateBatchProbeTests(unittest.TestCase):
 
         self.assertEqual(len(results), 2)
         pool_manager.sync_from_nodes.assert_called()
-        synced_nodes = pool_manager.sync_from_nodes.call_args_list[-1].args[0]
+        pool_manager.replace_all_slots_from_nodes.assert_called_once()
+        synced_nodes = pool_manager.replace_all_slots_from_nodes.call_args.args[0]
         self.assertEqual([node["id"] for node in synced_nodes], ["node-1"])
 
     def test_test_multiple_nodes_uses_configured_parallel_workers(self) -> None:
@@ -332,6 +334,31 @@ class VpnGateBatchProbeTests(unittest.TestCase):
                 vpngate_manager.test_multiple_nodes([node["id"] for node in nodes])
 
         self.assertEqual(created_workers, [12])
+
+
+class PoolHealthCheckTests(unittest.TestCase):
+    def test_pool_check_slot_health_falls_back_to_http_when_https_handshake_times_out(self) -> None:
+        slot = mock.Mock(port=52000, index=1)
+        opener = mock.Mock()
+        https_timeout = urllib.error.URLError("[Errno _ssl.c:983] The handshake operation timed out")
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ip":"1.2.3.4"}'
+        response.__exit__.return_value = None
+        opener.open.side_effect = [https_timeout, response]
+
+        with (
+            mock.patch.object(vpngate_manager, "pool_manager", mock.Mock(proxy_user="u", proxy_pass="p")),
+            mock.patch.object(vpngate_manager.urllib.request, "build_opener", return_value=opener),
+            mock.patch.object(vpngate_manager.vpn_utils, "enrich_ip_info"),
+        ):
+            ok, message, meta = vpngate_manager.pool_check_slot_health(slot)
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "ok")
+        self.assertEqual(meta["exit_ip"], "1.2.3.4")
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertEqual(opener.open.call_args_list[0].args[0].full_url, "https://api.ipify.org?format=json")
+        self.assertEqual(opener.open.call_args_list[1].args[0].full_url, "http://api.ipify.org?format=json")
 
 
 if __name__ == "__main__":
