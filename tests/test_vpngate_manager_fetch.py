@@ -24,7 +24,7 @@ def _row(ip: str, port: str = "443", proto: str = "tcp") -> dict[str, str]:
 class VpnGateSourceDiscoveryTests(unittest.TestCase):
     def test_default_mirror_api_urls_prioritize_reviewed_sources(self) -> None:
         self.assertEqual(
-            vpngate_manager.DEFAULT_MIRROR_API_URLS[:3],
+            vpngate_manager.DEFAULT_MIRROR_API_URLS,
             [
                 "http://149.102.146.143:8592/api/iphone/",
                 "http://60.86.198.39:64731/api/iphone/",

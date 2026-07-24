@@ -146,9 +146,6 @@ DEFAULT_MIRROR_API_URLS = [
     "http://149.102.146.143:8592/api/iphone/",
     "http://60.86.198.39:64731/api/iphone/",
     "http://223.205.2.159:47032/api/iphone/",
-    "http://114.142.39.208:14439/api/iphone/",
-    "http://160.251.62.107:46080/api/iphone/",
-    "http://118.32.241.238:38392/api/iphone/",
 ]
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1800, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1800, 1)
