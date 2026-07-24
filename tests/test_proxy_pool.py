@@ -399,8 +399,7 @@ class PoolLifecycleTests(unittest.TestCase):
         _wait_ready(mgr, 1)
         ready = next(s for s in mgr.slots if s.state == proxy_pool.SLOT_READY)
         ready.process.poll.return_value = 1  # dead
-        # fail_count threshold 2: call tick_health twice
-        mgr.tick_health()
+        # fail_count threshold 1: one failed tick removes/replaces the slot
         mgr.tick_health()
         # after health, dead slot drained/replaced if candidates remain via _last_candidates
         self.assertTrue(
@@ -441,7 +440,6 @@ class PoolLifecycleTests(unittest.TestCase):
 
         mgr.slots[0].process.poll.return_value = 1
         mgr.tick_health()
-        mgr.tick_health()
         _wait_ready(mgr, 2)
 
         self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
@@ -464,8 +462,6 @@ class PoolLifecycleTests(unittest.TestCase):
         original_listener = active.listener
         original_process = active.process
 
-        mgr.tick_health()
-        active.last_health_at = 0
         mgr.tick_health()
 
         self.assertEqual(active.state, proxy_pool.SLOT_READY)
@@ -501,8 +497,6 @@ class PoolLifecycleTests(unittest.TestCase):
         old_process = active.process
 
         mgr.tick_health()
-        active.last_health_at = 0
-        mgr.tick_health()
         deadline = time.time() + 2
         while time.time() < deadline and active.node_id == "A":
             time.sleep(0.01)
@@ -530,13 +524,11 @@ class PoolLifecycleTests(unittest.TestCase):
         active = next(s for s in mgr.slots if s.state == proxy_pool.SLOT_READY)
 
         mgr.tick_health()
-        active.last_health_at = 0
-        mgr.tick_health()
 
         self.assertIn(active.state, (proxy_pool.SLOT_READY, proxy_pool.SLOT_EMPTY))
         mgr.shutdown()
 
-    def test_fatal_health_errors_release_slot_immediately_after_second_failure(self) -> None:
+    def test_fatal_health_errors_release_slot_immediately_after_first_failure(self) -> None:
         fatal_reasons = (
             "<urlopen error timed out>",
             "[错误代码 2005] [ERR_OVPN_AUTH_FAILED] OpenVPN 身份验证失败",
@@ -557,8 +549,6 @@ class PoolLifecycleTests(unittest.TestCase):
                 original_process = active.process
                 original_listener = active.listener
 
-                mgr.tick_health()
-                active.last_health_at = 0
                 mgr.tick_health()
 
                 deadline = time.time() + 2

@@ -525,7 +525,7 @@ class PoolManager:
                 if unhealthy:
                     slot.fail_count += 1
                     slot.last_error = reason
-                    if slot.fail_count >= 2:
+                    if slot.fail_count >= 1:
                         to_replace.append((slot, reason))
                 else:
                     slot.fail_count = 0
@@ -1322,7 +1322,7 @@ class PoolManager:
                 return
             slot.fail_count += 1
             slot.last_error = message or "health_check failed"
-            if slot.fail_count >= 2:
+            if slot.fail_count >= 1:
                 reason = slot.last_error
                 self._request_slot_replacement_locked(slot, reason, time.time())
                 try:
