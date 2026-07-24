@@ -13,6 +13,7 @@ import socket
 import tempfile
 import threading
 import time
+import concurrent.futures
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -307,6 +308,7 @@ class PoolManager:
         health_check: HealthCheckFn | None = None,
         cleanup_port: CleanupPortFn | None = None,
         health_check_interval: int = 60,
+        health_check_workers: int = 20,
         config_dir: str | Path | None = None,
         max_shadow_starting: int = 5,
         replacement_grace_seconds: int = 180,
@@ -331,6 +333,7 @@ class PoolManager:
         self.health_check = health_check
         self.cleanup_port = cleanup_port
         self.health_check_interval = max(5, int(health_check_interval or 60))
+        self.health_check_workers = max(1, int(health_check_workers or 20))
         self.config_dir = Path(config_dir) if config_dir else None
         self.max_shadow_starting = max(1, int(max_shadow_starting or 5))
         self.replacement_grace_seconds = max(0, int(replacement_grace_seconds or 180))
@@ -545,8 +548,10 @@ class PoolManager:
                     except Exception:
                         pass
 
-        for slot in to_probe:
-            self._probe_ready_slot(slot)
+        if to_probe:
+            workers = min(self.health_check_workers, len(to_probe))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                list(executor.map(self._probe_ready_slot, to_probe))
 
         self._request_fill_slots()
 

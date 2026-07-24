@@ -363,6 +363,7 @@ class PoolHealthCheckTests(unittest.TestCase):
 
         with (
             mock.patch.object(vpngate_manager, "pool_manager", mock.Mock(proxy_user="u", proxy_pass="p")),
+            mock.patch.object(vpngate_manager, "POOL_HEALTH_TARGET_URLS", []),
             mock.patch.object(vpngate_manager.urllib.request, "build_opener", return_value=opener),
             mock.patch.object(vpngate_manager.vpn_utils, "enrich_ip_info"),
         ):

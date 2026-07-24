@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -150,6 +151,12 @@ DEFAULT_MIRROR_API_URLS = [
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1800, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1800, 1)
 POOL_HEALTH_CHECK_INTERVAL_SECONDS = env_int("POOL_HEALTH_CHECK_INTERVAL_SECONDS", 300, 5)
+POOL_HEALTH_CHECK_WORKERS = env_int("POOL_HEALTH_CHECK_WORKERS", 20, 1, 100)
+POOL_HEALTH_TARGET_URLS = [
+    url.strip()
+    for url in os.environ.get("POOL_HEALTH_TARGET_URLS", "https://signup.live.com/signup?lic=1").split(",")
+    if url.strip()
+]
 POOL_REFRESH_BATCH_SIZE = env_int("POOL_REFRESH_BATCH_SIZE", 5, 0, 200)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
@@ -6713,6 +6720,17 @@ def pool_check_slot_health(slot: proxy_pool.PoolSlot):
     handlers = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
     opener = urllib.request.build_opener(handlers)
     started = time.time()
+    for url in POOL_HEALTH_TARGET_URLS:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "aimili-vpngate-pool-health/1.0"},
+        )
+        try:
+            with opener.open(req, timeout=10) as resp:
+                resp.read(1024)
+        except urllib.error.HTTPError:
+            pass
+
     body = ""
     last_exc: Exception | None = None
     for url in (
@@ -6789,6 +6807,7 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         health_check=pool_check_slot_health,
         cleanup_port=lambda host, port: proxy_server.stop_registered_listener(host, port),
         health_check_interval=POOL_HEALTH_CHECK_INTERVAL_SECONDS,
+        health_check_workers=POOL_HEALTH_CHECK_WORKERS,
         config_dir=CONFIG_DIR / "pool",
     )
     mgr.api_token = str(cfg.get("api_token") or "")
