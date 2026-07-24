@@ -143,11 +143,11 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
 API_URL = "https://www.vpngate.net/api/iphone/"
 MIRROR_SITES_URL = os.environ.get("MIRROR_SITES_URL", "https://www.vpngate.net/en/sites.aspx")
 DEFAULT_MIRROR_API_URLS = [
+    "http://149.102.146.143:8592/api/iphone/",
+    "http://60.86.198.39:64731/api/iphone/",
+    "http://223.205.2.159:47032/api/iphone/",
+    "http://114.142.39.208:14439/api/iphone/",
     "http://160.251.62.107:46080/api/iphone/",
-    "http://150.40.105.5:32536/api/iphone/",
-    "http://150.40.105.8:61446/api/iphone/",
-    "http://150.40.105.25:65488/api/iphone/",
-    "http://126251132176.joetsu.ne.jp:16166/api/iphone/",
     "http://118.32.241.238:38392/api/iphone/",
 ]
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1800, 1)
