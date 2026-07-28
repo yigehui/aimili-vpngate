@@ -335,7 +335,8 @@ class PoolManager:
         self.health_check_interval = max(5, int(health_check_interval or 60))
         self.health_check_workers = max(1, int(health_check_workers or 20))
         self.config_dir = Path(config_dir) if config_dir else None
-        self.max_shadow_starting = max(1, int(max_shadow_starting or 5))
+        routine_shadow_floor = max(1, self.pool_size // 10)
+        self.max_shadow_starting = max(routine_shadow_floor, int(max_shadow_starting or 0))
         self.replacement_grace_seconds = max(0, int(replacement_grace_seconds or 180))
         self.shadow_port_base = int(shadow_port_base or 53000)
         self.shadow_port_count = max(1, int(shadow_port_count or 200))
