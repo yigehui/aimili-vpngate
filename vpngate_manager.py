@@ -1729,7 +1729,6 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "probe_message": f"Test exception: {e}",
                     "latency_ms": 0
                 }
-            available_snapshot = None
             with lock:
                 current_nodes = read_nodes()
                 for n in current_nodes:
@@ -1738,13 +1737,6 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                         break
                 sorted_nodes = sort_all_nodes(current_nodes)
                 write_json(NODES_FILE, sorted_nodes)
-                if SERVICE_MODE == "pool" and pool_manager is not None:
-                    available_snapshot = [n for n in sorted_nodes if n.get("probe_status") == "available"]
-            if available_snapshot is not None:
-                try:
-                    pool_manager.sync_from_nodes(available_snapshot)
-                except Exception as pool_exc:
-                    print(f"[test_multiple_nodes] pool sync failed: {pool_exc}", flush=True)
                 
     # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
     successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
@@ -2179,10 +2171,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
                             if available_candidates:
                                 auto_switch_node()
-
-        if SERVICE_MODE == "pool" and pool_manager is not None:
-            available = [n for n in read_nodes() if n.get("probe_status") == "available"]
-            pool_manager.sync_from_nodes(available)
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} non-active nodes."

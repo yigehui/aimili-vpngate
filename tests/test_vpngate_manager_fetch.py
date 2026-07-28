@@ -247,7 +247,7 @@ class VpnGateBatchProbeTests(unittest.TestCase):
             "active": False,
         }
 
-    def test_test_multiple_nodes_syncs_available_results_to_pool(self) -> None:
+    def test_test_multiple_nodes_syncs_available_results_to_pool_once_after_batch(self) -> None:
         nodes = [
             self._node("node-1", "1.1.1.1"),
             self._node("node-2", "2.2.2.2"),
@@ -299,12 +299,53 @@ class VpnGateBatchProbeTests(unittest.TestCase):
                 results = vpngate_manager.test_multiple_nodes(["node-1", "node-2"])
 
         self.assertEqual(len(results), 2)
-        pool_manager.sync_from_nodes.assert_called()
+        pool_manager.sync_from_nodes.assert_called_once()
         pool_manager.replace_all_slots_from_nodes.assert_not_called()
         pool_manager.rolling_replace_from_nodes.assert_called_once()
+        synced_once_nodes = pool_manager.sync_from_nodes.call_args.args[0]
+        self.assertEqual([node["id"] for node in synced_once_nodes], ["node-1"])
         synced_nodes = pool_manager.rolling_replace_from_nodes.call_args.args[0]
         self.assertEqual([node["id"] for node in synced_nodes], ["node-1"])
         self.assertEqual(pool_manager.rolling_replace_from_nodes.call_args.kwargs, {})
+
+    def test_maintain_valid_nodes_does_not_sync_pool_outside_batch_probe(self) -> None:
+        node = self._node("node-1", "1.1.1.1")
+
+        with tempfile.TemporaryDirectory() as td:
+            nodes_file = Path(td) / "nodes.json"
+            config_dir = Path(td) / "configs"
+            config_path = config_dir / "node-1.ovpn"
+            node["config_file"] = str(config_path)
+            vpngate_manager.write_json(nodes_file, [])
+            pool_manager = mock.Mock()
+
+            def fake_test_multiple_nodes(node_ids: list[str]) -> list[dict[str, object]]:
+                current_nodes = vpngate_manager.read_json(nodes_file, [])
+                for current in current_nodes:
+                    if current.get("id") in node_ids:
+                        current["probe_status"] = "available"
+                        current["probe_message"] = "ok"
+                vpngate_manager.write_json(nodes_file, current_nodes)
+                return [current for current in current_nodes if current.get("id") in node_ids]
+
+            with (
+                mock.patch.object(vpngate_manager, "NODES_FILE", nodes_file),
+                mock.patch.object(vpngate_manager, "CONFIG_DIR", config_dir),
+                mock.patch.object(vpngate_manager, "SERVICE_MODE", "pool"),
+                mock.patch.object(vpngate_manager, "pool_manager", pool_manager),
+                mock.patch.object(vpngate_manager, "ensure_dirs"),
+                mock.patch.object(vpngate_manager, "fetch_candidates", return_value=[node]),
+                mock.patch.object(vpngate_manager, "load_ui_config", return_value={"connection_enabled": False}),
+                mock.patch.object(vpngate_manager, "active_openvpn_running", return_value=False),
+                mock.patch.object(vpngate_manager, "test_multiple_nodes", side_effect=fake_test_multiple_nodes),
+                mock.patch.object(vpngate_manager, "set_state"),
+                mock.patch.object(vpngate_manager, "log_to_json"),
+            ):
+                message = vpngate_manager.maintain_valid_nodes(False)
+
+        self.assertEqual(message, "Fetched 1 nodes. Tested 1 non-active nodes.")
+        pool_manager.sync_from_nodes.assert_not_called()
+        pool_manager.rolling_replace_from_nodes.assert_not_called()
 
     def test_test_multiple_nodes_uses_configured_parallel_workers(self) -> None:
         nodes = [self._node(f"node-{i}", f"10.0.0.{i}") for i in range(1, 21)]
