@@ -67,6 +67,14 @@ def extract_api_token(headers: dict[str, str] | Any) -> str | None:
     return None
 
 
+def extract_query_api_token(qs: dict[str, list[str]] | Any) -> str | None:
+    vals = qs.get("token") if hasattr(qs, "get") else None
+    if not vals:
+        return None
+    token = vals[0] if isinstance(vals, list) else vals
+    return str(token).strip() or None
+
+
 def token_matches(expected: str, provided: str | None) -> bool:
     """Constant-time compare of expected vs provided API token."""
     if not expected or provided is None:
@@ -232,6 +240,9 @@ def parse_pool_query(qs: dict[str, list[str]]) -> dict[str, Any]:
         require_exit_ip = True
     elif require_exit_raw in ("0", "false", "no", "off"):
         require_exit_ip = False
+    return_type = (_first("return_type", "http") or "http").strip().lower()
+    if return_type not in ("http", "socks5"):
+        raise ValueError(f"invalid return_type: {return_type!r}")
 
     return {
         "country": _first("country", ""),
@@ -240,6 +251,7 @@ def parse_pool_query(qs: dict[str, list[str]]) -> dict[str, Any]:
         "sort": _first("sort", "latency") or "latency",
         "protocol": _first("protocol", "all") or "all",
         "ip_type": _first("ip_type", _first("type", "all")) or "all",
+        "return_type": return_type,
         "detail": detail,
         "fallback_unknown": fallback_unknown,
         "require_exit_ip": require_exit_ip,
@@ -611,6 +623,35 @@ class PoolManager:
             item["fallback_unknown_used"] = fallback_unknown_used
             item["require_exit_ip"] = strict_exit
             return item
+
+    def list_proxy_lines(
+        self,
+        country: str = "",
+        limit: int = 0,
+        offset: int = 0,
+        sort: str = "latency",
+        ip_type: str = "all",
+        fallback_unknown: bool = False,
+        require_exit_ip: bool | None = None,
+        return_type: str = "http",
+    ) -> str:
+        key = (return_type or "http").strip().lower()
+        if key not in ("http", "socks5"):
+            raise ValueError(f"invalid return_type: {return_type!r}")
+        result = self.list_proxies(
+            country=country,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+            ip_type=ip_type,
+            fallback_unknown=fallback_unknown,
+            require_exit_ip=require_exit_ip,
+        )
+        return "\n".join(
+            str(item.get(key) or "").strip()
+            for item in result.get("proxies", [])
+            if str(item.get(key) or "").strip()
+        )
 
     def status(self, detail: bool = False) -> dict[str, Any]:
         with self._lock:

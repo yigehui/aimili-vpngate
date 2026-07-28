@@ -6025,13 +6025,13 @@ class Handler(BaseHTTPRequestHandler):
         if SERVICE_MODE != "pool" or pool_manager is None:
             self.send_json({"ok": False, "error": "pool_mode_disabled"}, HTTPStatus.FORBIDDEN)
             return
+        parsed = urllib.parse.urlsplit(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
         cfg_token = getattr(pool_manager, "api_token", "") or ""
-        provided = proxy_pool.extract_api_token(self.headers)
+        provided = proxy_pool.extract_api_token(self.headers) or proxy_pool.extract_query_api_token(qs)
         if not proxy_pool.token_matches(cfg_token, provided):
             self.send_json({"ok": False, "error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
             return
-        parsed = urllib.parse.urlsplit(self.path)
-        qs = urllib.parse.parse_qs(parsed.query)
         try:
             q = proxy_pool.parse_pool_query(qs)
         except ValueError as exc:
@@ -6068,6 +6068,19 @@ class Handler(BaseHTTPRequestHandler):
                     require_exit_ip=q.get("require_exit_ip"),
                 )
             )
+            return
+        if effective_path in ("/api/pool/proxies/text", "/api/pool/proxies/text/"):
+            body = pool_manager.list_proxy_lines(
+                country=q.get("country") or "",
+                limit=int(q.get("limit") or 0),
+                offset=int(q.get("offset") or 0),
+                sort=str(q.get("sort") or "latency"),
+                ip_type=str(q.get("ip_type") or "all"),
+                fallback_unknown=bool(q.get("fallback_unknown")),
+                require_exit_ip=q.get("require_exit_ip"),
+                return_type=str(q.get("return_type") or "http"),
+            )
+            self.send_bytes(body.encode("utf-8"), "text/plain; charset=utf-8")
             return
         self.send_json({"ok": False, "error": "not_found"}, HTTPStatus.NOT_FOUND)
 

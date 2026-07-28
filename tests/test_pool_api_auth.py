@@ -21,6 +21,12 @@ class TokenTests(unittest.TestCase):
             "tok123",
         )
 
+    def test_extract_query_token(self) -> None:
+        self.assertEqual(
+            proxy_pool.extract_query_api_token({"token": ["tok-from-query"]}),
+            "tok-from-query",
+        )
+
     def test_check_token(self) -> None:
         self.assertTrue(proxy_pool.token_matches("secret", "secret"))
         self.assertFalse(proxy_pool.token_matches("secret", "nope"))
@@ -47,6 +53,16 @@ class ConfigLoadTests(unittest.TestCase):
             )
             cfg = proxy_pool.load_or_create_pool_config(path)
             self.assertNotIn("max_shadow_starting", cfg)
+
+
+class PoolQueryParseTests(unittest.TestCase):
+    def test_parse_pool_query_defaults_return_type_to_http(self) -> None:
+        parsed = proxy_pool.parse_pool_query({})
+        self.assertEqual(parsed["return_type"], "http")
+
+    def test_parse_pool_query_rejects_invalid_return_type(self) -> None:
+        with self.assertRaises(ValueError):
+            proxy_pool.parse_pool_query({"return_type": ["ftp"]})
 
 
 if __name__ == "__main__":

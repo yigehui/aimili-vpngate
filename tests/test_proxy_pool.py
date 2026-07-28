@@ -171,6 +171,21 @@ class PoolQueryTests(unittest.TestCase):
         self.assertEqual(st["slots"]["empty"], 2)
         self.assertEqual(st["port_base"], 52000)
 
+    def test_list_proxy_lines_defaults_to_http_multiline(self) -> None:
+        text = self.mgr.list_proxy_lines(country="jp,us", sort="port")
+        self.assertEqual(
+            text.splitlines(),
+            [
+                "http://user:pass@203.0.113.10:52000",
+                "http://user:pass@203.0.113.10:52001",
+                "http://user:pass@203.0.113.10:52002",
+            ],
+        )
+
+    def test_list_proxy_lines_supports_socks5(self) -> None:
+        text = self.mgr.list_proxy_lines(ip_type="hosting", return_type="socks5")
+        self.assertEqual(text, "socks5://user:pass@203.0.113.10:52001")
+
 
 class PoolSyncTests(unittest.TestCase):
     def test_sync_keeps_existing_ready_ports_when_node_list_changes(self) -> None:
