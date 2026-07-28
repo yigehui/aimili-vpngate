@@ -921,8 +921,9 @@ class PoolManager:
         now = time.time()
         with self._lock:
             self._last_candidates = list(candidates)
+            window_size = min(self.pool_size, self._routine_replace_count(batch_size))
             capacity = min(
-                self._routine_replace_count(batch_size),
+                window_size,
                 self.max_shadow_starting - self._shadow_inflight_count_locked(),
             )
             if capacity <= 0:
@@ -932,11 +933,11 @@ class PoolManager:
             if not ordered_candidates or not self.slots:
                 return 0
             candidate_index = 0
-            scanned = 0
-            while len(tasks) < capacity and candidate_index < len(ordered_candidates) and scanned < self.pool_size:
-                slot = self.slots[self.refresh_cursor % self.pool_size]
-                self.refresh_cursor = (self.refresh_cursor + 1) % self.pool_size
-                scanned += 1
+            start_cursor = self.refresh_cursor
+            for offset in range(window_size):
+                if len(tasks) >= capacity or candidate_index >= len(ordered_candidates):
+                    break
+                slot = self.slots[(start_cursor + offset) % self.pool_size]
                 if not (
                     slot.state == SLOT_READY
                     and not slot.replacement_pending
@@ -956,6 +957,7 @@ class PoolManager:
                 slot.replacement_deadline_at = now + self.replacement_grace_seconds
                 slot.shadow = shadow
                 tasks.append((slot, node))
+            self.refresh_cursor = (start_cursor + window_size) % self.pool_size
         for slot, node in tasks:
             threading.Thread(
                 target=self._start_shadow_for_slot,
