@@ -157,7 +157,6 @@ POOL_HEALTH_TARGET_URLS = [
     for url in os.environ.get("POOL_HEALTH_TARGET_URLS", "https://signup.live.com/signup?lic=1").split(",")
     if url.strip()
 ]
-POOL_REFRESH_BATCH_SIZE = env_int("POOL_REFRESH_BATCH_SIZE", 5, 0, 200)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 MERGE_MIRROR_SOURCES = env_bool("MERGE_MIRROR_SOURCES", True)
@@ -1769,8 +1768,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     if available_snapshot is not None:
         try:
             pool_manager.sync_from_nodes(available_snapshot)
-            if POOL_REFRESH_BATCH_SIZE > 0:
-                pool_manager.rolling_replace_from_nodes(available_snapshot, batch_size=POOL_REFRESH_BATCH_SIZE)
+            pool_manager.rolling_replace_from_nodes(available_snapshot)
         except Exception as pool_exc:
             print(f"[test_multiple_nodes] pool rolling refresh failed: {pool_exc}", flush=True)
         
@@ -3513,6 +3511,7 @@ INDEX_HTML = r"""<!doctype html>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
     </select>
+    <input id="exit_ip_filter" type="text" placeholder="出口IP筛选（模糊）" class="input-field" style="max-width: 220px; height: 42px;" />
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
@@ -3569,6 +3568,12 @@ INDEX_HTML = r"""<!doctype html>
         显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条筛选结果 / 总数 <span id="total_node_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
       </div>
       <div style="display: flex; gap: 8px; align-items: center;">
+        <label for="page_size_select" style="font-size: 13px; color: var(--text-secondary);">每页</label>
+        <select id="page_size_select" class="input-field" style="width: 84px; height: 32px; padding: 0 8px; font-size: 12px;">
+          <option value="20">20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
         <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
         <button id="btn_prev_page" class="connect-btn" style="height: 32px; padding: 0 10px;">上一页</button>
         <span style="font-size: 13px; color: var(--text-secondary); margin: 0 8px;">
@@ -3967,6 +3972,18 @@ INDEX_HTML = r"""<!doctype html>
         <div style="font-weight: 700; color: var(--text-primary);">端口 / 槽位代理列表</div>
         <button type="button" onclick="loadPoolManageStatus()" class="btn-primary" style="height: 34px; padding: 0 14px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">刷新</button>
       </div>
+      <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px;">
+        <select id="pool_manage_country_filter" class="input-field" style="width: 140px; height: 36px; font-size: 12px;">
+          <option value="">所有国家</option>
+        </select>
+        <select id="pool_manage_ip_type_filter" class="input-field" style="width: 140px; height: 36px; font-size: 12px;">
+          <option value="">所有IP类型</option>
+          <option value="residential">住宅IP</option>
+          <option value="hosting">机房IP</option>
+          <option value="mobile">移动网络</option>
+        </select>
+        <input id="pool_manage_exit_ip_filter" type="text" placeholder="出口IP筛选（模糊）" class="input-field" style="width: 220px; height: 36px; font-size: 12px;" />
+      </div>
       <div style="overflow: auto; border: 1px solid var(--border-color); border-radius: 10px; max-height: 560px;">
         <table style="width: 100%; border-collapse: collapse; font-size: 12px; min-width: 1080px;">
           <thead style="position: sticky; top: 0; background: #111827; z-index: 1;">
@@ -3995,6 +4012,12 @@ INDEX_HTML = r"""<!doctype html>
           显示第 <span id="pool_page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="pool_page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="pool_filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条槽位
         </div>
         <div style="display: flex; gap: 8px; align-items: center;">
+          <label for="pool_manage_page_size_select" style="font-size: 13px; color: var(--text-secondary);">每页</label>
+          <select id="pool_manage_page_size_select" class="input-field" style="width: 84px; height: 32px; padding: 0 8px; font-size: 12px;">
+            <option value="20">20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
           <button id="pool_btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
           <button id="pool_btn_prev_page" class="connect-btn" style="height: 32px; padding: 0 10px;">上一页</button>
           <span style="font-size: 13px; color: var(--text-secondary); margin: 0 8px;">
@@ -4061,10 +4084,10 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
-const pageSize = 50;
+let pageSize = 20;
 let currentPageNodes = [];
 let poolManagePage = 1;
-const poolManagePageSize = 20;
+let poolManagePageSize = 20;
 let poolManageLastData = null;
 
 const $=id=>document.getElementById(id);
@@ -4186,22 +4209,72 @@ function updateCountryFilter() {
   }
 }
 
+function normalizeFilterText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function matchesIpTypeFilter(actualType, selectedType) {
+  if (!selectedType) return true;
+  if (selectedType === "residential") {
+    return ["residential", "mobile"].includes(actualType);
+  }
+  return actualType === selectedType;
+}
+
+function updatePoolManageCountryFilter(details) {
+  const select = $("pool_manage_country_filter");
+  if (!select) return;
+  const selectedValue = select.value;
+  const countries = Array.from(new Set((details || []).map(slot => String(slot.country || "").trim()).filter(Boolean))).sort();
+  const currentOptions = Array.from(select.options).map(o => o.value).filter(Boolean);
+  if (JSON.stringify(countries) === JSON.stringify(currentOptions)) {
+    if (selectedValue && !countries.includes(selectedValue)) {
+      select.value = "";
+    }
+    return;
+  }
+  select.innerHTML = '<option value="">所有国家</option>' + countries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  select.value = countries.includes(selectedValue) ? selectedValue : "";
+}
+
+function getFilteredPoolManageDetails(details) {
+  const selectedCountry = $("pool_manage_country_filter") ? $("pool_manage_country_filter").value : "";
+  const selectedIpType = $("pool_manage_ip_type_filter") ? $("pool_manage_ip_type_filter").value : "";
+  const exitIpKeyword = normalizeFilterText($("pool_manage_exit_ip_filter") ? $("pool_manage_exit_ip_filter").value : "");
+  return (details || []).filter(slot => {
+    if (!slot) return false;
+    const slotCountry = String(slot.country || "").trim();
+    const slotIpType = normalizeFilterText(slot.ip_type);
+    const slotExitIp = normalizeFilterText(slot.exit_ip);
+    if (selectedCountry && slotCountry !== selectedCountry) {
+      return false;
+    }
+    if (!matchesIpTypeFilter(slotIpType, selectedIpType)) {
+      return false;
+    }
+    if (exitIpKeyword && !slotExitIp.includes(exitIpKeyword)) {
+      return false;
+    }
+    return true;
+  });
+}
+
 function getFilteredNodes() {
   const selectedCountry = $("country_filter").value;
   const selectedIpType = $("ip_type_filter").value;
   const selectedStatus = $("status_filter").value;
+  const exitIpKeyword = normalizeFilterText($("exit_ip_filter").value);
   return nodes.filter(n => {
     if (!n) return false;
     if (selectedCountry && translateCountry(n.country) !== selectedCountry) {
       return false;
     }
-    if (selectedIpType) {
-      if (selectedIpType === "residential" && !["residential", "mobile"].includes(n.ip_type)) {
-        return false;
-      }
-      if (selectedIpType === "hosting" && n.ip_type !== "hosting") {
-        return false;
-      }
+    if (!matchesIpTypeFilter(normalizeFilterText(n.ip_type), selectedIpType)) {
+      return false;
+    }
+    const exitIpValue = normalizeFilterText(n.exit_ip || n.ip || n.remote_host || "");
+    if (exitIpKeyword && !exitIpValue.includes(exitIpKeyword)) {
+      return false;
     }
     if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) {
       return false;
@@ -4462,6 +4535,11 @@ $("btn_last_page").onclick = () => {
   currentPage = totalPages;
   render();
 };
+$("country_filter").onchange=()=>{ currentPage = 1; render(); };
+$("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
+$("status_filter").onchange=()=>{ currentPage = 1; render(); };
+$("exit_ip_filter").oninput=()=>{ currentPage = 1; render(); };
+$("page_size_select").onchange=()=>{ pageSize = parseInt($("page_size_select").value, 10) || 20; currentPage = 1; render(); };
 
 async function testNode(btn, id, event){
   if (event) event.stopPropagation();
@@ -4652,10 +4730,6 @@ async function load(){
     startConnectionPolling();
   }
 }
-$("country_filter").onchange=()=>{ currentPage = 1; render(); };
-$("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
-$("status_filter").onchange=()=>{ currentPage = 1; render(); };
-
 $("refresh").onclick=async()=>{
   refreshButtonBusy("正在启动更新...");
   try{
@@ -5390,19 +5464,26 @@ function renderPoolManage(data) {
     tokenInput.placeholder = data.api_token_masked ? `当前：${data.api_token_masked}` : "输入新的 API Token，至少 16 位";
   }
   const details = Array.isArray(pool.slot_detail) ? pool.slot_detail : [];
+  updatePoolManageCountryFilter(details);
   if (!tbody) return;
   if (!details.length) {
     tbody.innerHTML = `<tr><td colspan="11" style="padding:14px;color:var(--text-secondary);">暂无槽位详情。请确认当前为 pool 模式。</td></tr>`;
     updatePoolManagePagination(0, 0, 0, 1);
     return;
   }
-  const totalPoolPages = Math.ceil(details.length / poolManagePageSize) || 1;
+  const filteredDetails = getFilteredPoolManageDetails(details);
+  if (!filteredDetails.length) {
+    tbody.innerHTML = `<tr><td colspan="11" style="padding:14px;color:var(--text-secondary);">未找到符合筛选条件的槽位。</td></tr>`;
+    updatePoolManagePagination(0, 0, 0, 1);
+    return;
+  }
+  const totalPoolPages = Math.ceil(filteredDetails.length / poolManagePageSize) || 1;
   if (poolManagePage > totalPoolPages) poolManagePage = totalPoolPages;
   if (poolManagePage < 1) poolManagePage = 1;
   const poolStartIndex = (poolManagePage - 1) * poolManagePageSize;
-  const poolEndIndex = Math.min(poolStartIndex + poolManagePageSize, details.length);
-  const pageDetails = details.slice(poolStartIndex, poolEndIndex);
-  updatePoolManagePagination(details.length, poolStartIndex, poolEndIndex, totalPoolPages);
+  const poolEndIndex = Math.min(poolStartIndex + poolManagePageSize, filteredDetails.length);
+  const pageDetails = filteredDetails.slice(poolStartIndex, poolEndIndex);
+  updatePoolManagePagination(filteredDetails.length, poolStartIndex, poolEndIndex, totalPoolPages);
   tbody.innerHTML = pageDetails.map(slot => {
     const err = slot.last_error ? `<div style="max-width:220px;color:var(--danger);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(slot.last_error)}">${esc(slot.last_error)}</div>` : "";
     return `<tr style="border-top: 1px solid rgba(255,255,255,0.05);">
@@ -5428,13 +5509,21 @@ function rerenderPoolManagePage() {
 $("pool_btn_first_page").onclick = () => { poolManagePage = 1; rerenderPoolManagePage(); };
 $("pool_btn_prev_page").onclick = () => { if (poolManagePage > 1) { poolManagePage--; rerenderPoolManagePage(); } };
 $("pool_btn_next_page").onclick = () => {
-  const details = poolManageLastData && poolManageLastData.pool && Array.isArray(poolManageLastData.pool.slot_detail) ? poolManageLastData.pool.slot_detail : [];
+  const details = poolManageLastData && poolManageLastData.pool && Array.isArray(poolManageLastData.pool.slot_detail) ? getFilteredPoolManageDetails(poolManageLastData.pool.slot_detail) : [];
   const totalPages = Math.ceil(details.length / poolManagePageSize) || 1;
   if (poolManagePage < totalPages) { poolManagePage++; rerenderPoolManagePage(); }
 };
 $("pool_btn_last_page").onclick = () => {
-  const details = poolManageLastData && poolManageLastData.pool && Array.isArray(poolManageLastData.pool.slot_detail) ? poolManageLastData.pool.slot_detail : [];
+  const details = poolManageLastData && poolManageLastData.pool && Array.isArray(poolManageLastData.pool.slot_detail) ? getFilteredPoolManageDetails(poolManageLastData.pool.slot_detail) : [];
   poolManagePage = Math.ceil(details.length / poolManagePageSize) || 1;
+  rerenderPoolManagePage();
+};
+$("pool_manage_country_filter").onchange = () => { poolManagePage = 1; rerenderPoolManagePage(); };
+$("pool_manage_ip_type_filter").onchange = () => { poolManagePage = 1; rerenderPoolManagePage(); };
+$("pool_manage_exit_ip_filter").oninput = () => { poolManagePage = 1; rerenderPoolManagePage(); };
+$("pool_manage_page_size_select").onchange = () => {
+  poolManagePageSize = parseInt($("pool_manage_page_size_select").value, 10) || 20;
+  poolManagePage = 1;
   rerenderPoolManagePage();
 };
 

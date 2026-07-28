@@ -304,6 +304,7 @@ class VpnGateBatchProbeTests(unittest.TestCase):
         pool_manager.rolling_replace_from_nodes.assert_called_once()
         synced_nodes = pool_manager.rolling_replace_from_nodes.call_args.args[0]
         self.assertEqual([node["id"] for node in synced_nodes], ["node-1"])
+        self.assertEqual(pool_manager.rolling_replace_from_nodes.call_args.kwargs, {})
 
     def test_test_multiple_nodes_uses_configured_parallel_workers(self) -> None:
         nodes = [self._node(f"node-{i}", f"10.0.0.{i}") for i in range(1, 21)]

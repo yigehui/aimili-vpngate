@@ -347,6 +347,7 @@ class PoolManager:
         self._started = False
         self._fill_thread: threading.Thread | None = None
         self._temp_config_dir: tempfile.TemporaryDirectory[str] | None = None
+        self.refresh_cursor = 0
 
     def start(self) -> None:
         self._started = True
@@ -822,10 +823,54 @@ class PoolManager:
                     pass
         return 10**9
 
+    def _routine_replace_count(self, batch_size: int | None = None) -> int:
+        if batch_size is not None:
+            return max(0, int(batch_size or 0))
+        return max(1, self.pool_size // 10)
+
+    def _candidate_priority_key(self, node: dict[str, Any]) -> tuple[int, float, str]:
+        ip_type = str(node.get("ip_type") or "").strip().lower()
+        tier = 0 if ip_type in ("residential", "mobile") else 1
+        return (tier, self._latency_key(node), self._node_id(node))
+
+    def _select_refresh_candidates_locked(
+        self,
+        candidates: list[dict[str, Any]],
+        consumed_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        used_ids = {
+            s.node_id
+            for s in self.slots
+            if s.node_id and s.state in (SLOT_READY, SLOT_STARTING)
+        }
+        used_ids.update(
+            s.shadow.node_id
+            for s in self.slots
+            if s.shadow is not None and s.shadow.node_id
+        )
+        now = time.time()
+        selected: list[dict[str, Any]] = []
+        for node in sorted(candidates, key=self._candidate_priority_key):
+            nid = self._node_id(node)
+            if not nid or nid in used_ids or nid in consumed_ids:
+                continue
+            until = self._skipped.get(nid)
+            if until is not None and until > now:
+                continue
+            consumed_ids.add(nid)
+            selected.append(node)
+        return selected
+
     def sync_from_nodes(self, nodes: list[dict[str, Any]]) -> None:
         with self._lock:
             candidates = self._dedupe_nodes(list(nodes or []))
-            candidates.sort(key=self._latency_key)
+            has_live_slots = any(
+                s.node_id and s.state in (SLOT_READY, SLOT_STARTING)
+                for s in self.slots
+            )
+            candidates.sort(
+                key=self._candidate_priority_key if has_live_slots else self._latency_key
+            )
             self._last_candidates = list(candidates)
 
             # Do not churn existing READY ports during a node-list refresh.
@@ -836,35 +881,39 @@ class PoolManager:
 
         self._request_fill_slots()
 
-    def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int = 5) -> int:
+    def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
         candidates = self._dedupe_nodes(list(nodes or []))
-        limit = max(0, int(batch_size or 0))
         tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
         now = time.time()
         with self._lock:
-            candidates.sort(key=self._latency_key)
             self._last_candidates = list(candidates)
-            capacity = min(limit, self.max_shadow_starting - self._shadow_inflight_count_locked())
+            capacity = min(
+                self._routine_replace_count(batch_size),
+                self.max_shadow_starting - self._shadow_inflight_count_locked(),
+            )
             if capacity <= 0:
                 return 0
-            slots = sorted(
-                [
-                    s for s in self.slots
-                    if s.state == SLOT_READY
-                    and not s.replacement_pending
-                    and s.shadow is None
-                    and s.process is not None
-                    and s.listener is not None
-                    and s.node_id
-                ],
-                key=lambda s: s.updated_at or 0,
-            )
-            for slot in slots:
-                if len(tasks) >= capacity:
-                    break
-                node = self._reserve_shadow_node_locked(slot)
-                if node is None:
-                    break
+            consumed_ids: set[str] = set()
+            ordered_candidates = self._select_refresh_candidates_locked(candidates, consumed_ids)
+            if not ordered_candidates or not self.slots:
+                return 0
+            candidate_index = 0
+            scanned = 0
+            while len(tasks) < capacity and candidate_index < len(ordered_candidates) and scanned < self.pool_size:
+                slot = self.slots[self.refresh_cursor % self.pool_size]
+                self.refresh_cursor = (self.refresh_cursor + 1) % self.pool_size
+                scanned += 1
+                if not (
+                    slot.state == SLOT_READY
+                    and not slot.replacement_pending
+                    and slot.shadow is None
+                    and slot.process is not None
+                    and slot.listener is not None
+                    and slot.node_id
+                ):
+                    continue
+                node = ordered_candidates[candidate_index]
+                candidate_index += 1
                 shadow = ShadowCandidate(index=slot.index, tun_name=self._shadow_tun_name(slot), port=self._shadow_port(slot))
                 self._shadow_meta_from_node(shadow, node)
                 slot.replacement_pending = True
