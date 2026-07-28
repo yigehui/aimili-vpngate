@@ -904,13 +904,7 @@ class PoolManager:
     def sync_from_nodes(self, nodes: list[dict[str, Any]]) -> None:
         with self._lock:
             candidates = self._dedupe_nodes(list(nodes or []))
-            has_live_slots = any(
-                s.node_id and s.state in (SLOT_READY, SLOT_STARTING)
-                for s in self.slots
-            )
-            candidates.sort(
-                key=self._candidate_priority_key if has_live_slots else self._latency_key
-            )
+            candidates.sort(key=self._candidate_priority_key)
             self._last_candidates = list(candidates)
 
             # Do not churn existing READY ports during a node-list refresh.

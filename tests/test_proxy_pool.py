@@ -354,7 +354,7 @@ class PoolLifecycleTests(unittest.TestCase):
         _wait_ready(mgr, 2)
         self.assertEqual(sum(1 for s in mgr.slots if s.state == proxy_pool.SLOT_READY), 2)
 
-    def test_cold_start_sync_keeps_fastest_fill_order(self) -> None:
+    def test_cold_start_sync_prefers_non_hosting_over_faster_hosting(self) -> None:
         mgr = self._mgr(pool_size=2, max_starting=2)
         mgr.start()
         mgr.sync_from_nodes([
@@ -364,7 +364,7 @@ class PoolLifecycleTests(unittest.TestCase):
              "score_latency": 50, "ip_type": "residential", "config_text": "b", "probe_status": "available"},
         ])
         _wait_ready(mgr, 2)
-        self.assertEqual([mgr.slots[i].node_id for i in range(2)], ["fast_hosting", "slow_residential"])
+        self.assertEqual([mgr.slots[i].node_id for i in range(2)], ["slow_residential", "fast_hosting"])
         mgr.shutdown()
 
     def test_warm_sync_refill_prefers_non_hosting_for_empty_slot(self) -> None:
