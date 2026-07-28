@@ -6882,7 +6882,6 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         proxy_pass=str(cfg["proxy_pass"]),
         return_credentials=bool(cfg.get("return_credentials", True)),
         max_starting=int(cfg.get("max_starting", 5)),
-        max_shadow_starting=int(cfg.get("max_shadow_starting", 5)),
         slot_start_timeout=int(cfg.get("slot_start_timeout", 90)),
         replacement_grace_seconds=int(cfg.get("replacement_grace_seconds", 180)),
         shadow_port_base=int(cfg.get("shadow_port_base", 53000)),

@@ -160,7 +160,6 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
             "POOL_API_RETURN_CREDENTIALS", "return_credentials", True
         ),
         "max_starting": _pick_int("POOL_MAX_STARTING", "max_starting", 5),
-        "max_shadow_starting": _pick_int("POOL_MAX_SHADOW_STARTING", "max_shadow_starting", 5),
         "slot_start_timeout": _pick_int("POOL_SLOT_START_TIMEOUT", "slot_start_timeout", 90),
         "replacement_grace_seconds": _pick_int("POOL_REPLACEMENT_GRACE_SECONDS", "replacement_grace_seconds", 180),
         "shadow_port_base": _pick_int("POOL_SHADOW_PORT_BASE", "shadow_port_base", 53000),
@@ -182,7 +181,6 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
             "listen_host": cfg["listen_host"],
             "return_credentials": cfg["return_credentials"],
             "max_starting": cfg["max_starting"],
-            "max_shadow_starting": cfg["max_shadow_starting"],
             "slot_start_timeout": cfg["slot_start_timeout"],
             "replacement_grace_seconds": cfg["replacement_grace_seconds"],
             "shadow_port_base": cfg["shadow_port_base"],

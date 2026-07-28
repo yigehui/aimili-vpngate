@@ -38,6 +38,16 @@ class ConfigLoadTests(unittest.TestCase):
             cfg2 = proxy_pool.load_or_create_pool_config(path)
             self.assertEqual(cfg1, cfg2)
 
+    def test_load_or_create_pool_secrets_ignores_deprecated_shadow_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "pool_secrets.json"
+            path.write_text(
+                '{"api_token":"a","proxy_user":"u","proxy_pass":"p","max_shadow_starting":99}\n',
+                encoding="utf-8",
+            )
+            cfg = proxy_pool.load_or_create_pool_config(path)
+            self.assertNotIn("max_shadow_starting", cfg)
+
 
 if __name__ == "__main__":
     unittest.main()
