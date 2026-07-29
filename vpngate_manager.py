@@ -1759,8 +1759,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             available_snapshot = [n for n in sorted_nodes if n.get("probe_status") == "available"]
     if available_snapshot is not None:
         try:
-            pool_manager.sync_from_nodes(available_snapshot)
             pool_manager.rolling_replace_from_nodes(available_snapshot)
+            pool_manager.sync_from_nodes(available_snapshot)
         except Exception as pool_exc:
             print(f"[test_multiple_nodes] pool rolling refresh failed: {pool_exc}", flush=True)
         

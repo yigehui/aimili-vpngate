@@ -370,6 +370,8 @@ class PoolLifecycleTests(unittest.TestCase):
     def test_warm_sync_refill_prefers_non_hosting_for_empty_slot(self) -> None:
         mgr = self._mgr(pool_size=2, max_starting=2)
         mgr.slots[0] = _ready_slot(0, "US", 10, node_id="existing_ready")
+        mgr.slots[0].node_ip = "1.1.1.1"
+        mgr.slots[0].exit_ip = "1.1.1.1"
         mgr.start()
         mgr.sync_from_nodes([
             {"id": "fast_hosting", "country_short": "US", "country": "US", "ip": "1.1.1.1",

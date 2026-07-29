@@ -875,6 +875,9 @@ class PoolManager:
     def _slot_exit_key(self, slot: PoolSlot) -> str:
         return str(slot.exit_ip or slot.node_ip or "").strip()
 
+    def _shadow_exit_key(self, shadow: ShadowCandidate) -> str:
+        return str(shadow.exit_ip or shadow.node_ip or "").strip()
+
     def _target_nodes(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         target: list[dict[str, Any]] = []
         seen_exit_keys: set[str] = set()
@@ -976,7 +979,7 @@ class PoolManager:
             # is unusable. Keep current proxies stable and let health checks replace
             # a slot only when the actual OpenVPN/listener/exit-IP check fails.
 
-        self._request_fill_slots()
+        self._request_fill_slots(target_only=True)
 
     def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
         candidates = self._dedupe_nodes(list(nodes or []))
@@ -1068,19 +1071,24 @@ class PoolManager:
         if probe_health and self.health_check is not None:
             self.probe_ready_slots()
 
-    def _request_fill_slots(self) -> None:
+    def _request_fill_slots(self, target_only: bool = False) -> None:
         if not self._started:
             return
         with self._lock:
             if self._fill_thread is not None and self._fill_thread.is_alive():
                 return
-            self._fill_thread = threading.Thread(target=self._fill_worker, name="proxy-pool-fill", daemon=True)
+            self._fill_thread = threading.Thread(
+                target=self._fill_worker,
+                args=(target_only,),
+                name="proxy-pool-fill",
+                daemon=True,
+            )
             self._fill_thread.start()
 
-    def _fill_worker(self) -> None:
-        self._run_fill_loop()
+    def _fill_worker(self, target_only: bool = False) -> None:
+        self._run_fill_loop(target_only=target_only)
 
-    def _run_fill_loop(self) -> None:
+    def _run_fill_loop(self, target_only: bool = False) -> None:
         while True:
             tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
             with self._lock:
@@ -1088,7 +1096,7 @@ class PoolManager:
                     return
                 capacity = self.max_starting - sum(1 for s in self.slots if s.state == SLOT_STARTING)
                 for _ in range(max(0, capacity)):
-                    task = self._reserve_start_task_locked()
+                    task = self._reserve_start_task_locked(target_only=target_only)
                     if task is None:
                         break
                     tasks.append(task)
@@ -1122,13 +1130,29 @@ class PoolManager:
         for slot in ready_slots:
             self._probe_ready_slot(slot)
 
-    def _reserve_start_task_locked(self) -> tuple[PoolSlot, dict[str, Any]] | None:
-        candidates = list(self._last_candidates or [])
+    def _reserve_start_task_locked(self, target_only: bool = False) -> tuple[PoolSlot, dict[str, Any]] | None:
+        candidates = (
+            self._target_nodes(list(self._last_candidates or []))
+            if target_only
+            else list(self._last_candidates or [])
+        )
         used_ids = {
             s.node_id
             for s in self.slots
             if s.state in (SLOT_READY, SLOT_STARTING) and s.node_id
         }
+        used_exit_keys: set[str] = set()
+        if target_only:
+            used_exit_keys = {
+                self._slot_exit_key(s)
+                for s in self.slots
+                if s.state in (SLOT_READY, SLOT_STARTING) and self._slot_exit_key(s)
+            }
+            used_exit_keys.update(
+                self._shadow_exit_key(s.shadow)
+                for s in self.slots
+                if s.shadow is not None and self._shadow_exit_key(s.shadow)
+            )
         empty_slots = [s for s in self.slots if s.state == SLOT_EMPTY]
         if not empty_slots:
             return None
@@ -1138,12 +1162,18 @@ class PoolManager:
                 continue
             for node in candidates:
                 nid = self._node_id(node)
+                exit_key = self._candidate_exit_key(node)
                 if not nid or nid in used_ids:
+                    continue
+                if target_only and (not exit_key or exit_key in used_exit_keys):
                     continue
                 until = self._skipped.get(nid)
                 if until is not None and until > now:
                     continue
                 self._assign_slot_metadata(slot, node)
+                used_ids.add(nid)
+                if target_only and exit_key:
+                    used_exit_keys.add(exit_key)
                 return slot, node
         return None
 

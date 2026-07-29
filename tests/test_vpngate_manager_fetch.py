@@ -302,6 +302,10 @@ class VpnGateBatchProbeTests(unittest.TestCase):
         pool_manager.sync_from_nodes.assert_called_once()
         pool_manager.replace_all_slots_from_nodes.assert_not_called()
         pool_manager.rolling_replace_from_nodes.assert_called_once()
+        self.assertLess(
+            pool_manager.method_calls.index(mock.call.rolling_replace_from_nodes(mock.ANY)),
+            pool_manager.method_calls.index(mock.call.sync_from_nodes(mock.ANY)),
+        )
         synced_once_nodes = pool_manager.sync_from_nodes.call_args.args[0]
         self.assertEqual([node["id"] for node in synced_once_nodes], ["node-1"])
         synced_nodes = pool_manager.rolling_replace_from_nodes.call_args.args[0]
