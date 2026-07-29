@@ -869,6 +869,12 @@ class PoolManager:
             return max(0, int(batch_size or 0))
         return self.pool_size
 
+    def _routine_shadow_capacity_locked(self) -> int:
+        return max(0, self.pool_size - self._shadow_inflight_count_locked())
+
+    def _routine_start_capacity_locked(self) -> int:
+        return max(0, self.pool_size - sum(1 for s in self.slots if s.state == SLOT_STARTING))
+
     def _candidate_exit_key(self, node: dict[str, Any]) -> str:
         return str(node.get("exit_ip") or node.get("ip") or node.get("node_ip") or "").strip()
 
@@ -992,8 +998,8 @@ class PoolManager:
             window_size = min(self.pool_size, self._routine_replace_count(batch_size))
             if not candidates or not self.slots:
                 return 0
-            shadow_capacity = max(0, self.max_shadow_starting - self._shadow_inflight_count_locked())
-            start_capacity = max(0, self.max_starting - sum(1 for s in self.slots if s.state == SLOT_STARTING))
+            shadow_capacity = self._routine_shadow_capacity_locked()
+            start_capacity = self._routine_start_capacity_locked()
             capacity = min(window_size, shadow_capacity + start_capacity)
             if capacity <= 0:
                 return 0

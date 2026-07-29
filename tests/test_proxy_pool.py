@@ -958,6 +958,53 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual([mgr.slots[i].node_id for i in range(20)], [f"new-{i:02d}" for i in range(20)])
         mgr.shutdown()
 
+    def test_default_rolling_replace_ignores_small_starting_limits(self) -> None:
+        def health_check(slot):
+            return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}
+
+        mgr = self._mgr(pool_size=20, max_starting=1, max_shadow_starting=1)
+        mgr.health_check = mock.Mock(side_effect=health_check)
+        mgr.start()
+        mgr.sync_from_nodes([
+            {
+                "id": f"old-{i:02d}",
+                "country_short": "JP",
+                "country": "Japan",
+                "ip": f"1.1.1.{i}",
+                "score_latency": 100 + i,
+                "ip_type": "hosting",
+                "config_text": f"old-{i}",
+                "probe_status": "available",
+            }
+            for i in range(20)
+        ])
+        _wait_ready(mgr, 20)
+
+        started = mgr.rolling_replace_from_nodes([
+            {
+                "id": f"new-{i:02d}",
+                "country_short": "TH",
+                "country": "Thailand",
+                "ip": f"2.2.2.{i}",
+                "score_latency": i,
+                "ip_type": "residential",
+                "config_text": f"new-{i}",
+                "probe_status": "available",
+            }
+            for i in range(20)
+        ])
+
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            ids = [mgr.slots[i].node_id for i in range(20)]
+            if ids == [f"new-{i:02d}" for i in range(20)]:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(started, 20)
+        self.assertEqual([mgr.slots[i].node_id for i in range(20)], [f"new-{i:02d}" for i in range(20)])
+        mgr.shutdown()
+
     def test_new_manager_starts_refresh_cursor_from_zero(self) -> None:
         mgr = self._mgr(pool_size=4, max_starting=4, max_shadow_starting=2)
         self.assertEqual(mgr.refresh_cursor, 0)
