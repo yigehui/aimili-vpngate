@@ -917,6 +917,7 @@ class PoolManager:
 
     def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
         candidates = self._dedupe_nodes(list(nodes or []))
+        candidates.sort(key=self._candidate_priority_key)
         tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
         now = time.time()
         with self._lock:
@@ -928,16 +929,18 @@ class PoolManager:
             )
             if capacity <= 0:
                 return 0
-            consumed_ids: set[str] = set()
-            ordered_candidates = self._select_refresh_candidates_locked(candidates, consumed_ids)
-            if not ordered_candidates or not self.slots:
+            if not candidates or not self.slots:
                 return 0
-            candidate_index = 0
             start_cursor = self.refresh_cursor
             for offset in range(window_size):
-                if len(tasks) >= capacity or candidate_index >= len(ordered_candidates):
+                if len(tasks) >= capacity:
                     break
                 slot = self.slots[(start_cursor + offset) % self.pool_size]
+                if slot.index >= len(candidates):
+                    continue
+                node = candidates[slot.index]
+                if self._node_id(node) == slot.node_id:
+                    continue
                 if not (
                     slot.state == SLOT_READY
                     and not slot.replacement_pending
@@ -947,8 +950,6 @@ class PoolManager:
                     and slot.node_id
                 ):
                     continue
-                node = ordered_candidates[candidate_index]
-                candidate_index += 1
                 shadow = ShadowCandidate(index=slot.index, tun_name=self._shadow_tun_name(slot), port=self._shadow_port(slot))
                 self._shadow_meta_from_node(shadow, node)
                 slot.replacement_pending = True
