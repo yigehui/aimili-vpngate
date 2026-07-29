@@ -918,22 +918,22 @@ class PoolManager:
     def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
         candidates = self._dedupe_nodes(list(nodes or []))
         candidates.sort(key=self._candidate_priority_key)
-        tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
+        shadow_tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
+        start_tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
         now = time.time()
         with self._lock:
             self._last_candidates = list(candidates)
             window_size = min(self.pool_size, self._routine_replace_count(batch_size))
-            capacity = min(
-                window_size,
-                self.max_shadow_starting - self._shadow_inflight_count_locked(),
-            )
-            if capacity <= 0:
-                return 0
             if not candidates or not self.slots:
+                return 0
+            shadow_capacity = max(0, self.max_shadow_starting - self._shadow_inflight_count_locked())
+            start_capacity = max(0, self.max_starting - sum(1 for s in self.slots if s.state == SLOT_STARTING))
+            capacity = min(window_size, shadow_capacity + start_capacity)
+            if capacity <= 0:
                 return 0
             start_cursor = self.refresh_cursor
             for offset in range(window_size):
-                if len(tasks) >= capacity:
+                if len(shadow_tasks) + len(start_tasks) >= capacity:
                     break
                 slot = self.slots[(start_cursor + offset) % self.pool_size]
                 if slot.index >= len(candidates):
@@ -941,7 +941,21 @@ class PoolManager:
                 node = candidates[slot.index]
                 if self._node_id(node) == slot.node_id:
                     continue
+                if slot.state == SLOT_EMPTY:
+                    if (
+                        start_capacity <= 0
+                        or slot.replacement_pending
+                        or slot.shadow is not None
+                        or not self._prepare_empty_slot_port(slot)
+                    ):
+                        continue
+                    self._assign_slot_metadata(slot, node)
+                    start_tasks.append((slot, node))
+                    start_capacity -= 1
+                    continue
                 if not (
+                    shadow_capacity > 0
+                    and
                     slot.state == SLOT_READY
                     and not slot.replacement_pending
                     and slot.shadow is None
@@ -957,16 +971,24 @@ class PoolManager:
                 slot.replacement_requested_at = now
                 slot.replacement_deadline_at = now + self.replacement_grace_seconds
                 slot.shadow = shadow
-                tasks.append((slot, node))
+                shadow_tasks.append((slot, node))
+                shadow_capacity -= 1
             self.refresh_cursor = (start_cursor + window_size) % self.pool_size
-        for slot, node in tasks:
+        for slot, node in shadow_tasks:
             threading.Thread(
                 target=self._start_shadow_for_slot,
                 args=(slot, node),
                 name=f"proxy-pool-rolling-{slot.index}",
                 daemon=True,
             ).start()
-        return len(tasks)
+        for slot, node in start_tasks:
+            threading.Thread(
+                target=self._start_reserved_slot,
+                args=(slot, node),
+                name=f"proxy-pool-slot-{slot.index}",
+                daemon=True,
+            ).start()
+        return len(shadow_tasks) + len(start_tasks)
 
     def replace_all_slots_from_nodes(self, nodes: list[dict[str, Any]], probe_health: bool = True) -> None:
         with self._lock:
