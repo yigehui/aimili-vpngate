@@ -300,8 +300,6 @@ class VpnGateBatchProbeTests(unittest.TestCase):
 
         self.assertEqual(len(results), 2)
         pool_manager.replace_all_slots_from_target_nodes.assert_called_once()
-        pool_manager.sync_from_nodes.assert_not_called()
-        pool_manager.replace_all_slots_from_nodes.assert_not_called()
         replaced_nodes = pool_manager.replace_all_slots_from_target_nodes.call_args.args[0]
         self.assertEqual([node["id"] for node in replaced_nodes], ["node-1"])
         self.assertEqual(pool_manager.replace_all_slots_from_target_nodes.call_args.kwargs, {"batch_size": 50})
@@ -342,7 +340,6 @@ class VpnGateBatchProbeTests(unittest.TestCase):
                 message = vpngate_manager.maintain_valid_nodes(False)
 
         self.assertEqual(message, "Fetched 1 nodes. Tested 1 non-active nodes.")
-        pool_manager.sync_from_nodes.assert_not_called()
         pool_manager.replace_all_slots_from_target_nodes.assert_not_called()
 
     def test_test_multiple_nodes_uses_configured_parallel_workers(self) -> None:

@@ -30,6 +30,16 @@ def _ready_slot(index: int, country: str, latency: int, node_id: str | None = No
     return slot
 
 
+def _seed_pool(mgr: proxy_pool.PoolManager, nodes: list[dict[str, object]]) -> int:
+    return mgr.replace_all_slots_from_target_nodes(list(nodes), batch_size=mgr.pool_size)
+
+
+def _set_candidates(mgr: proxy_pool.PoolManager, nodes: list[dict[str, object]]) -> None:
+    candidates = mgr._dedupe_nodes(list(nodes))
+    candidates.sort(key=mgr._candidate_priority_key)
+    mgr._last_candidates = list(candidates)
+
+
 class PoolQueryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.mgr = proxy_pool.PoolManager(
@@ -188,31 +198,6 @@ class PoolQueryTests(unittest.TestCase):
 
 
 class PoolSyncTests(unittest.TestCase):
-    def test_sync_keeps_existing_ready_ports_when_node_list_changes(self) -> None:
-        mgr = proxy_pool.PoolManager(
-            pool_size=2,
-            port_base=52000,
-            public_host="127.0.0.1",
-            listen_host="127.0.0.1",
-            proxy_user="u",
-            proxy_pass="p",
-            return_credentials=True,
-            max_starting=1,
-            start_openvpn=mock.Mock(return_value=(False, "skip", None)),
-            stop_openvpn=mock.Mock(),
-            create_listener=mock.Mock(),
-            log=lambda *a, **k: None,
-        )
-        mgr.slots[0] = _ready_slot(0, "JP", 10, node_id="old_node")
-        mgr.start()
-        mgr.sync_from_nodes([
-            {"id": "new_node", "country_short": "US", "country": "US", "ip": "2.2.2.2",
-             "score_latency": 5, "config_text": "b", "probe_status": "available"},
-        ])
-        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
-        self.assertEqual(mgr.slots[0].node_id, "old_node")
-        mgr.stop_openvpn.assert_not_called()
-
     def test_dedupe_same_node_id(self) -> None:
         started: list[str] = []
 
@@ -276,7 +261,7 @@ class PoolSyncTests(unittest.TestCase):
             },
         ]
         mgr.start()
-        mgr.sync_from_nodes(nodes)
+        _seed_pool(mgr, nodes)
         _wait_ready(mgr, 2)
         ready_ids = [s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY]
         self.assertEqual(len(ready_ids), 2)
@@ -335,7 +320,7 @@ class PoolLifecycleTests(unittest.TestCase):
              "score_latency": 6, "config_text": "b", "probe_status": "available"},
         ]
         mgr.start()
-        mgr.sync_from_nodes(nodes)
+        _seed_pool(mgr, nodes)
         _wait_ready(mgr, 1)
         ready = [s for s in mgr.slots if s.state == proxy_pool.SLOT_READY]
         self.assertGreaterEqual(len(ready), 1)
@@ -345,7 +330,7 @@ class PoolLifecycleTests(unittest.TestCase):
     def test_refill_continues_past_max_starting_batch(self) -> None:
         mgr = self._mgr()
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
              "score_latency": 5, "config_text": "a", "probe_status": "available"},
             {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
@@ -357,7 +342,7 @@ class PoolLifecycleTests(unittest.TestCase):
     def test_cold_start_sync_prefers_non_hosting_over_faster_hosting(self) -> None:
         mgr = self._mgr(pool_size=2, max_starting=2)
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "fast_hosting", "country_short": "US", "country": "US", "ip": "1.1.1.1",
              "score_latency": 5, "ip_type": "hosting", "config_text": "a", "probe_status": "available"},
             {"id": "slow_residential", "country_short": "JP", "country": "Japan", "ip": "2.2.2.2",
@@ -367,22 +352,6 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual([mgr.slots[i].node_id for i in range(2)], ["slow_residential", "fast_hosting"])
         mgr.shutdown()
 
-    def test_warm_sync_refill_prefers_non_hosting_for_empty_slot(self) -> None:
-        mgr = self._mgr(pool_size=2, max_starting=2)
-        mgr.slots[0] = _ready_slot(0, "US", 10, node_id="existing_ready")
-        mgr.slots[0].node_ip = "1.1.1.1"
-        mgr.slots[0].exit_ip = "1.1.1.1"
-        mgr.start()
-        mgr.sync_from_nodes([
-            {"id": "fast_hosting", "country_short": "US", "country": "US", "ip": "1.1.1.1",
-             "score_latency": 5, "ip_type": "hosting", "config_text": "a", "probe_status": "available"},
-            {"id": "slow_residential", "country_short": "JP", "country": "Japan", "ip": "2.2.2.2",
-             "score_latency": 50, "ip_type": "residential", "config_text": "b", "probe_status": "available"},
-        ])
-        _wait_ready(mgr, 2)
-        self.assertEqual(mgr.slots[0].node_id, "existing_ready")
-        self.assertEqual(mgr.slots[1].node_id, "slow_residential")
-        mgr.shutdown()
 
     def test_refill_skips_empty_slot_when_port_is_occupied(self) -> None:
         cleanup_calls: list[int] = []
@@ -408,7 +377,7 @@ class PoolLifecycleTests(unittest.TestCase):
         )
         mgr._port_is_available = mock.Mock(side_effect=lambda port: int(port) != 52000)  # type: ignore[method-assign]
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
              "score_latency": 5, "config_text": "a", "probe_status": "available"},
             {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
@@ -423,7 +392,7 @@ class PoolLifecycleTests(unittest.TestCase):
     def test_shutdown_stops_all(self) -> None:
         mgr = self._mgr()
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
              "score_latency": 5, "config_text": "a", "probe_status": "available"},
         ])
@@ -435,7 +404,7 @@ class PoolLifecycleTests(unittest.TestCase):
     def test_health_replaces_dead_process(self) -> None:
         mgr = self._mgr()
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
              "score_latency": 5, "config_text": "a", "probe_status": "available"},
             {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
@@ -476,7 +445,7 @@ class PoolLifecycleTests(unittest.TestCase):
         mgr.slots[1].process = proc1
         mgr.slots[1].listener = lis1
 
-        mgr.sync_from_nodes([
+        _set_candidates(mgr, [
             {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
              "score_latency": 5, "config_text": "b", "probe_status": "available"},
             {"id": "C", "country_short": "KR", "country": "Korea", "ip": "3.3.3.3",
@@ -495,7 +464,7 @@ class PoolLifecycleTests(unittest.TestCase):
         mgr = self._mgr(pool_size=1)
         mgr.health_check = mock.Mock(return_value=(False, "health_check failed", {}))
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
              "score_latency": 5, "config_text": "a", "probe_status": "available"},
             {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
@@ -520,7 +489,7 @@ class PoolLifecycleTests(unittest.TestCase):
         mgr = self._mgr(pool_size=1)
         mgr.health_check = mock.Mock(return_value=(False, "<urlopen error timed out>", {}))
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
              "score_latency": 5, "config_text": "a", "probe_status": "available"},
         ])
@@ -546,7 +515,7 @@ class PoolLifecycleTests(unittest.TestCase):
         mgr = self._mgr(pool_size=1)
         mgr.health_check = mock.Mock(side_effect=health_check)
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
              "score_latency": 5, "config_text": "a", "probe_status": "available"},
             {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
@@ -577,7 +546,7 @@ class PoolLifecycleTests(unittest.TestCase):
         mgr.health_check = mock.Mock(return_value=(False, "health_check failed", {}))
         mgr.replacement_grace_seconds = 0
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
              "score_latency": 5, "config_text": "a", "probe_status": "available"},
             {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
@@ -601,7 +570,7 @@ class PoolLifecycleTests(unittest.TestCase):
                 mgr = self._mgr(pool_size=1)
                 mgr.health_check = mock.Mock(return_value=(False, reason, {}))
                 mgr.start()
-                mgr.sync_from_nodes([
+                _seed_pool(mgr, [
                     {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
                      "score_latency": 5, "config_text": "a", "probe_status": "available"},
                     {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
@@ -624,386 +593,6 @@ class PoolLifecycleTests(unittest.TestCase):
                 self.assertFalse(active.replacement_pending)
                 mgr.shutdown()
 
-    def test_replace_all_slots_from_nodes_rebuilds_and_probes_ready_slots(self) -> None:
-        mgr = self._mgr(pool_size=2)
-        mgr.health_check = mock.Mock(side_effect=[
-            (True, "ok", {"exit_ip": "9.9.9.1", "latency_ms": 11}),
-            (True, "ok", {"exit_ip": "9.9.9.2", "latency_ms": 12}),
-        ])
-        mgr.start()
-
-        old0 = _ready_slot(0, "JP", 10, node_id="A")
-        old1 = _ready_slot(1, "US", 20, node_id="B")
-        old0.process = mock.Mock()
-        old0.process.poll.return_value = None
-        old1.process = mock.Mock()
-        old1.process.poll.return_value = None
-        old0.listener = mock.Mock(stop=mock.Mock(), is_alive=mock.Mock(return_value=True))
-        old1.listener = mock.Mock(stop=mock.Mock(), is_alive=mock.Mock(return_value=True))
-        old0_process = old0.process
-        old1_process = old1.process
-        old0_listener = old0.listener
-        old1_listener = old1.listener
-        mgr.slots[0] = old0
-        mgr.slots[1] = old1
-
-        mgr.replace_all_slots_from_nodes([
-            {"id": "C", "country_short": "KR", "country": "Korea", "ip": "3.3.3.3",
-             "score_latency": 5, "config_text": "c", "probe_status": "available"},
-            {"id": "D", "country_short": "SG", "country": "Singapore", "ip": "4.4.4.4",
-             "score_latency": 6, "config_text": "d", "probe_status": "available"},
-        ])
-
-        _wait_ready(mgr, 2)
-        self.assertEqual([s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY], ["C", "D"])
-        self.assertEqual([s.exit_ip for s in mgr.slots if s.state == proxy_pool.SLOT_READY], ["9.9.9.1", "9.9.9.2"])
-        old0_listener.stop.assert_called_once()
-        old1_listener.stop.assert_called_once()
-        mgr.stop_openvpn.assert_any_call(old0_process)
-        mgr.stop_openvpn.assert_any_call(old1_process)
-        self.assertEqual(mgr.health_check.call_count, 2)
-        mgr.shutdown()
-
-    def test_rolling_replace_only_replaces_one_batch(self) -> None:
-        mgr = self._mgr(pool_size=4, max_starting=4, max_shadow_starting=2)
-        mgr.health_check = mock.Mock(return_value=(True, "ok", {"exit_ip": "9.9.9.9", "latency_ms": 12}))
-        mgr.start()
-        mgr.sync_from_nodes([
-            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
-             "score_latency": 5, "ip_type": "hosting", "config_text": "a", "probe_status": "available"},
-            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
-             "score_latency": 6, "ip_type": "hosting", "config_text": "b", "probe_status": "available"},
-            {"id": "C", "country_short": "KR", "country": "Korea", "ip": "3.3.3.3",
-             "score_latency": 7, "ip_type": "hosting", "config_text": "c", "probe_status": "available"},
-            {"id": "D", "country_short": "SG", "country": "Singapore", "ip": "4.4.4.4",
-             "score_latency": 8, "ip_type": "hosting", "config_text": "d", "probe_status": "available"},
-        ])
-        _wait_ready(mgr, 4)
-
-        started = mgr.rolling_replace_from_nodes([
-            {"id": "E", "country_short": "TH", "country": "Thailand", "ip": "5.5.5.5",
-             "score_latency": 1, "ip_type": "hosting", "config_text": "e", "probe_status": "available"},
-            {"id": "F", "country_short": "GB", "country": "United Kingdom", "ip": "6.6.6.6",
-             "score_latency": 50, "ip_type": "residential", "config_text": "f", "probe_status": "available"},
-            {"id": "G", "country_short": "NL", "country": "Netherlands", "ip": "7.7.7.7",
-             "score_latency": 60, "ip_type": "mobile", "config_text": "g", "probe_status": "available"},
-            {"id": "H", "country_short": "DE", "country": "Germany", "ip": "8.8.8.8",
-             "score_latency": 2, "ip_type": "hosting", "config_text": "h", "probe_status": "available"},
-        ], batch_size=2)
-
-        deadline = time.time() + 2
-        while time.time() < deadline:
-            ids = [s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY]
-            if len(set(ids) & {"F", "G"}) == 2:
-                break
-            time.sleep(0.01)
-
-        ids = [s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY]
-        self.assertEqual(started, 2)
-        self.assertEqual(len(ids), 4)
-        self.assertEqual(len(set(ids) & {"F", "G"}), 2)
-        self.assertEqual(mgr.refresh_cursor, 2)
-        self.assertEqual([mgr.slots[i].node_id for i in range(2)], ["F", "G"])
-        self.assertEqual([mgr.slots[i].node_id for i in range(2, 4)], ["C", "D"])
-        mgr.shutdown()
-
-    def test_rolling_replace_advances_slots_by_cursor_and_wraps(self) -> None:
-        mgr = self._mgr(pool_size=4, max_starting=4, max_shadow_starting=2)
-        mgr.health_check = mock.Mock(side_effect=lambda slot: (True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}))
-        mgr.start()
-        mgr.sync_from_nodes([
-            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
-             "score_latency": 5, "ip_type": "hosting", "config_text": "a", "probe_status": "available"},
-            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
-             "score_latency": 6, "ip_type": "hosting", "config_text": "b", "probe_status": "available"},
-            {"id": "C", "country_short": "KR", "country": "Korea", "ip": "3.3.3.3",
-             "score_latency": 7, "ip_type": "hosting", "config_text": "c", "probe_status": "available"},
-            {"id": "D", "country_short": "SG", "country": "Singapore", "ip": "4.4.4.4",
-             "score_latency": 8, "ip_type": "hosting", "config_text": "d", "probe_status": "available"},
-        ])
-        _wait_ready(mgr, 4)
-
-        first = mgr.rolling_replace_from_nodes([
-            {"id": "E", "country_short": "TH", "country": "Thailand", "ip": "5.5.5.5",
-             "score_latency": 1, "ip_type": "residential", "config_text": "e", "probe_status": "available"},
-            {"id": "F", "country_short": "GB", "country": "United Kingdom", "ip": "6.6.6.6",
-             "score_latency": 2, "ip_type": "residential", "config_text": "f", "probe_status": "available"},
-        ], batch_size=2)
-
-        deadline = time.time() + 2
-        while time.time() < deadline:
-            if [mgr.slots[i].node_id for i in range(4)] == ["E", "F", "C", "D"]:
-                break
-            time.sleep(0.01)
-
-        self.assertEqual(first, 2)
-        self.assertEqual([mgr.slots[i].node_id for i in range(4)], ["E", "F", "C", "D"])
-        self.assertEqual(mgr.refresh_cursor, 2)
-
-        second = mgr.rolling_replace_from_nodes([
-            {"id": "E", "country_short": "TH", "country": "Thailand", "ip": "5.5.5.5",
-             "score_latency": 1, "ip_type": "residential", "config_text": "e", "probe_status": "available"},
-            {"id": "F", "country_short": "GB", "country": "United Kingdom", "ip": "6.6.6.6",
-             "score_latency": 2, "ip_type": "residential", "config_text": "f", "probe_status": "available"},
-            {"id": "G", "country_short": "NL", "country": "Netherlands", "ip": "7.7.7.7",
-             "score_latency": 3, "ip_type": "residential", "config_text": "g", "probe_status": "available"},
-            {"id": "H", "country_short": "DE", "country": "Germany", "ip": "8.8.8.8",
-             "score_latency": 4, "ip_type": "residential", "config_text": "h", "probe_status": "available"},
-        ], batch_size=2)
-
-        deadline = time.time() + 2
-        while time.time() < deadline:
-            if [mgr.slots[i].node_id for i in range(4)] == ["E", "F", "G", "H"]:
-                break
-            time.sleep(0.01)
-
-        self.assertEqual(second, 2)
-        self.assertEqual([mgr.slots[i].node_id for i in range(4)], ["E", "F", "G", "H"])
-        self.assertEqual(mgr.refresh_cursor, 0)
-        mgr.shutdown()
-
-    def test_rolling_replace_does_not_skip_past_current_window(self) -> None:
-        mgr = self._mgr(pool_size=4, max_starting=4, max_shadow_starting=2)
-        mgr.health_check = mock.Mock(return_value=(True, "ok", {"exit_ip": "9.9.9.9", "latency_ms": 12}))
-        mgr.start()
-        mgr.sync_from_nodes([
-            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
-             "score_latency": 5, "ip_type": "hosting", "config_text": "a", "probe_status": "available"},
-            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
-             "score_latency": 6, "ip_type": "hosting", "config_text": "b", "probe_status": "available"},
-            {"id": "C", "country_short": "KR", "country": "Korea", "ip": "3.3.3.3",
-             "score_latency": 7, "ip_type": "hosting", "config_text": "c", "probe_status": "available"},
-            {"id": "D", "country_short": "SG", "country": "Singapore", "ip": "4.4.4.4",
-             "score_latency": 8, "ip_type": "hosting", "config_text": "d", "probe_status": "available"},
-        ])
-        _wait_ready(mgr, 4)
-
-        original = [mgr.slots[i].node_id for i in range(4)]
-        mgr.slots[0].state = proxy_pool.SLOT_STARTING
-        mgr.slots[0].process = None
-        mgr.slots[0].listener = None
-
-        started = mgr.rolling_replace_from_nodes([
-            {"id": "E", "country_short": "TH", "country": "Thailand", "ip": "5.5.5.5",
-             "score_latency": 1, "ip_type": "residential", "config_text": "e", "probe_status": "available"},
-            {"id": "F", "country_short": "GB", "country": "United Kingdom", "ip": "6.6.6.6",
-             "score_latency": 2, "ip_type": "residential", "config_text": "f", "probe_status": "available"},
-        ], batch_size=2)
-
-        deadline = time.time() + 2
-        while time.time() < deadline:
-            if mgr.slots[1].node_id == "E":
-                break
-            time.sleep(0.01)
-
-        self.assertEqual(started, 1)
-        self.assertEqual(mgr.refresh_cursor, 2)
-        self.assertEqual(mgr.slots[0].node_id, original[0])
-        self.assertEqual(mgr.slots[1].node_id, "E")
-        self.assertEqual(mgr.slots[2].node_id, original[2])
-        self.assertEqual(mgr.slots[3].node_id, original[3])
-        mgr.shutdown()
-
-    def test_rolling_replace_ignores_slot_order_when_exit_ips_already_present(self) -> None:
-        mgr = self._mgr(pool_size=4, max_starting=4, max_shadow_starting=2)
-        mgr.health_check = mock.Mock(return_value=(True, "ok", {"exit_ip": "9.9.9.9", "latency_ms": 12}))
-        mgr.start()
-
-        slot0 = _ready_slot(0, "US", 10, node_id="A")
-        slot1 = _ready_slot(1, "US", 20, node_id="B")
-        slot2 = _ready_slot(2, "JP", 30, node_id="C")
-        slot3 = _ready_slot(3, "JP", 40, node_id="D")
-        slot0.exit_ip = "4.4.4.4"
-        slot1.exit_ip = "3.3.3.3"
-        slot2.exit_ip = "2.2.2.2"
-        slot3.exit_ip = "1.1.1.1"
-        for slot in (slot0, slot1, slot2, slot3):
-            slot.process = mock.Mock(poll=mock.Mock(return_value=None))
-            slot.listener = mock.Mock(start=mock.Mock(return_value=slot.port), is_alive=mock.Mock(return_value=True), stop=mock.Mock())
-        mgr.slots = [slot0, slot1, slot2, slot3]
-
-        started = mgr.rolling_replace_from_nodes([
-            {"id": "C", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
-             "score_latency": 1, "ip_type": "residential", "config_text": "c", "probe_status": "available"},
-            {"id": "D", "country_short": "JP", "country": "Japan", "ip": "2.2.2.2",
-             "score_latency": 2, "ip_type": "residential", "config_text": "d", "probe_status": "available"},
-            {"id": "A", "country_short": "US", "country": "US", "ip": "3.3.3.3",
-             "score_latency": 3, "ip_type": "hosting", "config_text": "a", "probe_status": "available"},
-            {"id": "B", "country_short": "US", "country": "US", "ip": "4.4.4.4",
-             "score_latency": 4, "ip_type": "hosting", "config_text": "b", "probe_status": "available"},
-        ], batch_size=4)
-
-        self.assertEqual(started, 0)
-        self.assertEqual([mgr.slots[i].node_id for i in range(4)], ["A", "B", "C", "D"])
-        mgr.shutdown()
-
-    def test_rolling_replace_starts_empty_window_slots_from_target_layout(self) -> None:
-        mgr = self._mgr(pool_size=4, max_starting=4, max_shadow_starting=2)
-        mgr.health_check = mock.Mock(return_value=(True, "ok", {"exit_ip": "9.9.9.9", "latency_ms": 12}))
-        mgr.start()
-
-        slot2 = _ready_slot(2, "JP", 30, node_id="C")
-        slot3 = _ready_slot(3, "JP", 40, node_id="D")
-        for slot in (slot2, slot3):
-            slot.process = mock.Mock(poll=mock.Mock(return_value=None))
-            slot.listener = mock.Mock(start=mock.Mock(return_value=slot.port), is_alive=mock.Mock(return_value=True), stop=mock.Mock())
-        mgr.slots = [
-            proxy_pool.PoolSlot(index=0, port_base=52000),
-            proxy_pool.PoolSlot(index=1, port_base=52000),
-            slot2,
-            slot3,
-        ]
-
-        started = mgr.rolling_replace_from_nodes([
-            {"id": "C", "country_short": "JP", "country": "Japan", "ip": "3.3.3.3",
-             "score_latency": 1, "ip_type": "residential", "config_text": "c", "probe_status": "available"},
-            {"id": "D", "country_short": "JP", "country": "Japan", "ip": "4.4.4.4",
-             "score_latency": 2, "ip_type": "residential", "config_text": "d", "probe_status": "available"},
-            {"id": "A", "country_short": "US", "country": "US", "ip": "1.1.1.1",
-             "score_latency": 3, "ip_type": "hosting", "config_text": "a", "probe_status": "available"},
-            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
-             "score_latency": 4, "ip_type": "hosting", "config_text": "b", "probe_status": "available"},
-        ], batch_size=2)
-
-        _wait_ready(mgr, 4)
-
-        self.assertEqual(started, 2)
-        self.assertEqual([mgr.slots[i].node_id for i in range(2)], ["C", "D"])
-        self.assertEqual([mgr.slots[i].state for i in range(2)], [proxy_pool.SLOT_READY, proxy_pool.SLOT_READY])
-        self.assertEqual([mgr.slots[i].node_id for i in range(2, 4)], ["C", "D"])
-        self.assertEqual(mgr.refresh_cursor, 2)
-        mgr.shutdown()
-
-    def test_rolling_replace_prioritizes_stale_slots_before_empty_slots(self) -> None:
-        def health_check(slot):
-            return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}
-
-        mgr = self._mgr(pool_size=3, max_starting=3, max_shadow_starting=1)
-        mgr.health_check = mock.Mock(side_effect=health_check)
-        mgr.start()
-        stale = _ready_slot(0, "US", 20, node_id="stale")
-        stale.exit_ip = "9.9.9.9"
-        stale.node_ip = "9.9.9.9"
-        stale.process = mock.Mock(poll=mock.Mock(return_value=None))
-        stale.listener = mock.Mock(start=mock.Mock(return_value=stale.port), is_alive=mock.Mock(return_value=True), stop=mock.Mock())
-        keep = _ready_slot(2, "JP", 10, node_id="keep")
-        keep.exit_ip = "1.1.1.1"
-        keep.node_ip = "1.1.1.1"
-        keep.process = mock.Mock(poll=mock.Mock(return_value=None))
-        keep.listener = mock.Mock(start=mock.Mock(return_value=keep.port), is_alive=mock.Mock(return_value=True), stop=mock.Mock())
-        mgr.slots = [stale, proxy_pool.PoolSlot(index=1, port_base=52000), keep]
-
-        started = mgr.rolling_replace_from_nodes([
-            {"id": "keep", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
-             "score_latency": 1, "ip_type": "residential", "config_text": "keep", "probe_status": "available"},
-            {"id": "new-home", "country_short": "TH", "country": "Thailand", "ip": "2.2.2.2",
-             "score_latency": 2, "ip_type": "residential", "config_text": "new-home", "probe_status": "available"},
-        ], batch_size=3)
-
-        deadline = time.time() + 2
-        while time.time() < deadline:
-            if mgr.slots[0].node_id == "new-home":
-                break
-            time.sleep(0.01)
-
-        self.assertEqual(started, 1)
-        self.assertEqual(mgr.slots[0].node_id, "new-home")
-        self.assertEqual(mgr.slots[1].state, proxy_pool.SLOT_EMPTY)
-        mgr.shutdown()
-
-    def test_default_rolling_replace_reconciles_full_pool(self) -> None:
-        def health_check(slot):
-            return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}
-
-        mgr = self._mgr(pool_size=20, max_starting=20, max_shadow_starting=20)
-        mgr.health_check = mock.Mock(side_effect=health_check)
-        mgr.start()
-        mgr.sync_from_nodes([
-            {
-                "id": f"old-{i:02d}",
-                "country_short": "JP",
-                "country": "Japan",
-                "ip": f"1.1.1.{i}",
-                "score_latency": 100 + i,
-                "ip_type": "hosting",
-                "config_text": f"old-{i}",
-                "probe_status": "available",
-            }
-            for i in range(20)
-        ])
-        _wait_ready(mgr, 20)
-
-        started = mgr.rolling_replace_from_nodes([
-            {
-                "id": f"new-{i:02d}",
-                "country_short": "TH",
-                "country": "Thailand",
-                "ip": f"2.2.2.{i}",
-                "score_latency": i,
-                "ip_type": "residential",
-                "config_text": f"new-{i}",
-                "probe_status": "available",
-            }
-            for i in range(20)
-        ])
-
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            ids = [mgr.slots[i].node_id for i in range(20)]
-            if ids == [f"new-{i:02d}" for i in range(20)]:
-                break
-            time.sleep(0.01)
-
-        self.assertEqual(started, 20)
-        self.assertEqual([mgr.slots[i].node_id for i in range(20)], [f"new-{i:02d}" for i in range(20)])
-        mgr.shutdown()
-
-    def test_default_rolling_replace_ignores_small_starting_limits(self) -> None:
-        def health_check(slot):
-            return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}
-
-        mgr = self._mgr(pool_size=20, max_starting=1, max_shadow_starting=1)
-        mgr.health_check = mock.Mock(side_effect=health_check)
-        mgr.start()
-        mgr.sync_from_nodes([
-            {
-                "id": f"old-{i:02d}",
-                "country_short": "JP",
-                "country": "Japan",
-                "ip": f"1.1.1.{i}",
-                "score_latency": 100 + i,
-                "ip_type": "hosting",
-                "config_text": f"old-{i}",
-                "probe_status": "available",
-            }
-            for i in range(20)
-        ])
-        _wait_ready(mgr, 20)
-
-        started = mgr.rolling_replace_from_nodes([
-            {
-                "id": f"new-{i:02d}",
-                "country_short": "TH",
-                "country": "Thailand",
-                "ip": f"2.2.2.{i}",
-                "score_latency": i,
-                "ip_type": "residential",
-                "config_text": f"new-{i}",
-                "probe_status": "available",
-            }
-            for i in range(20)
-        ])
-
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            ids = [mgr.slots[i].node_id for i in range(20)]
-            if ids == [f"new-{i:02d}" for i in range(20)]:
-                break
-            time.sleep(0.01)
-
-        self.assertEqual(started, 20)
-        self.assertEqual([mgr.slots[i].node_id for i in range(20)], [f"new-{i:02d}" for i in range(20)])
-        mgr.shutdown()
 
     def test_replace_all_slots_from_target_nodes_rebuilds_exact_target_layout_by_batch(self) -> None:
         def health_check(slot):
@@ -1012,7 +601,7 @@ class PoolLifecycleTests(unittest.TestCase):
         mgr = self._mgr(pool_size=4, max_starting=1, max_shadow_starting=1)
         mgr.health_check = mock.Mock(side_effect=health_check)
         mgr.start()
-        mgr.sync_from_nodes([
+        _seed_pool(mgr, [
             {"id": "old-a", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
              "score_latency": 10, "ip_type": "hosting", "config_text": "a", "probe_status": "available"},
             {"id": "old-b", "country_short": "JP", "country": "Japan", "ip": "1.1.1.2",
@@ -1038,10 +627,6 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(mgr.slots[3].state, proxy_pool.SLOT_EMPTY)
         mgr.shutdown()
 
-    def test_new_manager_starts_refresh_cursor_from_zero(self) -> None:
-        mgr = self._mgr(pool_size=4, max_starting=4, max_shadow_starting=2)
-        self.assertEqual(mgr.refresh_cursor, 0)
-        mgr.shutdown()
 
 
 if __name__ == "__main__":

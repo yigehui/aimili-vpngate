@@ -14,7 +14,6 @@ import tempfile
 import threading
 import time
 import concurrent.futures
-from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -359,7 +358,6 @@ class PoolManager:
         self._started = False
         self._fill_thread: threading.Thread | None = None
         self._temp_config_dir: tempfile.TemporaryDirectory[str] | None = None
-        self.refresh_cursor = 0
 
     def start(self) -> None:
         self._started = True
@@ -864,17 +862,6 @@ class PoolManager:
                     pass
         return 10**9
 
-    def _routine_replace_count(self, batch_size: int | None = None) -> int:
-        if batch_size is not None:
-            return max(0, int(batch_size or 0))
-        return self.pool_size
-
-    def _routine_shadow_capacity_locked(self) -> int:
-        return max(0, self.pool_size - self._shadow_inflight_count_locked())
-
-    def _routine_start_capacity_locked(self) -> int:
-        return max(0, self.pool_size - sum(1 for s in self.slots if s.state == SLOT_STARTING))
-
     def _candidate_exit_key(self, node: dict[str, Any]) -> str:
         return str(node.get("exit_ip") or node.get("ip") or node.get("node_ip") or "").strip()
 
@@ -897,185 +884,10 @@ class PoolManager:
                 break
         return target
 
-    def _slot_window_locked(self, start_cursor: int, window_size: int) -> list[PoolSlot]:
-        return [
-            self.slots[(start_cursor + offset) % self.pool_size]
-            for offset in range(window_size)
-        ]
-
-    def _build_refresh_plan_locked(
-        self,
-        candidates: list[dict[str, Any]],
-        slots: list[PoolSlot],
-    ) -> tuple[list[PoolSlot], list[PoolSlot], deque[dict[str, Any]]]:
-        target_nodes = self._target_nodes(candidates)
-        target_counts = Counter(self._candidate_exit_key(node) for node in target_nodes)
-        kept_counts: Counter[str] = Counter()
-        stale_slots: list[PoolSlot] = []
-        empty_slots: list[PoolSlot] = []
-        window_indexes = {slot.index for slot in slots}
-
-        for slot in self.slots:
-            if slot.state == SLOT_EMPTY:
-                if slot.index in window_indexes:
-                    empty_slots.append(slot)
-                continue
-            exit_key = self._slot_exit_key(slot)
-            if exit_key and kept_counts[exit_key] < target_counts.get(exit_key, 0):
-                kept_counts[exit_key] += 1
-                continue
-            if slot.index in window_indexes:
-                stale_slots.append(slot)
-
-        needed_counts = Counter(kept_counts)
-        missing_nodes: deque[dict[str, Any]] = deque()
-        for node in target_nodes:
-            exit_key = self._candidate_exit_key(node)
-            if not exit_key:
-                continue
-            if needed_counts[exit_key] >= target_counts[exit_key]:
-                continue
-            missing_nodes.append(node)
-            needed_counts[exit_key] += 1
-
-        return stale_slots, empty_slots, missing_nodes
-
     def _candidate_priority_key(self, node: dict[str, Any]) -> tuple[int, float, str]:
         ip_type = str(node.get("ip_type") or "").strip().lower()
         tier = 0 if ip_type in ("residential", "mobile") else 1
         return (tier, self._latency_key(node), self._node_id(node))
-
-    def _select_refresh_candidates_locked(
-        self,
-        candidates: list[dict[str, Any]],
-        consumed_ids: set[str],
-    ) -> list[dict[str, Any]]:
-        used_ids = {
-            s.node_id
-            for s in self.slots
-            if s.node_id and s.state in (SLOT_READY, SLOT_STARTING)
-        }
-        used_ids.update(
-            s.shadow.node_id
-            for s in self.slots
-            if s.shadow is not None and s.shadow.node_id
-        )
-        now = time.time()
-        selected: list[dict[str, Any]] = []
-        for node in sorted(candidates, key=self._candidate_priority_key):
-            nid = self._node_id(node)
-            if not nid or nid in used_ids or nid in consumed_ids:
-                continue
-            until = self._skipped.get(nid)
-            if until is not None and until > now:
-                continue
-            consumed_ids.add(nid)
-            selected.append(node)
-        return selected
-
-    def sync_from_nodes(self, nodes: list[dict[str, Any]]) -> None:
-        with self._lock:
-            candidates = self._dedupe_nodes(list(nodes or []))
-            candidates.sort(key=self._candidate_priority_key)
-            self._last_candidates = list(candidates)
-
-            # Do not churn existing READY ports during a node-list refresh.
-            # VPNGate availability lists fluctuate a lot; a node disappearing from
-            # the latest CSV/test batch does not prove the already connected tunnel
-            # is unusable. Keep current proxies stable and let health checks replace
-            # a slot only when the actual OpenVPN/listener/exit-IP check fails.
-
-        self._request_fill_slots(target_only=True)
-
-    def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
-        candidates = self._dedupe_nodes(list(nodes or []))
-        candidates.sort(key=self._candidate_priority_key)
-        shadow_tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
-        start_tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
-        now = time.time()
-        with self._lock:
-            self._last_candidates = list(candidates)
-            window_size = min(self.pool_size, self._routine_replace_count(batch_size))
-            if not candidates or not self.slots:
-                return 0
-            shadow_capacity = self._routine_shadow_capacity_locked()
-            start_capacity = self._routine_start_capacity_locked()
-            capacity = min(window_size, shadow_capacity + start_capacity)
-            if capacity <= 0:
-                return 0
-            start_cursor = self.refresh_cursor
-            slot_window = self._slot_window_locked(start_cursor, window_size)
-            stale_slots, empty_slots, missing_nodes = self._build_refresh_plan_locked(candidates, slot_window)
-
-            for slot in stale_slots:
-                if not missing_nodes or len(shadow_tasks) + len(start_tasks) >= capacity:
-                    break
-                if not (
-                    shadow_capacity > 0
-                    and slot.state == SLOT_READY
-                    and not slot.replacement_pending
-                    and slot.shadow is None
-                    and slot.process is not None
-                    and slot.listener is not None
-                    and slot.node_id
-                ):
-                    continue
-                node = missing_nodes.popleft()
-                shadow = ShadowCandidate(index=slot.index, tun_name=self._shadow_tun_name(slot), port=self._shadow_port(slot))
-                self._shadow_meta_from_node(shadow, node)
-                slot.replacement_pending = True
-                slot.replacement_reason = "rolling refresh"
-                slot.replacement_requested_at = now
-                slot.replacement_deadline_at = now + self.replacement_grace_seconds
-                slot.shadow = shadow
-                shadow_tasks.append((slot, node))
-                shadow_capacity -= 1
-
-            for slot in empty_slots:
-                if not missing_nodes or len(shadow_tasks) + len(start_tasks) >= capacity:
-                    break
-                if (
-                    start_capacity <= 0
-                    or slot.replacement_pending
-                    or slot.shadow is not None
-                    or not self._prepare_empty_slot_port(slot)
-                ):
-                    continue
-                node = missing_nodes.popleft()
-                self._assign_slot_metadata(slot, node)
-                start_tasks.append((slot, node))
-                start_capacity -= 1
-            self.refresh_cursor = (start_cursor + window_size) % self.pool_size
-        for slot, node in shadow_tasks:
-            threading.Thread(
-                target=self._start_shadow_for_slot,
-                args=(slot, node),
-                name=f"proxy-pool-rolling-{slot.index}",
-                daemon=True,
-            ).start()
-        for slot, node in start_tasks:
-            threading.Thread(
-                target=self._start_reserved_slot,
-                args=(slot, node),
-                name=f"proxy-pool-slot-{slot.index}",
-                daemon=True,
-            ).start()
-        return len(shadow_tasks) + len(start_tasks)
-
-    def replace_all_slots_from_nodes(self, nodes: list[dict[str, Any]], probe_health: bool = True) -> None:
-        with self._lock:
-            candidates = self._dedupe_nodes(list(nodes or []))
-            candidates.sort(key=self._latency_key)
-            self._last_candidates = list(candidates)
-
-        self._wait_fill_idle()
-        with self._lock:
-            for slot in self.slots:
-                if slot.state != SLOT_EMPTY:
-                    self._stop_slot(slot)
-        self._run_fill_loop()
-        if probe_health and self.health_check is not None:
-            self.probe_ready_slots()
 
     def replace_all_slots_from_target_nodes(self, nodes: list[dict[str, Any]], batch_size: int = 50) -> int:
         candidates = self._dedupe_nodes(list(nodes or []))
@@ -1133,7 +945,7 @@ class PoolManager:
             started += len(tasks)
         return started
 
-    def _request_fill_slots(self, target_only: bool = False) -> None:
+    def _request_fill_slots(self) -> None:
         if not self._started:
             return
         with self._lock:
@@ -1141,16 +953,15 @@ class PoolManager:
                 return
             self._fill_thread = threading.Thread(
                 target=self._fill_worker,
-                args=(target_only,),
                 name="proxy-pool-fill",
                 daemon=True,
             )
             self._fill_thread.start()
 
-    def _fill_worker(self, target_only: bool = False) -> None:
-        self._run_fill_loop(target_only=target_only)
+    def _fill_worker(self) -> None:
+        self._run_fill_loop()
 
-    def _run_fill_loop(self, target_only: bool = False) -> None:
+    def _run_fill_loop(self) -> None:
         while True:
             tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
             with self._lock:
@@ -1158,7 +969,7 @@ class PoolManager:
                     return
                 capacity = self.max_starting - sum(1 for s in self.slots if s.state == SLOT_STARTING)
                 for _ in range(max(0, capacity)):
-                    task = self._reserve_start_task_locked(target_only=target_only)
+                    task = self._reserve_start_task_locked()
                     if task is None:
                         break
                     tasks.append(task)
@@ -1192,29 +1003,23 @@ class PoolManager:
         for slot in ready_slots:
             self._probe_ready_slot(slot)
 
-    def _reserve_start_task_locked(self, target_only: bool = False) -> tuple[PoolSlot, dict[str, Any]] | None:
-        candidates = (
-            self._target_nodes(list(self._last_candidates or []))
-            if target_only
-            else list(self._last_candidates or [])
-        )
+    def _reserve_start_task_locked(self) -> tuple[PoolSlot, dict[str, Any]] | None:
+        candidates = list(self._last_candidates or [])
         used_ids = {
             s.node_id
             for s in self.slots
             if s.state in (SLOT_READY, SLOT_STARTING) and s.node_id
         }
-        used_exit_keys: set[str] = set()
-        if target_only:
-            used_exit_keys = {
-                self._slot_exit_key(s)
-                for s in self.slots
-                if s.state in (SLOT_READY, SLOT_STARTING) and self._slot_exit_key(s)
-            }
-            used_exit_keys.update(
-                self._shadow_exit_key(s.shadow)
-                for s in self.slots
-                if s.shadow is not None and self._shadow_exit_key(s.shadow)
-            )
+        used_exit_keys = {
+            self._slot_exit_key(s)
+            for s in self.slots
+            if s.state in (SLOT_READY, SLOT_STARTING) and self._slot_exit_key(s)
+        }
+        used_exit_keys.update(
+            self._shadow_exit_key(s.shadow)
+            for s in self.slots
+            if s.shadow is not None and self._shadow_exit_key(s.shadow)
+        )
         empty_slots = [s for s in self.slots if s.state == SLOT_EMPTY]
         if not empty_slots:
             return None
@@ -1227,15 +1032,14 @@ class PoolManager:
                 exit_key = self._candidate_exit_key(node)
                 if not nid or nid in used_ids:
                     continue
-                if target_only and (not exit_key or exit_key in used_exit_keys):
+                if not exit_key or exit_key in used_exit_keys:
                     continue
                 until = self._skipped.get(nid)
                 if until is not None and until > now:
                     continue
                 self._assign_slot_metadata(slot, node)
                 used_ids.add(nid)
-                if target_only and exit_key:
-                    used_exit_keys.add(exit_key)
+                used_exit_keys.add(exit_key)
                 return slot, node
         return None
 
