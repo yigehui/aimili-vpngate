@@ -149,4 +149,6 @@ TOKEN=$(python3 -c "import json;print(json.load(open('/opt/aimilivpn/vpngate_dat
 curl -H "Authorization: Bearer $TOKEN" "http://服务器IP:8787/api/pool/status?detail=1"
 curl -H "Authorization: Bearer $TOKEN" "http://服务器IP:8787/api/pool/proxies?country=JP&ip_type=residential&limit=10"
 curl -H "Authorization: Bearer $TOKEN" "http://服务器IP:8787/api/pool/proxies/random?ip_type=hosting"
+curl "http://服务器IP:8787/api/pool/proxies/text?token=$TOKEN&country=JP&ip_type=residential&fallback_unknown=1&limit=10&sort=latency&require_exit_ip=1&return_type=http"
+curl "http://服务器IP:8787/api/pool/proxies/text?token=$TOKEN&country=US&ip_type=hosting&return_type=socks5"
 ```

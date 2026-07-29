@@ -3868,7 +3868,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 12px;">
           <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 6px;">认证方式</div>
-          <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.6;">接口不使用网页登录态，使用 <span class="mono">Authorization: Bearer TOKEN</span> 或 <span class="mono">X-API-Token</span>。</div>
+          <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.6;">接口不使用网页登录态，使用 <span class="mono">Authorization: Bearer TOKEN</span>、<span class="mono">X-API-Token</span>，或在 URL 上携带 <span class="mono">token=...</span>。</div>
         </div>
         <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 12px;">
           <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 6px;">Token / 用户名 / 密码</div>
@@ -3890,6 +3890,7 @@ INDEX_HTML = r"""<!doctype html>
             <tr><td style="padding: 10px;" class="mono">GET</td><td style="padding: 10px;" class="mono">/api/pool/status?detail=1</td><td style="padding: 10px;">池状态、槽位数量、详细槽位健康信息</td></tr>
             <tr><td style="padding: 10px;" class="mono">GET</td><td style="padding: 10px;" class="mono">/api/pool/proxies</td><td style="padding: 10px;">获取可用代理列表</td></tr>
             <tr><td style="padding: 10px;" class="mono">GET</td><td style="padding: 10px;" class="mono">/api/pool/proxies/random</td><td style="padding: 10px;">随机获取一个可用代理，无可用时返回 404</td></tr>
+            <tr><td style="padding: 10px;" class="mono">GET</td><td style="padding: 10px;" class="mono">/api/pool/proxies/text</td><td style="padding: 10px;">只返回 http/socks5 多行文本；支持 URL 上携带 <span class="mono">token</span>，<span class="mono">return_type=http|socks5</span>，默认 <span class="mono">http</span></td></tr>
           </tbody>
         </table>
       </div>
@@ -3907,7 +3908,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 14px; margin-bottom: 16px;">
         <div style="font-weight: 700; color: var(--text-primary); margin-bottom: 8px;">查询参数</div>
         <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.7;">
-          <span class="mono">country=JP,KR,US</span>：按国家代码过滤；<span class="mono">ip_type=residential|hosting|mobile</span>：按 IP 类型过滤，其中 <span class="mono">residential</span> 会包含住宅与移动；<span class="mono">fallback_unknown=1</span>：严格住宅为空时回退返回未识别类型的可用槽位；<span class="mono">limit</span> / <span class="mono">offset</span>：分页；<span class="mono">sort=latency|country|port</span>：排序。
+          <span class="mono">country=JP,KR,US</span>：按国家代码过滤；<span class="mono">ip_type=residential|hosting|mobile</span>：按 IP 类型过滤，其中 <span class="mono">residential</span> 会包含住宅与移动；<span class="mono">fallback_unknown=1</span>：严格住宅为空时回退返回未识别类型的可用槽位；<span class="mono">limit</span> / <span class="mono">offset</span>：分页；<span class="mono">sort=latency|country|port</span>：排序；<span class="mono">require_exit_ip=0|1</span>：是否要求已有出口 IP；<span class="mono">return_type=http|socks5</span>：仅 <span class="mono">/api/pool/proxies/text</span> 使用，不传默认 <span class="mono">http</span>；<span class="mono">token=...</span>：可直接放在 URL 查询参数里。
         </div>
       </div>
 
@@ -5345,6 +5346,10 @@ function renderPoolApiDocs() {
       "",
       "# 随机获取一个美国机房代理",
       `curl -H "Authorization: Bearer $TOKEN" "${origin}/api/pool/proxies/random?country=US&ip_type=hosting"`,
+      "",
+      "# 获取纯文本代理列表，token 也可以直接走 URL 查询参数",
+      `curl "${origin}/api/pool/proxies/text?token=$TOKEN&country=JP&ip_type=residential&fallback_unknown=1&limit=10&sort=latency&require_exit_ip=1&return_type=http"`,
+      `curl "${origin}/api/pool/proxies/text?token=$TOKEN&country=US&ip_type=hosting&return_type=socks5"`,
       "",
       "# 手动用用户名密码测试固定槽位出口",
       "curl -x \"http://$USER:$PASS@POOL_PUBLIC_HOST:52000\" https://ifconfig.me"
