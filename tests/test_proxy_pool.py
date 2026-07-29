@@ -1005,6 +1005,39 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual([mgr.slots[i].node_id for i in range(20)], [f"new-{i:02d}" for i in range(20)])
         mgr.shutdown()
 
+    def test_replace_all_slots_from_target_nodes_rebuilds_exact_target_layout_by_batch(self) -> None:
+        def health_check(slot):
+            return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}
+
+        mgr = self._mgr(pool_size=4, max_starting=1, max_shadow_starting=1)
+        mgr.health_check = mock.Mock(side_effect=health_check)
+        mgr.start()
+        mgr.sync_from_nodes([
+            {"id": "old-a", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 10, "ip_type": "hosting", "config_text": "a", "probe_status": "available"},
+            {"id": "old-b", "country_short": "JP", "country": "Japan", "ip": "1.1.1.2",
+             "score_latency": 11, "ip_type": "hosting", "config_text": "b", "probe_status": "available"},
+            {"id": "old-c", "country_short": "JP", "country": "Japan", "ip": "1.1.1.3",
+             "score_latency": 12, "ip_type": "hosting", "config_text": "c", "probe_status": "available"},
+            {"id": "old-d", "country_short": "JP", "country": "Japan", "ip": "1.1.1.4",
+             "score_latency": 13, "ip_type": "hosting", "config_text": "d", "probe_status": "available"},
+        ])
+        _wait_ready(mgr, 4)
+
+        started = mgr.replace_all_slots_from_target_nodes([
+            {"id": "new-0", "country_short": "TH", "country": "Thailand", "ip": "2.2.2.1",
+             "score_latency": 1, "ip_type": "residential", "config_text": "n0", "probe_status": "available"},
+            {"id": "new-1", "country_short": "TH", "country": "Thailand", "ip": "2.2.2.2",
+             "score_latency": 2, "ip_type": "residential", "config_text": "n1", "probe_status": "available"},
+            {"id": "new-2", "country_short": "US", "country": "US", "ip": "2.2.2.3",
+             "score_latency": 3, "ip_type": "hosting", "config_text": "n2", "probe_status": "available"},
+        ], batch_size=2)
+
+        self.assertEqual(started, 3)
+        self.assertEqual([mgr.slots[i].node_id for i in range(3)], ["new-0", "new-1", "new-2"])
+        self.assertEqual(mgr.slots[3].state, proxy_pool.SLOT_EMPTY)
+        mgr.shutdown()
+
     def test_new_manager_starts_refresh_cursor_from_zero(self) -> None:
         mgr = self._mgr(pool_size=4, max_starting=4, max_shadow_starting=2)
         self.assertEqual(mgr.refresh_cursor, 0)

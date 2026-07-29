@@ -299,18 +299,12 @@ class VpnGateBatchProbeTests(unittest.TestCase):
                 results = vpngate_manager.test_multiple_nodes(["node-1", "node-2"])
 
         self.assertEqual(len(results), 2)
-        pool_manager.sync_from_nodes.assert_called_once()
+        pool_manager.replace_all_slots_from_target_nodes.assert_called_once()
+        pool_manager.sync_from_nodes.assert_not_called()
         pool_manager.replace_all_slots_from_nodes.assert_not_called()
-        pool_manager.rolling_replace_from_nodes.assert_called_once()
-        self.assertLess(
-            pool_manager.method_calls.index(mock.call.rolling_replace_from_nodes(mock.ANY)),
-            pool_manager.method_calls.index(mock.call.sync_from_nodes(mock.ANY)),
-        )
-        synced_once_nodes = pool_manager.sync_from_nodes.call_args.args[0]
-        self.assertEqual([node["id"] for node in synced_once_nodes], ["node-1"])
-        synced_nodes = pool_manager.rolling_replace_from_nodes.call_args.args[0]
-        self.assertEqual([node["id"] for node in synced_nodes], ["node-1"])
-        self.assertEqual(pool_manager.rolling_replace_from_nodes.call_args.kwargs, {})
+        replaced_nodes = pool_manager.replace_all_slots_from_target_nodes.call_args.args[0]
+        self.assertEqual([node["id"] for node in replaced_nodes], ["node-1"])
+        self.assertEqual(pool_manager.replace_all_slots_from_target_nodes.call_args.kwargs, {"batch_size": 50})
 
     def test_maintain_valid_nodes_does_not_sync_pool_outside_batch_probe(self) -> None:
         node = self._node("node-1", "1.1.1.1")
@@ -349,7 +343,7 @@ class VpnGateBatchProbeTests(unittest.TestCase):
 
         self.assertEqual(message, "Fetched 1 nodes. Tested 1 non-active nodes.")
         pool_manager.sync_from_nodes.assert_not_called()
-        pool_manager.rolling_replace_from_nodes.assert_not_called()
+        pool_manager.replace_all_slots_from_target_nodes.assert_not_called()
 
     def test_test_multiple_nodes_uses_configured_parallel_workers(self) -> None:
         nodes = [self._node(f"node-{i}", f"10.0.0.{i}") for i in range(1, 21)]
