@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import concurrent.futures
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
@@ -866,7 +867,69 @@ class PoolManager:
     def _routine_replace_count(self, batch_size: int | None = None) -> int:
         if batch_size is not None:
             return max(0, int(batch_size or 0))
-        return max(1, self.pool_size // 10)
+        return self.pool_size
+
+    def _candidate_exit_key(self, node: dict[str, Any]) -> str:
+        return str(node.get("exit_ip") or node.get("ip") or node.get("node_ip") or "").strip()
+
+    def _slot_exit_key(self, slot: PoolSlot) -> str:
+        return str(slot.exit_ip or slot.node_ip or "").strip()
+
+    def _target_nodes(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        target: list[dict[str, Any]] = []
+        seen_exit_keys: set[str] = set()
+        for node in candidates:
+            exit_key = self._candidate_exit_key(node)
+            if not exit_key or exit_key in seen_exit_keys:
+                continue
+            seen_exit_keys.add(exit_key)
+            target.append(node)
+            if len(target) >= self.pool_size:
+                break
+        return target
+
+    def _slot_window_locked(self, start_cursor: int, window_size: int) -> list[PoolSlot]:
+        return [
+            self.slots[(start_cursor + offset) % self.pool_size]
+            for offset in range(window_size)
+        ]
+
+    def _build_refresh_plan_locked(
+        self,
+        candidates: list[dict[str, Any]],
+        slots: list[PoolSlot],
+    ) -> tuple[list[PoolSlot], list[PoolSlot], deque[dict[str, Any]]]:
+        target_nodes = self._target_nodes(candidates)
+        target_counts = Counter(self._candidate_exit_key(node) for node in target_nodes)
+        kept_counts: Counter[str] = Counter()
+        stale_slots: list[PoolSlot] = []
+        empty_slots: list[PoolSlot] = []
+        window_indexes = {slot.index for slot in slots}
+
+        for slot in self.slots:
+            if slot.state == SLOT_EMPTY:
+                if slot.index in window_indexes:
+                    empty_slots.append(slot)
+                continue
+            exit_key = self._slot_exit_key(slot)
+            if exit_key and kept_counts[exit_key] < target_counts.get(exit_key, 0):
+                kept_counts[exit_key] += 1
+                continue
+            if slot.index in window_indexes:
+                stale_slots.append(slot)
+
+        needed_counts = Counter(kept_counts)
+        missing_nodes: deque[dict[str, Any]] = deque()
+        for node in target_nodes:
+            exit_key = self._candidate_exit_key(node)
+            if not exit_key:
+                continue
+            if needed_counts[exit_key] >= target_counts[exit_key]:
+                continue
+            missing_nodes.append(node)
+            needed_counts[exit_key] += 1
+
+        return stale_slots, empty_slots, missing_nodes
 
     def _candidate_priority_key(self, node: dict[str, Any]) -> tuple[int, float, str]:
         ip_type = str(node.get("ip_type") or "").strip().lower()
@@ -932,31 +995,15 @@ class PoolManager:
             if capacity <= 0:
                 return 0
             start_cursor = self.refresh_cursor
-            for offset in range(window_size):
-                if len(shadow_tasks) + len(start_tasks) >= capacity:
+            slot_window = self._slot_window_locked(start_cursor, window_size)
+            stale_slots, empty_slots, missing_nodes = self._build_refresh_plan_locked(candidates, slot_window)
+
+            for slot in stale_slots:
+                if not missing_nodes or len(shadow_tasks) + len(start_tasks) >= capacity:
                     break
-                slot = self.slots[(start_cursor + offset) % self.pool_size]
-                if slot.index >= len(candidates):
-                    continue
-                node = candidates[slot.index]
-                if self._node_id(node) == slot.node_id:
-                    continue
-                if slot.state == SLOT_EMPTY:
-                    if (
-                        start_capacity <= 0
-                        or slot.replacement_pending
-                        or slot.shadow is not None
-                        or not self._prepare_empty_slot_port(slot)
-                    ):
-                        continue
-                    self._assign_slot_metadata(slot, node)
-                    start_tasks.append((slot, node))
-                    start_capacity -= 1
-                    continue
                 if not (
                     shadow_capacity > 0
-                    and
-                    slot.state == SLOT_READY
+                    and slot.state == SLOT_READY
                     and not slot.replacement_pending
                     and slot.shadow is None
                     and slot.process is not None
@@ -964,6 +1011,7 @@ class PoolManager:
                     and slot.node_id
                 ):
                     continue
+                node = missing_nodes.popleft()
                 shadow = ShadowCandidate(index=slot.index, tun_name=self._shadow_tun_name(slot), port=self._shadow_port(slot))
                 self._shadow_meta_from_node(shadow, node)
                 slot.replacement_pending = True
@@ -973,6 +1021,21 @@ class PoolManager:
                 slot.shadow = shadow
                 shadow_tasks.append((slot, node))
                 shadow_capacity -= 1
+
+            for slot in empty_slots:
+                if not missing_nodes or len(shadow_tasks) + len(start_tasks) >= capacity:
+                    break
+                if (
+                    start_capacity <= 0
+                    or slot.replacement_pending
+                    or slot.shadow is not None
+                    or not self._prepare_empty_slot_port(slot)
+                ):
+                    continue
+                node = missing_nodes.popleft()
+                self._assign_slot_metadata(slot, node)
+                start_tasks.append((slot, node))
+                start_capacity -= 1
             self.refresh_cursor = (start_cursor + window_size) % self.pool_size
         for slot, node in shadow_tasks:
             threading.Thread(
