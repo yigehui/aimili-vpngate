@@ -627,6 +627,73 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(mgr.slots[3].state, proxy_pool.SLOT_EMPTY)
         mgr.shutdown()
 
+    def test_rebuild_freezes_other_slots_during_replace_all(self) -> None:
+        import threading as _threading
+
+        slow_gate = _threading.Event()
+        slow_on = {"v": False}
+
+        def maybe_slow_start(config_path, dev):
+            # 第一批(batch_size=2)对应 tun0/tun1,阻塞它们让重建停在第一批
+            if slow_on["v"] and dev in ("tun0", "tun1"):
+                slow_gate.wait(timeout=5)
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            return True, "ok", proc
+
+        mgr = self._mgr(maybe_slow_start, pool_size=4, max_starting=4)
+        # health_check 总是失败:正常情况下 tick_health 会立即停掉 READY slot
+        mgr.health_check = mock.Mock(return_value=(False, "dead", {}))
+        mgr.start()
+        _seed_pool(mgr, [
+            {"id": f"old-{i}", "country_short": "JP", "country": "Japan",
+             "ip": f"10.0.0.{i}", "score_latency": 10 + i, "ip_type": "hosting",
+             "config_text": f"o{i}", "probe_status": "available"}
+            for i in range(4)
+        ])
+        _wait_ready(mgr, 4)
+
+        slow_on["v"] = True
+        new_nodes = [
+            {"id": f"new-{i}", "country_short": "TH", "country": "Thailand",
+             "ip": f"20.0.0.{i}", "score_latency": i, "ip_type": "residential",
+             "config_text": f"n{i}", "probe_status": "available"}
+            for i in range(4)
+        ]
+        rebuild_thread = _threading.Thread(
+            target=mgr.replace_all_slots_from_target_nodes,
+            args=(new_nodes,),
+            kwargs={"batch_size": 2},
+            daemon=True,
+        )
+        rebuild_thread.start()
+
+        # 等待重建进入(_rebuilding 置位)
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not mgr._rebuilding:
+            time.sleep(0.01)
+        self.assertTrue(mgr._rebuilding, "rebuild flag should be set during replace_all")
+
+        # 重建进行中:第一批只动 slot 0-1,slot 2-3 应保持原样不动
+        slot2_node = mgr.slots[2].node_id
+        slot2_proc = mgr.slots[2].process
+        slot3_node = mgr.slots[3].node_id
+
+        # tick_health 即使 health_check 会失败,重建期间也不得动任何 slot
+        mgr.tick_health()
+        self.assertEqual(mgr.health_check.call_count, 0)
+        self.assertEqual(mgr.slots[2].state, proxy_pool.SLOT_READY)
+        self.assertEqual(mgr.slots[2].node_id, slot2_node)
+        self.assertIs(mgr.slots[2].process, slot2_proc)
+        self.assertEqual(mgr.slots[3].state, proxy_pool.SLOT_READY)
+        self.assertEqual(mgr.slots[3].node_id, slot3_node)
+
+        # 释放第一批,让重建走完
+        slow_gate.set()
+        rebuild_thread.join(timeout=5)
+        self.assertFalse(mgr._rebuilding, "rebuild flag should clear after replace_all")
+        mgr.shutdown()
+
 
 
 if __name__ == "__main__":

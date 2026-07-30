@@ -356,6 +356,7 @@ class PoolManager:
         self._last_candidates: list[dict[str, Any]] = []
         self._skipped: dict[str, float] = {}
         self._started = False
+        self._rebuilding = False
         self._fill_thread: threading.Thread | None = None
         self._temp_config_dir: tempfile.TemporaryDirectory[str] | None = None
 
@@ -490,6 +491,8 @@ class PoolManager:
 
     def tick_health(self) -> None:
         """Check READY slots and request background refill when capacity is empty."""
+        if self._rebuilding:
+            return
         to_probe: list[PoolSlot] = []
         now = time.time()
         with self._lock:
@@ -898,55 +901,60 @@ class PoolManager:
 
         with self._lock:
             self._last_candidates = list(candidates)
-
-        group_size = max(1, int(batch_size or 50))
-        started = 0
-        for start in range(0, self.pool_size, group_size):
-            tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
-            with self._lock:
-                end = min(self.pool_size, start + group_size)
-                for idx in range(start, end):
-                    slot = self.slots[idx]
-                    target = target_nodes[idx] if idx < len(target_nodes) else None
-                    if target is None:
+            self._rebuilding = True
+        try:
+            self._wait_fill_idle()
+            group_size = max(1, int(batch_size or 50))
+            started = 0
+            for start in range(0, self.pool_size, group_size):
+                tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
+                with self._lock:
+                    end = min(self.pool_size, start + group_size)
+                    for idx in range(start, end):
+                        slot = self.slots[idx]
+                        target = target_nodes[idx] if idx < len(target_nodes) else None
+                        if target is None:
+                            if slot.state != SLOT_EMPTY:
+                                self._stop_slot(slot)
+                            continue
+                        target_id = self._node_id(target)
+                        target_exit = self._candidate_exit_key(target)
+                        current_exit = self._slot_exit_key(slot)
+                        if (
+                            slot.state in (SLOT_READY, SLOT_STARTING)
+                            and slot.node_id == target_id
+                            and current_exit == target_exit
+                        ):
+                            continue
                         if slot.state != SLOT_EMPTY:
                             self._stop_slot(slot)
-                        continue
-                    target_id = self._node_id(target)
-                    target_exit = self._candidate_exit_key(target)
-                    current_exit = self._slot_exit_key(slot)
-                    if (
-                        slot.state in (SLOT_READY, SLOT_STARTING)
-                        and slot.node_id == target_id
-                        and current_exit == target_exit
-                    ):
-                        continue
-                    if slot.state != SLOT_EMPTY:
-                        self._stop_slot(slot)
-                    if not self._prepare_empty_slot_port(slot):
-                        continue
-                    self._assign_slot_metadata(slot, target)
-                    tasks.append((slot, target))
-            if not tasks:
-                continue
+                        if not self._prepare_empty_slot_port(slot):
+                            continue
+                        self._assign_slot_metadata(slot, target)
+                        tasks.append((slot, target))
+                if not tasks:
+                    continue
 
-            threads: list[threading.Thread] = []
-            for slot, node in tasks:
-                t = threading.Thread(
-                    target=self._start_reserved_slot,
-                    args=(slot, node),
-                    name=f"proxy-pool-slot-{slot.index}",
-                    daemon=True,
-                )
-                t.start()
-                threads.append(t)
-            for t in threads:
-                t.join(timeout=self.slot_start_timeout)
-            started += len(tasks)
-        return started
+                threads: list[threading.Thread] = []
+                for slot, node in tasks:
+                    t = threading.Thread(
+                        target=self._start_reserved_slot,
+                        args=(slot, node),
+                        name=f"proxy-pool-slot-{slot.index}",
+                        daemon=True,
+                    )
+                    t.start()
+                    threads.append(t)
+                for t in threads:
+                    t.join(timeout=self.slot_start_timeout)
+                started += len(tasks)
+            return started
+        finally:
+            with self._lock:
+                self._rebuilding = False
 
     def _request_fill_slots(self) -> None:
-        if not self._started:
+        if not self._started or self._rebuilding:
             return
         with self._lock:
             if self._fill_thread is not None and self._fill_thread.is_alive():
@@ -963,6 +971,8 @@ class PoolManager:
 
     def _run_fill_loop(self) -> None:
         while True:
+            if self._rebuilding:
+                return
             tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
             with self._lock:
                 if not self._started:
