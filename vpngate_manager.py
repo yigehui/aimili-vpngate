@@ -1759,7 +1759,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             available_snapshot = [n for n in sorted_nodes if n.get("probe_status") == "available"]
     if available_snapshot is not None:
         try:
-            pool_manager.replace_all_slots_from_target_nodes(available_snapshot, batch_size=50)
+            batch_size = max(1, int(getattr(pool_manager, "refresh_batch_size", 20) or 20))
+            pool_manager.replace_all_slots_from_target_nodes(available_snapshot, batch_size=batch_size)
         except Exception as pool_exc:
             print(f"[test_multiple_nodes] pool rolling refresh failed: {pool_exc}", flush=True)
         
@@ -6889,6 +6890,8 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         max_starting=int(cfg.get("max_starting", 5)),
         slot_start_timeout=int(cfg.get("slot_start_timeout", 90)),
         replacement_grace_seconds=int(cfg.get("replacement_grace_seconds", 180)),
+        refresh_batch_size=int(cfg.get("refresh_batch_size", 20)),
+        failed_node_skip_seconds=int(cfg.get("failed_node_skip_seconds", 300)),
         shadow_port_base=int(cfg.get("shadow_port_base", 53000)),
         shadow_port_count=int(cfg.get("shadow_port_count", 200)),
         require_exit_ip=bool(cfg.get("require_exit_ip", True)),

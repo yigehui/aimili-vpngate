@@ -22,6 +22,8 @@ SLOT_EMPTY = "EMPTY"
 SLOT_STARTING = "STARTING"
 SLOT_READY = "READY"
 SLOT_DRAINING = "DRAINING"
+DEFAULT_FAILED_NODE_SKIP_SECONDS = 300
+DEFAULT_REFRESH_BATCH_SIZE = 20
 
 LogFn = Callable[..., None]
 StartOpenVpnFn = Callable[[str, str], tuple[bool, str, Any]]
@@ -170,6 +172,8 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
         "max_starting": _pick_int("POOL_MAX_STARTING", "max_starting", 5),
         "slot_start_timeout": _pick_int("POOL_SLOT_START_TIMEOUT", "slot_start_timeout", 90),
         "replacement_grace_seconds": _pick_int("POOL_REPLACEMENT_GRACE_SECONDS", "replacement_grace_seconds", 180),
+        "refresh_batch_size": _pick_int("POOL_REFRESH_BATCH_SIZE", "refresh_batch_size", DEFAULT_REFRESH_BATCH_SIZE),
+        "failed_node_skip_seconds": _pick_int("POOL_FAILED_NODE_SKIP_SECONDS", "failed_node_skip_seconds", DEFAULT_FAILED_NODE_SKIP_SECONDS),
         "shadow_port_base": _pick_int("POOL_SHADOW_PORT_BASE", "shadow_port_base", 53000),
         "shadow_port_count": _pick_int("POOL_SHADOW_PORT_COUNT", "shadow_port_count", 200),
         "require_exit_ip": _pick_bool("POOL_REQUIRE_EXIT_IP", "require_exit_ip", True),
@@ -191,6 +195,8 @@ def load_or_create_pool_config(path: Path) -> dict[str, Any]:
             "max_starting": cfg["max_starting"],
             "slot_start_timeout": cfg["slot_start_timeout"],
             "replacement_grace_seconds": cfg["replacement_grace_seconds"],
+            "refresh_batch_size": cfg["refresh_batch_size"],
+            "failed_node_skip_seconds": cfg["failed_node_skip_seconds"],
             "shadow_port_base": cfg["shadow_port_base"],
             "shadow_port_count": cfg["shadow_port_count"],
             "require_exit_ip": cfg["require_exit_ip"],
@@ -322,6 +328,8 @@ class PoolManager:
         config_dir: str | Path | None = None,
         max_shadow_starting: int = 5,
         replacement_grace_seconds: int = 180,
+        refresh_batch_size: int = DEFAULT_REFRESH_BATCH_SIZE,
+        failed_node_skip_seconds: int = DEFAULT_FAILED_NODE_SKIP_SECONDS,
         shadow_port_base: int = 53000,
         shadow_port_count: int = 200,
     ) -> None:
@@ -348,6 +356,8 @@ class PoolManager:
         routine_shadow_floor = max(1, self.pool_size // 10)
         self.max_shadow_starting = max(routine_shadow_floor, int(max_shadow_starting or 0))
         self.replacement_grace_seconds = max(0, int(replacement_grace_seconds or 180))
+        self.refresh_batch_size = max(1, int(refresh_batch_size or DEFAULT_REFRESH_BATCH_SIZE))
+        self.failed_node_skip_seconds = max(0, int(failed_node_skip_seconds or DEFAULT_FAILED_NODE_SKIP_SECONDS))
         self.shadow_port_base = int(shadow_port_base or 53000)
         self.shadow_port_count = max(1, int(shadow_port_count or 200))
         self.api_token = ""
@@ -464,7 +474,7 @@ class PoolManager:
             slot.fail_count = 0
             slot.last_error = ""
             if old_id:
-                self._skipped[old_id] = time.time() + 60
+                self._skipped[old_id] = time.time() + self.failed_node_skip_seconds
             return
 
         if slot.shadow is not None:
@@ -504,7 +514,7 @@ class PoolManager:
                         self._stop_slot(slot)
                         slot.last_error = f"start timeout after {self.slot_start_timeout}s"
                         if old_id:
-                            self._skipped[old_id] = time.time() + 60
+                            self._skipped[old_id] = time.time() + self.failed_node_skip_seconds
                         try:
                             self.log("PoolSlot", f"start timeout reset slot={slot.index} node={old_id}")
                         except Exception:
@@ -556,7 +566,7 @@ class PoolManager:
                     slot.fail_count = 0
                     slot.last_error = ""
                     if old_id:
-                        self._skipped[old_id] = time.time() + 60
+                        self._skipped[old_id] = time.time() + self.failed_node_skip_seconds
                     try:
                         self.log("PoolSlot", f"health replace slot={slot.index} node={old_id}: {reason}")
                     except Exception:
@@ -681,6 +691,8 @@ class PoolManager:
                 "proxy_auth": bool(self.proxy_user or self.proxy_pass),
                 "public_host": self.public_host,
                 "require_exit_ip": self.require_exit_ip,
+                "refresh_batch_size": self.refresh_batch_size,
+                "failed_node_skip_seconds": self.failed_node_skip_seconds,
             }
             if detail:
                 result["slot_detail"] = [
@@ -1139,7 +1151,7 @@ class PoolManager:
                         pass
                 with self._lock:
                     slot.last_error = msg or "start_openvpn failed"
-                    self._skipped[nid] = time.time() + 60
+                    self._skipped[nid] = time.time() + self.failed_node_skip_seconds
                     self._reset_slot_fields(slot)
                 try:
                     self.log("PoolSlot", f"start failed slot={slot.index} node={nid}: {msg}")
@@ -1204,7 +1216,7 @@ class PoolManager:
             with self._lock:
                 if slot.node_id == nid:
                     slot.last_error = str(exc)
-                    self._skipped[nid] = time.time() + 60
+                    self._skipped[nid] = time.time() + self.failed_node_skip_seconds
                     self._reset_slot_fields(slot)
             try:
                 self.log("PoolSlot", f"start exception slot={slot.index} node={nid}: {exc}")
@@ -1243,7 +1255,7 @@ class PoolManager:
                 with self._lock:
                     if slot.shadow is not None and slot.shadow.node_id == nid:
                         slot.last_error = msg or "shadow start_openvpn failed"
-                        self._skipped[nid] = time.time() + 60
+                        self._skipped[nid] = time.time() + self.failed_node_skip_seconds
                         self._reset_replacement_fields_locked(slot)
                 return False
 
@@ -1286,7 +1298,7 @@ class PoolManager:
                     with self._lock:
                         if slot.shadow is not None and slot.shadow.node_id == nid:
                             slot.last_error = msg or "shadow health_check failed"
-                            self._skipped[nid] = time.time() + 60
+                            self._skipped[nid] = time.time() + self.failed_node_skip_seconds
                             self._reset_replacement_fields_locked(slot)
                     return False
 
@@ -1332,7 +1344,7 @@ class PoolManager:
             with self._lock:
                 if slot.shadow is not None and slot.shadow.node_id == nid:
                     slot.last_error = str(exc)
-                    self._skipped[nid] = time.time() + 60
+                    self._skipped[nid] = time.time() + self.failed_node_skip_seconds
                     self._reset_replacement_fields_locked(slot)
             return False
 

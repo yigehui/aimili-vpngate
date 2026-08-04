@@ -326,6 +326,50 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertGreaterEqual(len(ready), 1)
         self.assertNotEqual(ready[0].node_id, "")
 
+    def test_start_failure_skips_same_failed_node_for_current_refresh_window(self) -> None:
+        def flaky(config_path, dev):
+            if "bad-node" in config_path:
+                return False, "boom", None
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            return True, "ok", proc
+
+        mgr = self._mgr(flaky, pool_size=1)
+        bad = {
+            "id": "bad-node",
+            "country_short": "JP",
+            "country": "Japan",
+            "ip": "1.1.1.1",
+            "score_latency": 1,
+            "config_text": "bad",
+            "probe_status": "available",
+        }
+        good = {
+            "id": "good-node",
+            "country_short": "US",
+            "country": "US",
+            "ip": "2.2.2.2",
+            "score_latency": 2,
+            "config_text": "good",
+            "probe_status": "available",
+        }
+        mgr.start()
+        _set_candidates(mgr, [bad, good])
+
+        with mock.patch("proxy_pool.time.time", return_value=1000.0):
+            task = mgr._reserve_start_task_locked()
+            self.assertIsNotNone(task)
+            slot, node = task
+            self.assertEqual(node["id"], "bad-node")
+            self.assertFalse(mgr._start_reserved_slot(slot, node))
+
+        with mock.patch("proxy_pool.time.time", return_value=1061.0):
+            retry_task = mgr._reserve_start_task_locked()
+
+        self.assertIsNotNone(retry_task)
+        assert retry_task is not None
+        self.assertEqual(retry_task[1]["id"], "good-node")
+
 
     def test_refill_continues_past_max_starting_batch(self) -> None:
         mgr = self._mgr()

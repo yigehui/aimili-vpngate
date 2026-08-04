@@ -278,6 +278,7 @@ class VpnGateBatchProbeTests(unittest.TestCase):
             config_dir = Path(td) / "configs"
             vpngate_manager.write_json(nodes_file, nodes)
             pool_manager = mock.Mock()
+            pool_manager.refresh_batch_size = 17
 
             with (
                 mock.patch.object(vpngate_manager, "NODES_FILE", nodes_file),
@@ -302,7 +303,7 @@ class VpnGateBatchProbeTests(unittest.TestCase):
         pool_manager.replace_all_slots_from_target_nodes.assert_called_once()
         replaced_nodes = pool_manager.replace_all_slots_from_target_nodes.call_args.args[0]
         self.assertEqual([node["id"] for node in replaced_nodes], ["node-1"])
-        self.assertEqual(pool_manager.replace_all_slots_from_target_nodes.call_args.kwargs, {"batch_size": 50})
+        self.assertEqual(pool_manager.replace_all_slots_from_target_nodes.call_args.kwargs, {"batch_size": 17})
 
     def test_maintain_valid_nodes_does_not_sync_pool_outside_batch_probe(self) -> None:
         node = self._node("node-1", "1.1.1.1")

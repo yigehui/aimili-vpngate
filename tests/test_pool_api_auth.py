@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import proxy_pool
@@ -53,6 +54,21 @@ class ConfigLoadTests(unittest.TestCase):
             )
             cfg = proxy_pool.load_or_create_pool_config(path)
             self.assertNotIn("max_shadow_starting", cfg)
+
+    def test_load_or_create_pool_secrets_reads_refresh_and_skip_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "pool_secrets.json"
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "POOL_REFRESH_BATCH_SIZE": "17",
+                    "POOL_FAILED_NODE_SKIP_SECONDS": "321",
+                },
+                clear=False,
+            ):
+                cfg = proxy_pool.load_or_create_pool_config(path)
+        self.assertEqual(cfg["refresh_batch_size"], 17)
+        self.assertEqual(cfg["failed_node_skip_seconds"], 321)
 
 
 class PoolQueryParseTests(unittest.TestCase):
