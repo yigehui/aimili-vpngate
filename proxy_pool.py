@@ -584,7 +584,7 @@ class PoolManager:
         require_exit_ip: bool | None = None,
     ) -> dict[str, Any]:
         with self._lock:
-            strict_exit = self.require_exit_ip if require_exit_ip is None else bool(require_exit_ip)
+            strict_exit = self._effective_require_exit_ip(require_exit_ip)
             slots = self._filtered_ready(country, ip_type, require_exit_ip=strict_exit)
             fallback_unknown_used = False
             if fallback_unknown and not slots and self._can_fallback_unknown(ip_type):
@@ -617,7 +617,7 @@ class PoolManager:
         require_exit_ip: bool | None = None,
     ) -> dict[str, Any] | None:
         with self._lock:
-            strict_exit = self.require_exit_ip if require_exit_ip is None else bool(require_exit_ip)
+            strict_exit = self._effective_require_exit_ip(require_exit_ip)
             slots = self._filtered_ready(country, ip_type, require_exit_ip=strict_exit)
             fallback_unknown_used = False
             if fallback_unknown and not slots and self._can_fallback_unknown(ip_type):
@@ -629,6 +629,13 @@ class PoolManager:
             item["fallback_unknown_used"] = fallback_unknown_used
             item["require_exit_ip"] = strict_exit
             return item
+
+    def _effective_require_exit_ip(self, require_exit_ip: bool | None = None) -> bool:
+        if not self.require_exit_ip:
+            return False
+        if require_exit_ip is None:
+            return True
+        return bool(require_exit_ip)
 
     def list_proxy_lines(
         self,
