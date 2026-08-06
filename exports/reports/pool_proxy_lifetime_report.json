@@ -1,0 +1,480 @@
+{
+  "started_at": 1784907137.3097656,
+  "base": "http://127.0.0.1:8787",
+  "ready_timeout_seconds": 540,
+  "probe_interval_seconds": 60,
+  "max_probes": 10,
+  "events": [
+    {
+      "ts": 1784907137.3884614,
+      "kind": "status_poll",
+      "slots": {
+        "ready": 0,
+        "starting": 0,
+        "empty": 1,
+        "draining": 0
+      },
+      "slot_detail": [
+        {
+          "index": 0,
+          "port": 52000,
+          "state": "EMPTY",
+          "node_id": "",
+          "country": "",
+          "ip_type": "",
+          "entry_ip_type": "",
+          "latency_ms": 0,
+          "health_latency_ms": 0,
+          "exit_ip": "",
+          "last_health_at": 0.0,
+          "fail_count": 0,
+          "last_error": "",
+          "replacement_pending": false,
+          "replacement_reason": "",
+          "replacement_deadline_at": 0.0,
+          "shadow_node_id": ""
+        }
+      ]
+    },
+    {
+      "ts": 1784907147.4061778,
+      "kind": "status_poll",
+      "slots": {
+        "ready": 0,
+        "starting": 0,
+        "empty": 1,
+        "draining": 0
+      },
+      "slot_detail": [
+        {
+          "index": 0,
+          "port": 52000,
+          "state": "EMPTY",
+          "node_id": "",
+          "country": "",
+          "ip_type": "",
+          "entry_ip_type": "",
+          "latency_ms": 0,
+          "health_latency_ms": 0,
+          "exit_ip": "",
+          "last_health_at": 0.0,
+          "fail_count": 0,
+          "last_error": "",
+          "replacement_pending": false,
+          "replacement_reason": "",
+          "replacement_deadline_at": 0.0,
+          "shadow_node_id": ""
+        }
+      ]
+    },
+    {
+      "ts": 1784907157.4261858,
+      "kind": "status_poll",
+      "slots": {
+        "ready": 0,
+        "starting": 0,
+        "empty": 1,
+        "draining": 0
+      },
+      "slot_detail": [
+        {
+          "index": 0,
+          "port": 52000,
+          "state": "EMPTY",
+          "node_id": "",
+          "country": "",
+          "ip_type": "",
+          "entry_ip_type": "",
+          "latency_ms": 0,
+          "health_latency_ms": 0,
+          "exit_ip": "",
+          "last_health_at": 0.0,
+          "fail_count": 0,
+          "last_error": "",
+          "replacement_pending": false,
+          "replacement_reason": "",
+          "replacement_deadline_at": 0.0,
+          "shadow_node_id": ""
+        }
+      ]
+    },
+    {
+      "ts": 1784907167.4413655,
+      "kind": "status_poll",
+      "slots": {
+        "ready": 0,
+        "starting": 0,
+        "empty": 1,
+        "draining": 0
+      },
+      "slot_detail": [
+        {
+          "index": 0,
+          "port": 52000,
+          "state": "EMPTY",
+          "node_id": "",
+          "country": "",
+          "ip_type": "",
+          "entry_ip_type": "",
+          "latency_ms": 0,
+          "health_latency_ms": 0,
+          "exit_ip": "",
+          "last_health_at": 0.0,
+          "fail_count": 0,
+          "last_error": "",
+          "replacement_pending": false,
+          "replacement_reason": "",
+          "replacement_deadline_at": 0.0,
+          "shadow_node_id": ""
+        }
+      ]
+    },
+    {
+      "ts": 1784907177.4451501,
+      "kind": "status_poll",
+      "slots": {
+        "ready": 0,
+        "starting": 0,
+        "empty": 1,
+        "draining": 0
+      },
+      "slot_detail": [
+        {
+          "index": 0,
+          "port": 52000,
+          "state": "EMPTY",
+          "node_id": "",
+          "country": "",
+          "ip_type": "",
+          "entry_ip_type": "",
+          "latency_ms": 0,
+          "health_latency_ms": 0,
+          "exit_ip": "",
+          "last_health_at": 0.0,
+          "fail_count": 0,
+          "last_error": "",
+          "replacement_pending": false,
+          "replacement_reason": "",
+          "replacement_deadline_at": 0.0,
+          "shadow_node_id": ""
+        }
+      ]
+    },
+    {
+      "ts": 1784907187.4702058,
+      "kind": "status_poll",
+      "slots": {
+        "ready": 0,
+        "starting": 0,
+        "empty": 1,
+        "draining": 0
+      },
+      "slot_detail": [
+        {
+          "index": 0,
+          "port": 52000,
+          "state": "EMPTY",
+          "node_id": "",
+          "country": "",
+          "ip_type": "",
+          "entry_ip_type": "",
+          "latency_ms": 0,
+          "health_latency_ms": 0,
+          "exit_ip": "",
+          "last_health_at": 0.0,
+          "fail_count": 0,
+          "last_error": "",
+          "replacement_pending": false,
+          "replacement_reason": "",
+          "replacement_deadline_at": 0.0,
+          "shadow_node_id": ""
+        }
+      ]
+    },
+    {
+      "ts": 1784907197.5618892,
+      "kind": "status_poll",
+      "slots": {
+        "ready": 0,
+        "starting": 0,
+        "empty": 1,
+        "draining": 0
+      },
+      "slot_detail": [
+        {
+          "index": 0,
+          "port": 52000,
+          "state": "EMPTY",
+          "node_id": "",
+          "country": "",
+          "ip_type": "",
+          "entry_ip_type": "",
+          "latency_ms": 0,
+          "health_latency_ms": 0,
+          "exit_ip": "",
+          "last_health_at": 0.0,
+          "fail_count": 0,
+          "last_error": "",
+          "replacement_pending": false,
+          "replacement_reason": "",
+          "replacement_deadline_at": 0.0,
+          "shadow_node_id": ""
+        }
+      ]
+    },
+    {
+      "ts": 1784907207.6007378,
+      "kind": "status_poll",
+      "slots": {
+        "ready": 0,
+        "starting": 0,
+        "empty": 1,
+        "draining": 0
+      },
+      "slot_detail": [
+        {
+          "index": 0,
+          "port": 52000,
+          "state": "EMPTY",
+          "node_id": "",
+          "country": "",
+          "ip_type": "",
+          "entry_ip_type": "",
+          "latency_ms": 0,
+          "health_latency_ms": 0,
+          "exit_ip": "",
+          "last_health_at": 0.0,
+          "fail_count": 0,
+          "last_error": "",
+          "replacement_pending": false,
+          "replacement_reason": "",
+          "replacement_deadline_at": 0.0,
+          "shadow_node_id": ""
+        }
+      ]
+    },
+    {
+      "ts": 1784907217.673715,
+      "kind": "status_poll",
+      "slots": {
+        "ready": 0,
+        "starting": 0,
+        "empty": 1,
+        "draining": 0
+      },
+      "slot_detail": [
+        {
+          "index": 0,
+          "port": 52000,
+          "state": "EMPTY",
+          "node_id": "",
+          "country": "",
+          "ip_type": "",
+          "entry_ip_type": "",
+          "latency_ms": 0,
+          "health_latency_ms": 0,
+          "exit_ip": "",
+          "last_health_at": 0.0,
+          "fail_count": 0,
+          "last_error": "",
+          "replacement_pending": false,
+          "replacement_reason": "",
+          "replacement_deadline_at": 0.0,
+          "shadow_node_id": ""
+        }
+      ]
+    },
+    {
+      "ts": 1784907229.7176943,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907241.774118,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907253.8212,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907265.8587046,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907277.8884032,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907289.9273674,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907301.9490619,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907313.9859877,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907326.038547,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907338.0858214,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907350.116839,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907362.1653967,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907374.196217,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907386.2355316,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907398.2866886,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907410.3285801,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907422.3703725,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907434.4142575,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907446.4283066,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907458.4661474,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907470.5122418,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907482.5619645,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907494.611706,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907506.6456695,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907518.6939888,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907530.7225728,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907542.755671,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907554.810364,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907566.8455918,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907578.8662515,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907590.8972003,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907602.9306018,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907614.9601946,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907626.9892457,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907639.0408268,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907651.0868595,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907663.1307158,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    },
+    {
+      "ts": 1784907675.1703358,
+      "kind": "status_error",
+      "error": "URLError(ConnectionRefusedError(10061, '由于目标计算机积极拒绝，无法连接。', None, 10061, None))"
+    }
+  ],
+  "finished_at": 1784907686.2221189,
+  "result": "no_proxy_ready_within_timeout"
+}

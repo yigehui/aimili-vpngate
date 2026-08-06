@@ -1,0 +1,282 @@
+{
+  "generated_at": 1784907954.8585606,
+  "source_count": 7,
+  "official_source": "https://www.vpngate.net/api/iphone/",
+  "results": [
+    {
+      "source_url": "https://www.vpngate.net/api/iphone/",
+      "attempts": [
+        {
+          "url": "https://www.vpngate.net/api/iphone/",
+          "verify_ssl": true,
+          "rows": 98,
+          "accepted_unique": 98
+        }
+      ],
+      "ok": true,
+      "accepted_unique": 98,
+      "score": {
+        "median": 720221.0,
+        "p25": 604733,
+        "p75": 1299112,
+        "top10_mean": 2529874.7
+      },
+      "ping": {
+        "median": 20.5,
+        "p25": 10,
+        "p75": 31,
+        "best10_mean": 4.1
+      },
+      "speed_mbps": {
+        "median": 1197.26,
+        "p75": 2152.46,
+        "top10_mean": 4926.14
+      },
+      "sessions": {
+        "median": 17,
+        "p75": 57
+      },
+      "countries_top5": {
+        "KR": 37,
+        "JP": 36,
+        "RU": 7,
+        "TH": 5,
+        "US": 3
+      },
+      "overlap_with_official": null,
+      "unique_vs_official": null
+    },
+    {
+      "source_url": "http://160.251.62.107:46080/api/iphone/",
+      "attempts": [
+        {
+          "url": "http://160.251.62.107:46080/api/iphone/",
+          "verify_ssl": true,
+          "rows": 93,
+          "accepted_unique": 93
+        }
+      ],
+      "ok": true,
+      "accepted_unique": 93,
+      "score": {
+        "median": 666436,
+        "p25": 538051,
+        "p75": 1296283,
+        "top10_mean": 2016576.7
+      },
+      "ping": {
+        "median": 22,
+        "p25": 9,
+        "p75": 33,
+        "best10_mean": 3.9
+      },
+      "speed_mbps": {
+        "median": 896.07,
+        "p75": 2214.64,
+        "top10_mean": 6567.05
+      },
+      "sessions": {
+        "median": 16.0,
+        "p75": 56
+      },
+      "countries_top5": {
+        "JP": 46,
+        "KR": 32,
+        "RU": 6,
+        "VN": 4,
+        "US": 2
+      },
+      "overlap_with_official": 4,
+      "overlap_ratio_vs_self": 0.043,
+      "unique_vs_official": 89
+    },
+    {
+      "source_url": "http://149.102.146.143:8592/api/iphone/",
+      "attempts": [
+        {
+          "url": "http://149.102.146.143:8592/api/iphone/",
+          "verify_ssl": true,
+          "rows": 97,
+          "accepted_unique": 97
+        }
+      ],
+      "ok": true,
+      "accepted_unique": 97,
+      "score": {
+        "median": 735617,
+        "p25": 591164,
+        "p75": 1197457,
+        "top10_mean": 2223921.8
+      },
+      "ping": {
+        "median": 22,
+        "p25": 9,
+        "p75": 32,
+        "best10_mean": 3.2
+      },
+      "speed_mbps": {
+        "median": 1320.52,
+        "p75": 2664.92,
+        "top10_mean": 10039.63
+      },
+      "sessions": {
+        "median": 11,
+        "p75": 46
+      },
+      "countries_top5": {
+        "JP": 46,
+        "KR": 36,
+        "RU": 7,
+        "VN": 4,
+        "AU": 1
+      },
+      "overlap_with_official": 7,
+      "overlap_ratio_vs_self": 0.0722,
+      "unique_vs_official": 90
+    },
+    {
+      "source_url": "http://42.148.153.40:41158/api/iphone/",
+      "attempts": [
+        {
+          "url": "http://42.148.153.40:41158/api/iphone/",
+          "verify_ssl": true,
+          "error": "TimeoutError('timed out')"
+        }
+      ],
+      "ok": false
+    },
+    {
+      "source_url": "http://60.86.198.39:64731/api/iphone/",
+      "attempts": [
+        {
+          "url": "http://60.86.198.39:64731/api/iphone/",
+          "verify_ssl": true,
+          "rows": 96,
+          "accepted_unique": 96
+        }
+      ],
+      "ok": true,
+      "accepted_unique": 96,
+      "score": {
+        "median": 746030.0,
+        "p25": 615684,
+        "p75": 1157341,
+        "top10_mean": 2081213.3
+      },
+      "ping": {
+        "median": 22.5,
+        "p25": 9,
+        "p75": 32,
+        "best10_mean": 3.0
+      },
+      "speed_mbps": {
+        "median": 1827.74,
+        "p75": 3307.84,
+        "top10_mean": 6693.59
+      },
+      "sessions": {
+        "median": 12.0,
+        "p75": 46
+      },
+      "countries_top5": {
+        "JP": 46,
+        "KR": 33,
+        "RU": 6,
+        "US": 4,
+        "TH": 4
+      },
+      "overlap_with_official": 8,
+      "overlap_ratio_vs_self": 0.0833,
+      "unique_vs_official": 88
+    },
+    {
+      "source_url": "http://114.142.39.208:14439/api/iphone/",
+      "attempts": [
+        {
+          "url": "http://114.142.39.208:14439/api/iphone/",
+          "verify_ssl": true,
+          "rows": 95,
+          "accepted_unique": 95
+        }
+      ],
+      "ok": true,
+      "accepted_unique": 95,
+      "score": {
+        "median": 736293,
+        "p25": 613826,
+        "p75": 1318058,
+        "top10_mean": 1989865.8
+      },
+      "ping": {
+        "median": 23,
+        "p25": 12,
+        "p75": 30,
+        "best10_mean": 3.4
+      },
+      "speed_mbps": {
+        "median": 1176.22,
+        "p75": 2287.04,
+        "top10_mean": 6298.43
+      },
+      "sessions": {
+        "median": 16,
+        "p75": 47
+      },
+      "countries_top5": {
+        "KR": 40,
+        "JP": 38,
+        "VN": 5,
+        "RU": 4,
+        "TH": 3
+      },
+      "overlap_with_official": 9,
+      "overlap_ratio_vs_self": 0.0947,
+      "unique_vs_official": 86
+    },
+    {
+      "source_url": "http://223.205.2.159:47032/api/iphone/",
+      "attempts": [
+        {
+          "url": "http://223.205.2.159:47032/api/iphone/",
+          "verify_ssl": true,
+          "rows": 96,
+          "accepted_unique": 96
+        }
+      ],
+      "ok": true,
+      "accepted_unique": 96,
+      "score": {
+        "median": 713306.0,
+        "p25": 558115,
+        "p75": 1364198,
+        "top10_mean": 2477615.3
+      },
+      "ping": {
+        "median": 21,
+        "p25": 10,
+        "p75": 34,
+        "best10_mean": 2.6
+      },
+      "speed_mbps": {
+        "median": 1343.72,
+        "p75": 2614.93,
+        "top10_mean": 6495.53
+      },
+      "sessions": {
+        "median": 17.0,
+        "p75": 52
+      },
+      "countries_top5": {
+        "JP": 53,
+        "KR": 29,
+        "RU": 6,
+        "US": 3,
+        "ID": 1
+      },
+      "overlap_with_official": 9,
+      "overlap_ratio_vs_self": 0.0938,
+      "unique_vs_official": 87
+    }
+  ],
+  "merged_unique_total": 500
+}
