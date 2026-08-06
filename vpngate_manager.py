@@ -6882,6 +6882,8 @@ def build_pool_manager() -> proxy_pool.PoolManager:
     )
     if not str(cfg.get("public_host") or "").strip():
         raise RuntimeError("POOL_PUBLIC_HOST 不能为空：池模式 API 需要返回可被客户端访问的代理 host")
+    if not POOL_HEALTH_LOOP_ENABLED:
+        cfg["require_exit_ip"] = False
     mgr = proxy_pool.PoolManager(
         pool_size=int(cfg.get("pool_size", 50)),
         port_base=int(cfg.get("port_base", 52000)),

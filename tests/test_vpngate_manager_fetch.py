@@ -16,6 +16,34 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(vpngate_manager.CHECK_INTERVAL_SECONDS, 300)
         self.assertFalse(vpngate_manager.POOL_HEALTH_LOOP_ENABLED)
 
+    def test_build_pool_manager_disables_exit_ip_requirement_without_health_loop(self) -> None:
+        cfg = {
+            "api_token": "tok",
+            "proxy_user": "u",
+            "proxy_pass": "p",
+            "pool_size": 1,
+            "port_base": 52000,
+            "public_host": "203.0.113.10",
+            "listen_host": "127.0.0.1",
+            "return_credentials": True,
+            "max_starting": 1,
+            "slot_start_timeout": 90,
+            "replacement_grace_seconds": 180,
+            "refresh_batch_size": 30,
+            "failed_node_skip_seconds": 300,
+            "shadow_port_base": 53000,
+            "shadow_port_count": 200,
+            "require_exit_ip": True,
+        }
+        with (
+            mock.patch.object(vpngate_manager.proxy_pool, "load_or_create_pool_config", return_value=cfg),
+            mock.patch.object(vpngate_manager.proxy_pool, "PoolManager") as pool_cls,
+        ):
+            pool_cls.return_value.api_token = ""
+            vpngate_manager.build_pool_manager()
+
+        self.assertFalse(pool_cls.call_args.kwargs["require_exit_ip"])
+
 
 def _row(ip: str, port: str = "443", proto: str = "tcp") -> dict[str, str]:
     return {
