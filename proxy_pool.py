@@ -23,7 +23,7 @@ SLOT_STARTING = "STARTING"
 SLOT_READY = "READY"
 SLOT_DRAINING = "DRAINING"
 DEFAULT_FAILED_NODE_SKIP_SECONDS = 300
-DEFAULT_REFRESH_BATCH_SIZE = 20
+DEFAULT_REFRESH_BATCH_SIZE = 30
 
 LogFn = Callable[..., None]
 StartOpenVpnFn = Callable[[str, str], tuple[bool, str, Any]]
@@ -498,9 +498,17 @@ class PoolManager:
     def _should_drop_slot_immediately(self, reason: str) -> bool:
         return True
 
+    def _drop_unhealthy_slot_locked(self, slot: PoolSlot, reason: str) -> str:
+        old_id = slot.node_id
+        self._stop_slot(slot)
+        slot.fail_count = 0
+        slot.last_error = ""
+        if old_id:
+            self._skipped[old_id] = time.time() + self.failed_node_skip_seconds
+        return old_id
 
     def tick_health(self) -> None:
-        """Check READY slots and request background refill when capacity is empty."""
+        """Check READY slots and drop unhealthy ones without automatic refill."""
         if self._rebuilding:
             return
         to_probe: list[PoolSlot] = []
@@ -554,30 +562,16 @@ class PoolManager:
                     slot.fail_count = 0
 
             for slot, reason in to_replace:
-                old_id = slot.node_id
-                if slot.process is not None and slot.listener is not None:
-                    self._request_slot_replacement_locked(slot, reason, now)
-                    try:
-                        self.log("PoolSlot", f"health replacement pending slot={slot.index} node={old_id}: {reason}")
-                    except Exception:
-                        pass
-                else:
-                    self._stop_slot(slot)
-                    slot.fail_count = 0
-                    slot.last_error = ""
-                    if old_id:
-                        self._skipped[old_id] = time.time() + self.failed_node_skip_seconds
-                    try:
-                        self.log("PoolSlot", f"health replace slot={slot.index} node={old_id}: {reason}")
-                    except Exception:
-                        pass
+                old_id = self._drop_unhealthy_slot_locked(slot, reason)
+                try:
+                    self.log("PoolSlot", f"health drop slot={slot.index} node={old_id}: {reason}")
+                except Exception:
+                    pass
 
         if to_probe:
             workers = min(self.health_check_workers, len(to_probe))
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 list(executor.map(self._probe_ready_slot, to_probe))
-
-        self._request_fill_slots()
 
     def list_proxies(
         self,
@@ -899,12 +893,12 @@ class PoolManager:
                 break
         return target
 
-    def _candidate_priority_key(self, node: dict[str, Any]) -> tuple[int, float, str]:
+    def _candidate_priority_key(self, node: dict[str, Any]) -> tuple[int, float]:
         ip_type = str(node.get("ip_type") or "").strip().lower()
         tier = 0 if ip_type in ("residential", "mobile") else 1
-        return (tier, self._latency_key(node), self._node_id(node))
+        return (tier, self._latency_key(node))
 
-    def replace_all_slots_from_target_nodes(self, nodes: list[dict[str, Any]], batch_size: int = 50) -> int:
+    def replace_all_slots_from_target_nodes(self, nodes: list[dict[str, Any]], batch_size: int = DEFAULT_REFRESH_BATCH_SIZE) -> int:
         candidates = self._dedupe_nodes(list(nodes or []))
         candidates.sort(key=self._candidate_priority_key)
         target_nodes = self._target_nodes(candidates)
@@ -916,7 +910,7 @@ class PoolManager:
             self._rebuilding = True
         try:
             self._wait_fill_idle()
-            group_size = max(1, int(batch_size or 50))
+            group_size = max(1, int(batch_size or DEFAULT_REFRESH_BATCH_SIZE))
             started = 0
             for start in range(0, self.pool_size, group_size):
                 tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
@@ -1461,9 +1455,9 @@ class PoolManager:
             slot.last_error = message or "health_check failed"
             if slot.fail_count >= 1:
                 reason = slot.last_error
-                self._request_slot_replacement_locked(slot, reason, time.time())
+                old_id = self._drop_unhealthy_slot_locked(slot, reason)
                 try:
-                    self.log("PoolSlot", f"health replacement pending slot={slot.index} node={slot.node_id}: {reason}")
+                    self.log("PoolSlot", f"health drop slot={slot.index} node={old_id}: {reason}")
                 except Exception:
                     pass
     def _stop_slot(self, slot: PoolSlot) -> None:

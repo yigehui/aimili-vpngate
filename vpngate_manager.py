@@ -148,8 +148,9 @@ DEFAULT_MIRROR_API_URLS = [
     "http://60.86.198.39:64731/api/iphone/",
     "http://223.205.2.159:47032/api/iphone/",
 ]
-FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1800, 1)
-CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1800, 1)
+FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 300, 1)
+CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 300, 1)
+POOL_HEALTH_LOOP_ENABLED = env_bool("POOL_HEALTH_LOOP_ENABLED", False)
 POOL_HEALTH_CHECK_INTERVAL_SECONDS = env_int("POOL_HEALTH_CHECK_INTERVAL_SECONDS", 300, 5)
 POOL_HEALTH_CHECK_WORKERS = env_int("POOL_HEALTH_CHECK_WORKERS", 20, 1, 100)
 POOL_HEALTH_TARGET_URLS = [
@@ -1759,10 +1760,12 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             available_snapshot = [n for n in sorted_nodes if n.get("probe_status") == "available"]
     if available_snapshot is not None:
         try:
-            batch_size = max(1, int(getattr(pool_manager, "refresh_batch_size", 20) or 20))
-            pool_manager.replace_all_slots_from_target_nodes(available_snapshot, batch_size=batch_size)
+            pool_manager.replace_all_slots_from_target_nodes(
+                available_snapshot,
+                batch_size=proxy_pool.DEFAULT_REFRESH_BATCH_SIZE,
+            )
         except Exception as pool_exc:
-            print(f"[test_multiple_nodes] pool rolling refresh failed: {pool_exc}", flush=True)
+            print(f"[test_multiple_nodes] pool batch rebuild failed: {pool_exc}", flush=True)
         
     return list(updated_nodes_map.values())
 
@@ -6890,7 +6893,7 @@ def build_pool_manager() -> proxy_pool.PoolManager:
         max_starting=int(cfg.get("max_starting", 5)),
         slot_start_timeout=int(cfg.get("slot_start_timeout", 90)),
         replacement_grace_seconds=int(cfg.get("replacement_grace_seconds", 180)),
-        refresh_batch_size=int(cfg.get("refresh_batch_size", 20)),
+        refresh_batch_size=int(cfg.get("refresh_batch_size", proxy_pool.DEFAULT_REFRESH_BATCH_SIZE)),
         failed_node_skip_seconds=int(cfg.get("failed_node_skip_seconds", 300)),
         shadow_port_base=int(cfg.get("shadow_port_base", 53000)),
         shadow_port_count=int(cfg.get("shadow_port_count", 200)),
@@ -6917,7 +6920,7 @@ def pool_health_loop() -> None:
                 pool_manager.tick_health()
         except Exception as exc:
             log_to_json("ERROR", "Pool", f"health loop: {exc}")
-        time.sleep(15)
+        time.sleep(60)
 
 
 def main() -> None:
@@ -6956,7 +6959,10 @@ def main() -> None:
             flush=True,
         )
         threading.Thread(target=collector_loop, daemon=True).start()
-        threading.Thread(target=pool_health_loop, daemon=True).start()
+        if POOL_HEALTH_LOOP_ENABLED:
+            threading.Thread(target=pool_health_loop, daemon=True).start()
+        else:
+            print("[Pool] health loop disabled; pool refresh rebuilds tested nodes in batches", flush=True)
     else:
         threading.Thread(
             target=proxy_server.start_proxy_server,

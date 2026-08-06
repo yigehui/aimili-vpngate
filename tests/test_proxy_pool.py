@@ -445,7 +445,7 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertTrue(all(s.state == proxy_pool.SLOT_EMPTY for s in mgr.slots))
         self.assertTrue(all(s.listener is None for s in mgr.slots))
 
-    def test_health_replaces_dead_process(self) -> None:
+    def test_health_drops_dead_process_without_refill(self) -> None:
         mgr = self._mgr()
         mgr.start()
         _seed_pool(mgr, [
@@ -457,17 +457,11 @@ class PoolLifecycleTests(unittest.TestCase):
         _wait_ready(mgr, 1)
         ready = next(s for s in mgr.slots if s.state == proxy_pool.SLOT_READY)
         ready.process.poll.return_value = 1  # dead
-        # fail_count threshold 1: one failed tick removes/replaces the slot
         mgr.tick_health()
-        # after health, dead slot drained/replaced if candidates remain via _last_candidates
-        self.assertTrue(
-            any(
-                s.node_id == "B" or s.state in (proxy_pool.SLOT_READY, proxy_pool.SLOT_EMPTY)
-                for s in mgr.slots
-            )
-        )
+        self.assertEqual(ready.state, proxy_pool.SLOT_EMPTY)
+        self.assertEqual(ready.node_id, "")
 
-    def test_health_refills_from_latest_available_nodes_excluding_occupied(self) -> None:
+    def test_health_does_not_refill_from_latest_available_nodes(self) -> None:
         mgr = self._mgr()
         mgr.replacement_grace_seconds = 0
         mgr.start()
@@ -498,10 +492,9 @@ class PoolLifecycleTests(unittest.TestCase):
 
         mgr.slots[0].process.poll.return_value = 1
         mgr.tick_health()
-        _wait_ready(mgr, 2)
 
-        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
-        self.assertEqual(mgr.slots[0].node_id, "C")
+        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_EMPTY)
+        self.assertEqual(mgr.slots[0].node_id, "")
         self.assertEqual(mgr.slots[1].node_id, "B")
 
     def test_health_failure_removes_active_slot_immediately(self) -> None:
@@ -546,7 +539,7 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(mgr.slots[0].fail_count, 0)
         mgr.shutdown()
 
-    def test_health_failure_refills_slot_without_shadow(self) -> None:
+    def test_health_failure_drops_slot_without_shadow_or_refill(self) -> None:
         seen: dict[str, int] = {}
 
         def health_check(slot):
@@ -571,21 +564,17 @@ class PoolLifecycleTests(unittest.TestCase):
         old_process = active.process
 
         mgr.tick_health()
-        _wait_ready(mgr, 1)
 
-        self.assertEqual(active.node_id, "B")
-        self.assertIsNot(active.listener, old_listener)
-        self.assertIsNot(active.process, old_process)
+        self.assertEqual(active.state, proxy_pool.SLOT_EMPTY)
+        self.assertEqual(active.node_id, "")
+        old_listener.stop.assert_called_once()
+        mgr.stop_openvpn.assert_any_call(old_process)
         self.assertFalse(active.replacement_pending)
         self.assertIsNone(active.shadow)
-
-        active.last_health_at = 0
-        mgr.tick_health()
-        self.assertEqual(active.exit_ip, "9.9.9.9")
         mgr.shutdown()
 
 
-    def test_grace_expiry_falls_back_to_stop_and_refill(self) -> None:
+    def test_health_failure_does_not_start_grace_refill(self) -> None:
         mgr = self._mgr(pool_size=1)
         mgr.health_check = mock.Mock(return_value=(False, "health_check failed", {}))
         mgr.replacement_grace_seconds = 0
@@ -601,10 +590,11 @@ class PoolLifecycleTests(unittest.TestCase):
 
         mgr.tick_health()
 
-        self.assertIn(active.state, (proxy_pool.SLOT_READY, proxy_pool.SLOT_EMPTY))
+        self.assertEqual(active.state, proxy_pool.SLOT_EMPTY)
+        self.assertEqual(active.node_id, "")
         mgr.shutdown()
 
-    def test_fatal_health_errors_release_slot_immediately_after_first_failure(self) -> None:
+    def test_fatal_health_errors_drop_slot_without_refill(self) -> None:
         fatal_reasons = (
             "<urlopen error timed out>",
             "[错误代码 2005] [ERR_OVPN_AUTH_FAILED] OpenVPN 身份验证失败",
@@ -627,13 +617,10 @@ class PoolLifecycleTests(unittest.TestCase):
 
                 mgr.tick_health()
 
-                deadline = time.time() + 2
-                while time.time() < deadline and active.node_id == "A":
-                    time.sleep(0.01)
-
                 original_listener.stop.assert_called()
                 mgr.stop_openvpn.assert_any_call(original_process)
-                self.assertNotEqual(active.node_id, "A")
+                self.assertEqual(active.state, proxy_pool.SLOT_EMPTY)
+                self.assertEqual(active.node_id, "")
                 self.assertFalse(active.replacement_pending)
                 mgr.shutdown()
 

@@ -10,6 +10,13 @@ from pathlib import Path
 import vpngate_manager
 
 
+class RuntimeConfigTests(unittest.TestCase):
+    def test_pool_refresh_defaults_to_five_minutes_without_health_loop(self) -> None:
+        self.assertEqual(vpngate_manager.FETCH_INTERVAL_SECONDS, 300)
+        self.assertEqual(vpngate_manager.CHECK_INTERVAL_SECONDS, 300)
+        self.assertFalse(vpngate_manager.POOL_HEALTH_LOOP_ENABLED)
+
+
 def _row(ip: str, port: str = "443", proto: str = "tcp") -> dict[str, str]:
     return {
         "IP": ip,
@@ -278,7 +285,6 @@ class VpnGateBatchProbeTests(unittest.TestCase):
             config_dir = Path(td) / "configs"
             vpngate_manager.write_json(nodes_file, nodes)
             pool_manager = mock.Mock()
-            pool_manager.refresh_batch_size = 17
 
             with (
                 mock.patch.object(vpngate_manager, "NODES_FILE", nodes_file),
@@ -303,7 +309,7 @@ class VpnGateBatchProbeTests(unittest.TestCase):
         pool_manager.replace_all_slots_from_target_nodes.assert_called_once()
         replaced_nodes = pool_manager.replace_all_slots_from_target_nodes.call_args.args[0]
         self.assertEqual([node["id"] for node in replaced_nodes], ["node-1"])
-        self.assertEqual(pool_manager.replace_all_slots_from_target_nodes.call_args.kwargs, {"batch_size": 17})
+        self.assertEqual(pool_manager.replace_all_slots_from_target_nodes.call_args.kwargs, {"batch_size": 30})
 
     def test_maintain_valid_nodes_does_not_sync_pool_outside_batch_probe(self) -> None:
         node = self._node("node-1", "1.1.1.1")
