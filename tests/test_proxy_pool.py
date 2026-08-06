@@ -181,6 +181,24 @@ class PoolQueryTests(unittest.TestCase):
         self.assertEqual(st["slots"]["empty"], 2)
         self.assertEqual(st["port_base"], 52000)
 
+    def test_status_reports_fixed_refresh_batch_size(self) -> None:
+        mgr = proxy_pool.PoolManager(
+            pool_size=1,
+            port_base=52000,
+            public_host="203.0.113.10",
+            listen_host="127.0.0.1",
+            proxy_user="user",
+            proxy_pass="pass",
+            return_credentials=True,
+            max_starting=1,
+            refresh_batch_size=5,
+            start_openvpn=mock.Mock(),
+            stop_openvpn=mock.Mock(),
+            create_listener=mock.Mock(),
+            log=lambda *a, **k: None,
+        )
+        self.assertEqual(mgr.status()["refresh_batch_size"], 30)
+
     def test_list_proxy_lines_defaults_to_http_multiline(self) -> None:
         text = self.mgr.list_proxy_lines(country="jp,us", sort="port")
         self.assertEqual(

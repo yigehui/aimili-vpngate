@@ -356,7 +356,7 @@ class PoolManager:
         routine_shadow_floor = max(1, self.pool_size // 10)
         self.max_shadow_starting = max(routine_shadow_floor, int(max_shadow_starting or 0))
         self.replacement_grace_seconds = max(0, int(replacement_grace_seconds or 180))
-        self.refresh_batch_size = max(1, int(refresh_batch_size or DEFAULT_REFRESH_BATCH_SIZE))
+        self.refresh_batch_size = DEFAULT_REFRESH_BATCH_SIZE
         self.failed_node_skip_seconds = max(0, int(failed_node_skip_seconds or DEFAULT_FAILED_NODE_SKIP_SECONDS))
         self.shadow_port_base = int(shadow_port_base or 53000)
         self.shadow_port_count = max(1, int(shadow_port_count or 200))
