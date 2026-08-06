@@ -917,50 +917,36 @@ class PoolManager:
             self._rebuilding = True
         try:
             self._wait_fill_idle()
-            group_size = max(1, int(batch_size or DEFAULT_REFRESH_BATCH_SIZE))
             started = 0
-            for start in range(0, self.pool_size, group_size):
-                tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
+            for idx in range(self.pool_size):
+                task: tuple[PoolSlot, dict[str, Any]] | None = None
                 with self._lock:
-                    end = min(self.pool_size, start + group_size)
-                    for idx in range(start, end):
-                        slot = self.slots[idx]
-                        target = target_nodes[idx] if idx < len(target_nodes) else None
-                        if target is None:
-                            if slot.state != SLOT_EMPTY:
-                                self._stop_slot(slot)
-                            continue
-                        target_id = self._node_id(target)
-                        target_exit = self._candidate_exit_key(target)
-                        current_exit = self._slot_exit_key(slot)
-                        if (
-                            slot.state in (SLOT_READY, SLOT_STARTING)
-                            and slot.node_id == target_id
-                            and current_exit == target_exit
-                        ):
-                            continue
+                    slot = self.slots[idx]
+                    target = target_nodes[idx] if idx < len(target_nodes) else None
+                    if target is None:
                         if slot.state != SLOT_EMPTY:
                             self._stop_slot(slot)
-                        if not self._prepare_empty_slot_port(slot):
-                            continue
-                        self._assign_slot_metadata(slot, target)
-                        tasks.append((slot, target))
-                if not tasks:
+                        continue
+                    target_id = self._node_id(target)
+                    target_exit = self._candidate_exit_key(target)
+                    current_exit = self._slot_exit_key(slot)
+                    if (
+                        slot.state in (SLOT_READY, SLOT_STARTING)
+                        and slot.node_id == target_id
+                        and current_exit == target_exit
+                    ):
+                        continue
+                    if slot.state != SLOT_EMPTY:
+                        self._stop_slot(slot)
+                    if not self._prepare_empty_slot_port(slot):
+                        continue
+                    self._assign_slot_metadata(slot, target)
+                    task = (slot, target)
+                if task is None:
                     continue
-
-                threads: list[threading.Thread] = []
-                for slot, node in tasks:
-                    t = threading.Thread(
-                        target=self._start_reserved_slot,
-                        args=(slot, node),
-                        name=f"proxy-pool-slot-{slot.index}",
-                        daemon=True,
-                    )
-                    t.start()
-                    threads.append(t)
-                for t in threads:
-                    t.join(timeout=self.slot_start_timeout)
-                started += len(tasks)
+                slot, node = task
+                self._start_reserved_slot(slot, node)
+                started += 1
             return started
         finally:
             with self._lock:
