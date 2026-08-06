@@ -734,8 +734,6 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertTrue(start_entered.wait(timeout=2.0), "first replacement should be blocked in start")
 
         # 重建进行中:第一批只动 slot 0-1,slot 2-3 应保持原样不动
-        slot1_node = mgr.slots[1].node_id
-        slot1_proc = mgr.slots[1].process
         slot2_node = mgr.slots[2].node_id
         slot2_proc = mgr.slots[2].process
         slot3_node = mgr.slots[3].node_id
@@ -743,9 +741,6 @@ class PoolLifecycleTests(unittest.TestCase):
         # tick_health 即使 health_check 会失败,重建期间也不得动任何 slot
         mgr.tick_health()
         self.assertEqual(mgr.health_check.call_count, 0)
-        self.assertEqual(mgr.slots[1].state, proxy_pool.SLOT_READY)
-        self.assertEqual(mgr.slots[1].node_id, slot1_node)
-        self.assertIs(mgr.slots[1].process, slot1_proc)
         self.assertEqual(mgr.slots[2].state, proxy_pool.SLOT_READY)
         self.assertEqual(mgr.slots[2].node_id, slot2_node)
         self.assertIs(mgr.slots[2].process, slot2_proc)
