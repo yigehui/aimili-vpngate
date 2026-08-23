@@ -906,6 +906,30 @@ class PoolManager:
         return (tier, self._latency_key(node))
 
     def replace_all_slots_from_target_nodes(self, nodes: list[dict[str, Any]], batch_size: int = DEFAULT_REFRESH_BATCH_SIZE) -> int:
+        """Full-replace the pool to match ``nodes`` without a wide outage.
+
+        Every slot is reconciled against the target list (residential/mobile
+        first via ``_candidate_priority_key``, deduped by exit ip):
+
+        * Slot already holds the target node (same id + exit ip): skipped, no
+          needless cutover.
+        * Slot holds a different live node: a shadow OpenVPN/listener is brought
+          up on an independent tun/port, health-checked for a working exit ip,
+          and only then atomically cut over to the slot's public port. The old
+          node keeps serving until cutover. A shadow that fails verification is
+          torn down and the old node stays in place.
+        * Slot is EMPTY (no old node to protect): filled directly via the plain
+          first-fill path (no exit-ip verification — same as initial fill).
+        * No target covers the slot (fewer available nodes than pool_size): the
+          old node is stopped so no stale node lingers. The slot becomes EMPTY
+          until a later probe cycle supplies a target.
+
+        Slots are processed in small serial batches of
+        ``min(batch_size, max_shadow_starting)``; a batch must fully resolve
+        (cutover, shadow failure, or stop) before the next batch starts. The
+        health loop (``tick_health``) is frozen while ``_rebuilding`` is set.
+        Returns the number of slots that ended up serving a target node.
+        """
         candidates = self._dedupe_nodes(list(nodes or []))
         candidates.sort(key=self._candidate_priority_key)
         target_nodes = self._target_nodes(candidates)
@@ -917,50 +941,95 @@ class PoolManager:
             self._rebuilding = True
         try:
             self._wait_fill_idle()
-            group_size = max(1, int(batch_size or DEFAULT_REFRESH_BATCH_SIZE))
-            started = 0
-            for start in range(0, self.pool_size, group_size):
-                tasks: list[tuple[PoolSlot, dict[str, Any]]] = []
+            concurrency = max(1, min(int(batch_size or DEFAULT_REFRESH_BATCH_SIZE), self.max_shadow_starting))
+            # Build the ordered list of (slot_index, target) pairs that need work.
+            # target is None when there are fewer available nodes than pool_size:
+            # the slot's old node must be stopped (full replacement — no stale
+            # nodes are left behind). Slots whose node already matches the target
+            # (same id + exit ip) are skipped to avoid a needless cutover.
+            work: list[tuple[int, dict[str, Any] | None]] = []
+            for idx in range(self.pool_size):
+                target = target_nodes[idx] if idx < len(target_nodes) else None
                 with self._lock:
-                    end = min(self.pool_size, start + group_size)
-                    for idx in range(start, end):
-                        slot = self.slots[idx]
-                        target = target_nodes[idx] if idx < len(target_nodes) else None
-                        if target is None:
-                            if slot.state != SLOT_EMPTY:
-                                self._stop_slot(slot)
-                            continue
-                        target_id = self._node_id(target)
-                        target_exit = self._candidate_exit_key(target)
-                        current_exit = self._slot_exit_key(slot)
-                        if (
-                            slot.state in (SLOT_READY, SLOT_STARTING)
-                            and slot.node_id == target_id
-                            and current_exit == target_exit
-                        ):
-                            continue
+                    slot = self.slots[idx]
+                    if target is None:
                         if slot.state != SLOT_EMPTY:
-                            self._stop_slot(slot)
-                        if not self._prepare_empty_slot_port(slot):
-                            continue
-                        self._assign_slot_metadata(slot, target)
-                        tasks.append((slot, target))
-                if not tasks:
-                    continue
+                            work.append((idx, None))
+                        continue
+                    target_id = self._node_id(target)
+                    target_exit = self._candidate_exit_key(target)
+                    current_exit = self._slot_exit_key(slot)
+                    if (
+                        slot.state in (SLOT_READY, SLOT_STARTING)
+                        and slot.node_id == target_id
+                        and current_exit == target_exit
+                    ):
+                        continue
+                work.append((idx, target))
+            if not work:
+                return 0
 
+            started = 0
+            cursor = 0
+            while cursor < len(work):
+                batch = work[cursor:cursor + concurrency]
+                cursor += concurrency
                 threads: list[threading.Thread] = []
-                for slot, node in tasks:
+                for idx, target in batch:
+                    mode: str | None
+                    with self._lock:
+                        slot = self.slots[idx]
+                        if target is None:
+                            # No new target covers this slot: drop the old node.
+                            if slot.state != SLOT_EMPTY:
+                                old_id = slot.node_id
+                                self._stop_slot(slot)
+                                if old_id:
+                                    self._skipped[old_id] = time.time() + self.failed_node_skip_seconds
+                            mode = None
+                        elif slot.state == SLOT_EMPTY:
+                            # No old node to protect: use the plain first-fill path.
+                            if not self._prepare_empty_slot_port(slot):
+                                mode = None
+                            else:
+                                self._assign_slot_metadata(slot, target)
+                                mode = "fill"
+                        else:
+                            # Old node is live: stand up a shadow, verify, then cutover.
+                            if slot.shadow is not None or self._shadow_inflight_count_locked() >= self.max_shadow_starting:
+                                mode = None
+                            else:
+                                shadow = ShadowCandidate(
+                                    index=slot.index,
+                                    tun_name=self._shadow_tun_name(slot),
+                                    port=self._shadow_port(slot),
+                                )
+                                self._shadow_meta_from_node(shadow, target)
+                                slot.shadow = shadow
+                                slot.replacement_pending = True
+                                slot.replacement_reason = "rebuild"
+                                slot.replacement_requested_at = time.time()
+                                slot.replacement_deadline_at = slot.replacement_requested_at + self.replacement_grace_seconds
+                                mode = "shadow"
+                    if mode is None:
+                        continue
                     t = threading.Thread(
-                        target=self._start_reserved_slot,
-                        args=(slot, node),
-                        name=f"proxy-pool-slot-{slot.index}",
+                        target=self._start_reserved_slot if mode == "fill" else self._start_shadow_for_slot,
+                        args=(slot, target),
+                        name=f"proxy-pool-{'slot' if mode == 'fill' else 'shadow'}-{slot.index}",
                         daemon=True,
                     )
                     t.start()
                     threads.append(t)
                 for t in threads:
                     t.join(timeout=self.slot_start_timeout)
-                started += len(tasks)
+                # Count slots that ended up serving their target (cutover or first-fill).
+                with self._lock:
+                    for idx, target in batch:
+                        if target is None:
+                            continue
+                        if self.slots[idx].node_id == self._node_id(target):
+                            started += 1
             return started
         finally:
             with self._lock:
@@ -1327,8 +1396,8 @@ class PoolManager:
                 exit_ip_type = str(meta.get("ip_type") or "").strip()
                 if exit_ip_type:
                     current_shadow.ip_type = exit_ip_type
-                self._cutover_shadow_locked(slot)
-            return True
+                cutover_ok = self._cutover_shadow_locked(slot)
+            return cutover_ok
         except Exception as exc:
             if listener is not None:
                 try:
@@ -1407,6 +1476,22 @@ class PoolManager:
                         slot.listener.start()
             except Exception:
                 slot.listener = None
+            # Cutover failed: the old slot was rolled back above, but the
+            # verified shadow OpenVPN process is now orphaned. Stop it and
+            # clear the shadow/replacement state so the slot is left cleanly
+            # serving its old node and is eligible for a later retry — instead
+            # of leaking the process and wedging on slot.shadow != None.
+            if shadow.process is not None:
+                try:
+                    self.stop_openvpn(shadow.process)
+                except Exception:
+                    pass
+                shadow.process = None
+            shadow.listener = None
+            slot.last_error = "shadow cutover failed; old node retained"
+            if shadow.node_id:
+                self._skipped[shadow.node_id] = time.time() + self.failed_node_skip_seconds
+            self._reset_replacement_fields_locked(slot)
             return False
 
         slot.device_name = shadow.tun_name
@@ -1425,6 +1510,11 @@ class PoolManager:
         slot.updated_at = time.time()
         slot.fail_count = 0
         slot.last_error = ""
+        # The shadow's OpenVPN process now belongs to the slot; clear the
+        # shadow reference so the upcoming _cleanup_shadow_locked does not
+        # stop the process we just took over.
+        shadow.process = None
+        shadow.listener = None
         if old_process is not None:
             try:
                 self.stop_openvpn(old_process)

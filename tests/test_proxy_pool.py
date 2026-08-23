@@ -654,7 +654,7 @@ class PoolLifecycleTests(unittest.TestCase):
         def health_check(slot):
             return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}
 
-        mgr = self._mgr(pool_size=4, max_starting=1, max_shadow_starting=1)
+        mgr = self._mgr(pool_size=4, max_starting=1, max_shadow_starting=2)
         mgr.health_check = mock.Mock(side_effect=health_check)
         mgr.start()
         _seed_pool(mgr, [
@@ -668,6 +668,11 @@ class PoolLifecycleTests(unittest.TestCase):
              "score_latency": 13, "ip_type": "hosting", "config_text": "d", "probe_status": "available"},
         ])
         _wait_ready(mgr, 4)
+        # Snapshot old processes so we can prove they outlive the rebuild.
+        old_procs = [mgr.slots[i].process for i in range(4)]
+        old_proc_stop = mock.Mock()
+        for p in old_procs:
+            p.poll.return_value = None
 
         started = mgr.replace_all_slots_from_target_nodes([
             {"id": "new-0", "country_short": "TH", "country": "Thailand", "ip": "2.2.2.1",
@@ -678,9 +683,18 @@ class PoolLifecycleTests(unittest.TestCase):
              "score_latency": 3, "ip_type": "hosting", "config_text": "n2", "probe_status": "available"},
         ], batch_size=2)
 
+        # Three slots cut over to the new residential/mobile-prioritized targets.
         self.assertEqual(started, 3)
         self.assertEqual([mgr.slots[i].node_id for i in range(3)], ["new-0", "new-1", "new-2"])
+        # Slot 3 had no target: full replacement — the old node is dropped.
         self.assertEqual(mgr.slots[3].state, proxy_pool.SLOT_EMPTY)
+        self.assertEqual(mgr.slots[3].node_id, "")
+        self.assertIsNone(mgr.slots[3].process)
+        self.assertGreater(mgr._skipped.get("old-d", 0), 0)
+        # Cutover is verify-then-switch: each replaced slot ends up serving its
+        # target's exit ip reported by the health check.
+        for i in range(3):
+            self.assertEqual(mgr.slots[i].exit_ip, f"2.2.2.{i + 1}")
         mgr.shutdown()
 
     def test_rebuild_freezes_other_slots_during_replace_all(self) -> None:
@@ -691,15 +705,16 @@ class PoolLifecycleTests(unittest.TestCase):
         slow_on = {"v": False}
 
         def maybe_slow_start(config_path, dev):
-            # 第一批(batch_size=2)对应 tun0/tun1,阻塞它们让重建停在第一批
-            if slow_on["v"] and dev == "tun0":
+            # 新方案下重建起的是 shadow,slot 0 的 shadow tun 是 tun{pool_size+0}=tun4。
+            # 阻塞它让重建卡在第一批第一个 shadow 的 start_openvpn,从而观察冻结期行为。
+            if slow_on["v"] and dev == "tun4":
                 start_entered.set()
                 slow_gate.wait(timeout=5)
             proc = mock.Mock()
             proc.poll.return_value = None
             return True, "ok", proc
 
-        mgr = self._mgr(maybe_slow_start, pool_size=4, max_starting=4)
+        mgr = self._mgr(maybe_slow_start, pool_size=4, max_starting=4, max_shadow_starting=2)
         # health_check 总是失败:正常情况下 tick_health 会立即停掉 READY slot
         mgr.health_check = mock.Mock(return_value=(False, "dead", {}))
         mgr.start()
@@ -731,12 +746,16 @@ class PoolLifecycleTests(unittest.TestCase):
         while time.time() < deadline and not mgr._rebuilding:
             time.sleep(0.01)
         self.assertTrue(mgr._rebuilding, "rebuild flag should be set during replace_all")
-        self.assertTrue(start_entered.wait(timeout=2.0), "first replacement should be blocked in start")
+        self.assertTrue(start_entered.wait(timeout=2.0), "first shadow start should be blocked")
 
-        # 重建进行中:第一批只动 slot 0-1,slot 2-3 应保持原样不动
+        # 重建进行中:被替换 slot 的老节点仍在岗(shadow 起在独立 tun,不碰老 slot),
+        # 未涉及到的 slot 2-3 也保持原样不动。
         slot2_node = mgr.slots[2].node_id
         slot2_proc = mgr.slots[2].process
         slot3_node = mgr.slots[3].node_id
+        slot0_old_node = "old-0"
+        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
+        self.assertEqual(mgr.slots[0].node_id, slot0_old_node)
 
         # tick_health 即使 health_check 会失败,重建期间也不得动任何 slot
         mgr.tick_health()
@@ -751,6 +770,114 @@ class PoolLifecycleTests(unittest.TestCase):
         slow_gate.set()
         rebuild_thread.join(timeout=5)
         self.assertFalse(mgr._rebuilding, "rebuild flag should clear after replace_all")
+        mgr.shutdown()
+
+    def test_rebuild_shadow_health_fail_keeps_old_slot(self) -> None:
+        # shadow 验通失败时:老节点必须在岗、shadow 被清理、失败 target 进 _skipped,
+        # 且不影响其它 slot 的 cutover。
+        def health_check(slot):
+            # slot 0 的 shadow 验通失败,其余通过。shadow 端口在 53000 段。
+            is_shadow = getattr(slot, "port", 0) >= 53000
+            shadow_index = getattr(slot, "index", -1)
+            if is_shadow and shadow_index == 0:
+                return False, "dead exit", {}
+            return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}
+
+        mgr = self._mgr(pool_size=3, max_starting=2, max_shadow_starting=3)
+        mgr.health_check = mock.Mock(side_effect=health_check)
+        mgr.start()
+        _seed_pool(mgr, [
+            {"id": f"old-{i}", "country_short": "JP", "country": "Japan",
+             "ip": f"10.0.0.{i}", "score_latency": 10 + i, "ip_type": "hosting",
+             "config_text": f"o{i}", "probe_status": "available"}
+            for i in range(3)
+        ])
+        _wait_ready(mgr, 3)
+        old_proc0 = mgr.slots[0].process
+
+        new_nodes = [
+            {"id": "new-0", "country_short": "TH", "country": "Thailand", "ip": "20.0.0.0",
+             "score_latency": 1, "ip_type": "residential", "config_text": "n0", "probe_status": "available"},
+            {"id": "new-1", "country_short": "TH", "country": "Thailand", "ip": "20.0.0.1",
+             "score_latency": 2, "ip_type": "residential", "config_text": "n1", "probe_status": "available"},
+            {"id": "new-2", "country_short": "TH", "country": "Thailand", "ip": "20.0.0.2",
+             "score_latency": 3, "ip_type": "residential", "config_text": "n2", "probe_status": "available"},
+        ]
+        started = mgr.replace_all_slots_from_target_nodes(new_nodes, batch_size=3)
+
+        # slot 1/2 cutover 成功,slot 0 验通失败保留老节点。
+        self.assertEqual(started, 2)
+        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
+        self.assertEqual(mgr.slots[0].node_id, "old-0")
+        self.assertIs(mgr.slots[0].process, old_proc0)
+        self.assertIsNone(mgr.slots[0].shadow)
+        self.assertEqual(mgr.slots[1].node_id, "new-1")
+        self.assertEqual(mgr.slots[2].node_id, "new-2")
+        # 失败的 new-0 进 skip 窗口,不会立刻被重试。
+        self.assertGreater(mgr._skipped.get("new-0", 0), 0)
+        mgr.shutdown()
+
+    def test_rebuild_cutover_failure_keeps_old_slot_and_no_orphan(self) -> None:
+        # cutover 时 create_listener 抛异常:shadow 进程必须被停掉(无孤儿),
+        # 老节点保留在岗,replacement 字段清空,slot 不卡死(下轮可重试)。
+        def health_check(slot):
+            return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}
+
+        call_count = {"n": 0}
+
+        def listener_factory(**kwargs):
+            port = kwargs["port"]
+            call_count["n"] += 1
+            # 前 pool_size 次是 seed 首填充(slot 公开端口),正常起;
+            # 之后是 cutover 切公开端口,抛异常触发回滚。
+            if call_count["n"] > 2:
+                raise OSError("cutover listener bind failed")
+            lis = mock.Mock()
+            lis.start.return_value = port
+            lis.is_alive.return_value = True
+            lis.stop = mock.Mock()
+            return lis
+
+        stopped_procs = []
+
+        def stop_openvpn(proc):
+            stopped_procs.append(proc)
+
+        mgr = self._mgr(pool_size=2, max_starting=2, max_shadow_starting=2)
+        mgr.health_check = mock.Mock(side_effect=health_check)
+        mgr.create_listener = listener_factory
+        mgr.stop_openvpn = stop_openvpn
+        mgr.start()
+        _seed_pool(mgr, [
+            {"id": f"old-{i}", "country_short": "JP", "country": "Japan",
+             "ip": f"10.0.0.{i}", "score_latency": 10 + i, "ip_type": "hosting",
+             "config_text": f"o{i}", "probe_status": "available"}
+            for i in range(2)
+        ])
+        _wait_ready(mgr, 2)
+        old_procs = [mgr.slots[i].process for i in range(2)]
+
+        new_nodes = [
+            {"id": f"new-{i}", "country_short": "TH", "country": "Thailand",
+             "ip": f"20.0.0.{i}", "score_latency": i, "ip_type": "residential",
+             "config_text": f"n{i}", "probe_status": "available"}
+            for i in range(2)
+        ]
+        started = mgr.replace_all_slots_from_target_nodes(new_nodes, batch_size=2)
+
+        # cutover 全失败,没有 slot 成功切到 target。
+        self.assertEqual(started, 0)
+        for i in range(2):
+            slot = mgr.slots[i]
+            # 老节点保留在岗。
+            self.assertEqual(slot.state, proxy_pool.SLOT_READY)
+            self.assertEqual(slot.node_id, f"old-{i}")
+            self.assertIs(slot.process, old_procs[i])
+            # replacement 状态已清空,shadow 已清 —— 不卡死,下轮可重试。
+            self.assertIsNone(slot.shadow)
+            self.assertFalse(slot.replacement_pending)
+        # shadow 起的 OpenVPN 进程已被停掉(无孤儿)。
+        self.assertEqual(len(stopped_procs), 2)
         mgr.shutdown()
 
 
