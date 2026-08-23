@@ -880,6 +880,117 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(len(stopped_procs), 2)
         mgr.shutdown()
 
+    def test_rebuild_shadow_health_check_timeout_tears_down(self) -> None:
+        # health_check 永久阻塞超过硬超时:必须按"验证失败"清理 shadow
+        # (停 OpenVPN、清 slot.shadow、进 _skipped),老节点保留在岗,
+        # 而不是让线程卡死、shadow 进程/tun 泄漏。
+        import threading as _t
+
+        block_evt = _t.Event()
+
+        def health_check(slot):
+            block_evt.wait(30)  # 永远不 set → 阻塞
+            return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 1}
+
+        stopped_procs = []
+
+        def stop_openvpn(proc):
+            stopped_procs.append(proc)
+
+        mgr = self._mgr(pool_size=2, max_starting=2, max_shadow_starting=2,
+                        health_check_timeout=0.3)
+        mgr.health_check = mock.Mock(side_effect=health_check)
+        mgr.stop_openvpn = stop_openvpn
+        mgr.start()
+        _seed_pool(mgr, [
+            {"id": f"old-{i}", "country_short": "JP", "country": "Japan",
+             "ip": f"10.0.0.{i}", "score_latency": 10 + i, "ip_type": "hosting",
+             "config_text": f"o{i}", "probe_status": "available"}
+            for i in range(2)
+        ])
+        _wait_ready(mgr, 2)
+        old_procs = [mgr.slots[i].process for i in range(2)]
+
+        new_nodes = [
+            {"id": f"new-{i}", "country_short": "TH", "country": "Thailand",
+             "ip": f"20.0.0.{i}", "score_latency": i, "ip_type": "residential",
+             "config_text": f"n{i}", "probe_status": "available"}
+            for i in range(2)
+        ]
+        started = mgr.replace_all_slots_from_target_nodes(new_nodes, batch_size=2)
+
+        # 硬超时触发,两个 shadow 都验通失败 → 没有 slot 切到 target。
+        self.assertEqual(started, 0)
+        for i in range(2):
+            slot = mgr.slots[i]
+            # 老节点保留在岗,未被 cutover。
+            self.assertEqual(slot.state, proxy_pool.SLOT_READY)
+            self.assertEqual(slot.node_id, f"old-{i}")
+            self.assertIs(slot.process, old_procs[i])
+            # shadow 已清,不卡死 —— 下轮可重试。
+            self.assertIsNone(slot.shadow)
+            self.assertFalse(slot.replacement_pending)
+        # shadow 起的 OpenVPN 进程被停掉(无孤儿泄漏)。
+        self.assertEqual(len(stopped_procs), 2)
+        # 失败 target 进 skip 窗口。
+        self.assertGreater(mgr._skipped.get("new-0", 0), 0)
+        block_evt.set()  # 释放卡住的 health_check 线程
+        mgr.shutdown()
+
+    def test_rebuild_shadow_join_timeout_reaps_slot(self) -> None:
+        # join 超时(线程仍卡在 health_check 且硬超时还没到):rebuild 必须强制
+        # 回收 shadow(杀进程、清 slot.shadow),让该 slot 下轮可重试,而不是
+        # 被 "slot.shadow is not None" 永久跳过 —— 这正是服务器上泄漏的修复点。
+        import threading as _t
+
+        block_evt = _t.Event()
+
+        def health_check(slot):
+            block_evt.wait(30)  # 阻塞到测试结束
+            return True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 1}
+
+        stopped_procs = []
+
+        def stop_openvpn(proc):
+            stopped_procs.append(proc)
+
+        mgr = self._mgr(pool_size=1, max_starting=1, max_shadow_starting=1,
+                        health_check_timeout=30)  # 硬超时 30s,远大于 join 超时
+        # 绕过 __init__ 的 max(30, ...) 下限,让 join 超时快速触发。
+        mgr.slot_start_timeout = 0.3
+        mgr.health_check = mock.Mock(side_effect=health_check)
+        mgr.stop_openvpn = stop_openvpn
+        mgr.start()
+        _seed_pool(mgr, [
+            {"id": "old-0", "country_short": "JP", "country": "Japan", "ip": "10.0.0.0",
+             "score_latency": 10, "ip_type": "hosting", "config_text": "o0",
+             "probe_status": "available"}
+        ])
+        _wait_ready(mgr, 1)
+        old_proc = mgr.slots[0].process
+
+        new_nodes = [
+            {"id": "new-0", "country_short": "TH", "country": "Thailand", "ip": "20.0.0.0",
+             "score_latency": 1, "ip_type": "residential", "config_text": "n0",
+             "probe_status": "available"}
+        ]
+        started = mgr.replace_all_slots_from_target_nodes(new_nodes, batch_size=1)
+
+        # join 超时强制回收 → 没有 slot 切到 target。
+        self.assertEqual(started, 0)
+        slot = mgr.slots[0]
+        # 老节点保留在岗。
+        self.assertEqual(slot.state, proxy_pool.SLOT_READY)
+        self.assertEqual(slot.node_id, "old-0")
+        self.assertIs(slot.process, old_proc)
+        # shadow 被强制清空 —— 下轮可重试,不永久跳过。
+        self.assertIsNone(slot.shadow)
+        self.assertFalse(slot.replacement_pending)
+        # 失败 target 进 skip 窗口。
+        self.assertGreater(mgr._skipped.get("new-0", 0), 0)
+        block_evt.set()  # 释放卡住的 health_check 线程
+        mgr.shutdown()
+
 
 
 if __name__ == "__main__":

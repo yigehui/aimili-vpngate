@@ -332,6 +332,7 @@ class PoolManager:
         failed_node_skip_seconds: int = DEFAULT_FAILED_NODE_SKIP_SECONDS,
         shadow_port_base: int = 53000,
         shadow_port_count: int = 200,
+        health_check_timeout: int = 20,
     ) -> None:
         self.pool_size = int(pool_size)
         self.port_base = int(port_base)
@@ -360,6 +361,7 @@ class PoolManager:
         self.failed_node_skip_seconds = max(0, int(failed_node_skip_seconds or DEFAULT_FAILED_NODE_SKIP_SECONDS))
         self.shadow_port_base = int(shadow_port_base or 53000)
         self.shadow_port_count = max(1, int(shadow_port_count or 200))
+        self.health_check_timeout = max(5, int(health_check_timeout or 20))
         self.api_token = ""
         self.slots: list[PoolSlot] = [PoolSlot(i, self.port_base) for i in range(self.pool_size)]
         self._lock = threading.RLock()
@@ -974,7 +976,7 @@ class PoolManager:
             while cursor < len(work):
                 batch = work[cursor:cursor + concurrency]
                 cursor += concurrency
-                threads: list[threading.Thread] = []
+                threads: list[tuple[threading.Thread, int, str]] = []
                 for idx, target in batch:
                     mode: str | None
                     with self._lock:
@@ -1020,9 +1022,26 @@ class PoolManager:
                         daemon=True,
                     )
                     t.start()
-                    threads.append(t)
-                for t in threads:
+                    threads.append((t, idx, mode))
+                for t, idx, mode in threads:
                     t.join(timeout=self.slot_start_timeout)
+                    # join() timed out but the thread is still alive: the shadow
+                    # start/health_check path is wedged. Force-reap the shadow
+                    # (stop its OpenVPN, clear slot.shadow) so the slot is eligible
+                    # for a retry next cycle instead of leaking the process/tun
+                    # and being permanently skipped via "slot.shadow is not None".
+                    # A shadow thread that later wakes will see slot.shadow is
+                    # None and self-abort its (now-stale) cutover path.
+                    if t.is_alive() and mode == "shadow":
+                        with self._lock:
+                            slot = self.slots[idx]
+                            if slot.shadow is not None:
+                                nid = slot.shadow.node_id or "?"
+                                self.log("PoolSlot", f"shadow join_timeout_reap slot={slot.index} node={nid}")
+                                slot.last_error = "shadow start joined timeout; reaped"
+                                if slot.shadow.node_id:
+                                    self._skipped[slot.shadow.node_id] = time.time() + self.failed_node_skip_seconds
+                                self._reset_replacement_fields_locked(slot)
                 # Count slots that ended up serving their target (cutover or first-fill).
                 with self._lock:
                     for idx, target in batch:
@@ -1327,6 +1346,7 @@ class PoolManager:
                         slot.last_error = msg or "shadow start_openvpn failed"
                         self._skipped[nid] = time.time() + self.failed_node_skip_seconds
                         self._reset_replacement_fields_locked(slot)
+                self.log("PoolSlot", f"shadow start_fail slot={slot.index} node={nid} tun={shadow.tun_name}: {msg}")
                 return False
 
             listener = self.create_listener(
@@ -1346,15 +1366,30 @@ class PoolManager:
 
             meta: dict[str, Any] = {}
             if self.health_check is not None:
+                # Hard timeout around health_check: a misbehaving node can keep
+                # opener.open() blocked past slot_start_timeout, which wedges the
+                # rebuild thread and leaks the shadow process/tun. Bound it so a
+                # stuck health check is treated as verification failure and torn
+                # down cleanly instead of lingering forever.
+                ok = False
+                msg = ""
                 try:
-                    checked = self.health_check(shadow)
-                    if isinstance(checked, tuple):
-                        ok, msg, meta = checked
-                    else:
-                        ok, msg, meta = bool(checked), "", {}
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                        future = ex.submit(self.health_check, shadow)
+                        try:
+                            checked = future.result(timeout=self.health_check_timeout)
+                        except concurrent.futures.TimeoutError:
+                            future.cancel()
+                            ok, msg, meta = False, f"shadow health_check timeout {self.health_check_timeout}s", {}
+                        else:
+                            if isinstance(checked, tuple):
+                                ok, msg, meta = checked
+                            else:
+                                ok, msg, meta = bool(checked), "", {}
                 except Exception as exc:
                     ok, msg, meta = False, str(exc), {}
                 if not ok:
+                    self.log("PoolSlot", f"shadow health_fail slot={slot.index} node={nid} port={shadow.port}: {msg}")
                     try:
                         stop = getattr(listener, "stop", None)
                         if callable(stop):
@@ -1371,6 +1406,7 @@ class PoolManager:
                             self._skipped[nid] = time.time() + self.failed_node_skip_seconds
                             self._reset_replacement_fields_locked(slot)
                     return False
+                self.log("PoolSlot", f"shadow health_ok slot={slot.index} node={nid} exit={meta.get('exit_ip') or ''}")
 
             with self._lock:
                 current_shadow = slot.shadow
@@ -1397,6 +1433,7 @@ class PoolManager:
                 if exit_ip_type:
                     current_shadow.ip_type = exit_ip_type
                 cutover_ok = self._cutover_shadow_locked(slot)
+            self.log("PoolSlot", f"shadow cutover_{'ok' if cutover_ok else 'fail'} slot={slot.index} node={nid} port={slot.port}")
             return cutover_ok
         except Exception as exc:
             if listener is not None:
