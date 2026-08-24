@@ -1025,23 +1025,33 @@ class PoolManager:
                     threads.append((t, idx, mode))
                 for t, idx, mode in threads:
                     t.join(timeout=self.slot_start_timeout)
-                    # join() timed out but the thread is still alive: the shadow
-                    # start/health_check path is wedged. Force-reap the shadow
-                    # (stop its OpenVPN, clear slot.shadow) so the slot is eligible
-                    # for a retry next cycle instead of leaking the process/tun
-                    # and being permanently skipped via "slot.shadow is not None".
-                    # A shadow thread that later wakes will see slot.shadow is
-                    # None and self-abort its (now-stale) cutover path.
-                    if t.is_alive() and mode == "shadow":
+                    # join() timed out but the thread is still alive: the start
+                    # path is wedged. Force-reap so the slot is eligible for a
+                    # retry next cycle instead of leaking the process/tun and
+                    # being permanently skipped (shadow via "slot.shadow is not
+                    # None", fill via a STARTING slot _reserve_start_task_locked
+                    # never re-picks). A wedged thread that later wakes will see
+                    # the cleared state and self-abort its (now-stale) path.
+                    if t.is_alive():
                         with self._lock:
                             slot = self.slots[idx]
-                            if slot.shadow is not None:
-                                nid = slot.shadow.node_id or "?"
-                                self.log("PoolSlot", f"shadow join_timeout_reap slot={slot.index} node={nid}")
-                                slot.last_error = "shadow start joined timeout; reaped"
-                                if slot.shadow.node_id:
-                                    self._skipped[slot.shadow.node_id] = time.time() + self.failed_node_skip_seconds
-                                self._reset_replacement_fields_locked(slot)
+                            if mode == "shadow":
+                                if slot.shadow is not None:
+                                    nid = slot.shadow.node_id or "?"
+                                    self.log("PoolSlot", f"shadow join_timeout_reap slot={slot.index} node={nid}")
+                                    slot.last_error = "shadow start joined timeout; reaped"
+                                    if slot.shadow.node_id:
+                                        self._skipped[slot.shadow.node_id] = time.time() + self.failed_node_skip_seconds
+                                    self._reset_replacement_fields_locked(slot)
+                            else:
+                                # fill 模式卡住:把 STARTING slot 复位回 EMPTY,
+                                # 进 _skipped,避免槽位永久缺员。
+                                if slot.state == SLOT_STARTING and slot.node_id:
+                                    nid = slot.node_id
+                                    self.log("PoolSlot", f"fill join_timeout_reap slot={slot.index} node={nid}")
+                                    slot.last_error = "fill start joined timeout; reaped"
+                                    self._skipped[nid] = time.time() + self.failed_node_skip_seconds
+                                    self._reset_slot_fields(slot)
                 # Count slots that ended up serving their target (cutover or first-fill).
                 with self._lock:
                     for idx, target in batch:
@@ -1097,15 +1107,40 @@ class PoolManager:
                 )
                 t.start()
                 threads.append(t)
-            for t in threads:
+            # 对齐 shadow 路径（replace_all 里的 join_timeout_reap）：
+            # fill 线程 join 超时说明 _start_reserved_slot 卡住，把 slot 从
+            # STARTING 复位回 EMPTY，否则下一轮 _reserve_start_task_locked
+            # 只挑 SLOT_EMPTY 会漏掉这个卡住的 slot，导致槽位永久缺员。
+            for t, (slot, _node) in zip(threads, tasks):
                 t.join(timeout=self.slot_start_timeout)
+                if t.is_alive():
+                    with self._lock:
+                        if slot.state == SLOT_STARTING and slot.node_id:
+                            nid = slot.node_id
+                            self._reset_slot_fields(slot)
+                            self._skipped[nid] = time.time() + self.failed_node_skip_seconds
+                        else:
+                            nid = slot.node_id or "?"
+                    self.log("PoolSlot", f"fill join_timeout_reap slot={slot.index} node={nid}")
 
-    def _wait_fill_idle(self) -> None:
+    def _wait_fill_idle(self, timeout: float | None = None) -> bool:
+        # 有界等待：fill 线程可能因环境因素（tun 耗尽/句柄耗尽/openvpn 子进程
+        # 卡在内核态）长时间不返回。若无限等，_rebuilding 永真、tick_health
+        # 永久冻结，整个代理池停止更新。超时后孤儿化卡住的 fill 线程（daemon，
+        # 自行消亡），强制推进 rebuild，让 _rebuilding 能在 finally 复位。
+        limit = timeout if timeout is not None else self.replacement_grace_seconds
+        deadline = time.time() + limit
         while True:
             with self._lock:
                 thread = self._fill_thread
             if thread is None or not thread.is_alive():
-                return
+                return True
+            if time.time() >= deadline:
+                with self._lock:
+                    if self._fill_thread is thread:
+                        self._fill_thread = None
+                self.log("PoolSlot", f"wait_fill_idle timeout {limit}s; orphaning stuck fill thread")
+                return False
             thread.join(timeout=0.05)
 
     def probe_ready_slots(self) -> None:
@@ -1365,12 +1400,11 @@ class PoolManager:
                     listener.start()
 
             meta: dict[str, Any] = {}
+            # health_check 不再作为 cutover 门控：新节点隧道建立成功即切换，
+            # 验证结果仅用于填充 exit_ip/ip_type 供查询展示。这样避免某个节点
+            # 验证卡住/失败时 slot 停在原处、整个 rebuild 链路被拖住。
+            # 保留 health_check_timeout 硬超时，防止 opener.open() 无限阻塞 rebuild 线程。
             if self.health_check is not None:
-                # Hard timeout around health_check: a misbehaving node can keep
-                # opener.open() blocked past slot_start_timeout, which wedges the
-                # rebuild thread and leaks the shadow process/tun. Bound it so a
-                # stuck health check is treated as verification failure and torn
-                # down cleanly instead of lingering forever.
                 ok = False
                 msg = ""
                 try:
@@ -1380,33 +1414,18 @@ class PoolManager:
                             checked = future.result(timeout=self.health_check_timeout)
                         except concurrent.futures.TimeoutError:
                             future.cancel()
-                            ok, msg, meta = False, f"shadow health_check timeout {self.health_check_timeout}s", {}
+                            checked = False, f"shadow health_check timeout {self.health_check_timeout}s", {}
                         else:
-                            if isinstance(checked, tuple):
-                                ok, msg, meta = checked
-                            else:
-                                ok, msg, meta = bool(checked), "", {}
+                            if not isinstance(checked, tuple):
+                                checked = bool(checked), "", {}
                 except Exception as exc:
-                    ok, msg, meta = False, str(exc), {}
-                if not ok:
-                    self.log("PoolSlot", f"shadow health_fail slot={slot.index} node={nid} port={shadow.port}: {msg}")
-                    try:
-                        stop = getattr(listener, "stop", None)
-                        if callable(stop):
-                            stop()
-                    except Exception:
-                        pass
-                    try:
-                        self.stop_openvpn(process)
-                    except Exception:
-                        pass
-                    with self._lock:
-                        if slot.shadow is not None and slot.shadow.node_id == nid:
-                            slot.last_error = msg or "shadow health_check failed"
-                            self._skipped[nid] = time.time() + self.failed_node_skip_seconds
-                            self._reset_replacement_fields_locked(slot)
-                    return False
-                self.log("PoolSlot", f"shadow health_ok slot={slot.index} node={nid} exit={meta.get('exit_ip') or ''}")
+                    checked = False, str(exc), {}
+                ok, msg, meta = checked
+                if ok:
+                    self.log("PoolSlot", f"shadow health_ok slot={slot.index} node={nid} exit={meta.get('exit_ip') or ''}")
+                else:
+                    # 验证失败/超时：不回退、不保留老节点，照常 cutover 到新节点。
+                    self.log("PoolSlot", f"shadow health_skip slot={slot.index} node={nid} port={shadow.port}: {msg} (cutover anyway)")
 
             with self._lock:
                 current_shadow = slot.shadow

@@ -772,9 +772,9 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertFalse(mgr._rebuilding, "rebuild flag should clear after replace_all")
         mgr.shutdown()
 
-    def test_rebuild_shadow_health_fail_keeps_old_slot(self) -> None:
-        # shadow 验通失败时:老节点必须在岗、shadow 被清理、失败 target 进 _skipped,
-        # 且不影响其它 slot 的 cutover。
+    def test_rebuild_shadow_health_fail_cutover_anyway(self) -> None:
+        # health_check 不再是门控：验通失败时也照常 cutover 到新节点,
+        # 老节点被下掉。验证结果仅用于填充 exit_ip 供查询展示。
         def health_check(slot):
             # slot 0 的 shadow 验通失败,其余通过。shadow 端口在 53000 段。
             is_shadow = getattr(slot, "port", 0) >= 53000
@@ -805,16 +805,17 @@ class PoolLifecycleTests(unittest.TestCase):
         ]
         started = mgr.replace_all_slots_from_target_nodes(new_nodes, batch_size=3)
 
-        # slot 1/2 cutover 成功,slot 0 验通失败保留老节点。
-        self.assertEqual(started, 2)
+        # 三个 slot 全部 cutover 到新节点 —— 验通失败的 new-0 也切了。
+        self.assertEqual(started, 3)
         self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
-        self.assertEqual(mgr.slots[0].node_id, "old-0")
-        self.assertIs(mgr.slots[0].process, old_proc0)
+        self.assertEqual(mgr.slots[0].node_id, "new-0")
+        # 老节点 old-0 的进程在 cutover 时被下掉,不再是原进程。
+        self.assertIsNot(mgr.slots[0].process, old_proc0)
         self.assertIsNone(mgr.slots[0].shadow)
         self.assertEqual(mgr.slots[1].node_id, "new-1")
         self.assertEqual(mgr.slots[2].node_id, "new-2")
-        # 失败的 new-0 进 skip 窗口,不会立刻被重试。
-        self.assertGreater(mgr._skipped.get("new-0", 0), 0)
+        # 验通失败不再阻止 cutover,new-0 已上线,不进 _skipped。
+        self.assertNotIn("new-0", mgr._skipped)
         mgr.shutdown()
 
     def test_rebuild_cutover_failure_keeps_old_slot_and_no_orphan(self) -> None:
@@ -880,10 +881,10 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(len(stopped_procs), 2)
         mgr.shutdown()
 
-    def test_rebuild_shadow_health_check_timeout_tears_down(self) -> None:
-        # health_check 永久阻塞超过硬超时:必须按"验证失败"清理 shadow
-        # (停 OpenVPN、清 slot.shadow、进 _skipped),老节点保留在岗,
-        # 而不是让线程卡死、shadow 进程/tun 泄漏。
+    def test_rebuild_shadow_health_check_timeout_cutover_anyway(self) -> None:
+        # health_check 永久阻塞超过硬超时:不再按"验证失败"保留老节点,
+        # 而是照常 cutover 到新节点。硬超时的作用是防止 rebuild 线程被卡死,
+        # 而不是阻止切换。老节点在 cutover 时被下掉。
         import threading as _t
 
         block_evt = _t.Event()
@@ -919,21 +920,21 @@ class PoolLifecycleTests(unittest.TestCase):
         ]
         started = mgr.replace_all_slots_from_target_nodes(new_nodes, batch_size=2)
 
-        # 硬超时触发,两个 shadow 都验通失败 → 没有 slot 切到 target。
-        self.assertEqual(started, 0)
+        # 硬超时触发,但两个 shadow 仍 cutover 到新节点 —— 超时不阻止切换。
+        self.assertEqual(started, 2)
         for i in range(2):
             slot = mgr.slots[i]
-            # 老节点保留在岗,未被 cutover。
             self.assertEqual(slot.state, proxy_pool.SLOT_READY)
-            self.assertEqual(slot.node_id, f"old-{i}")
-            self.assertIs(slot.process, old_procs[i])
-            # shadow 已清,不卡死 —— 下轮可重试。
+            self.assertEqual(slot.node_id, f"new-{i}")
+            # 老节点进程在 cutover 时被下掉,不再是原进程。
+            self.assertIsNot(slot.process, old_procs[i])
+            # shadow 已清,不卡死。
             self.assertIsNone(slot.shadow)
             self.assertFalse(slot.replacement_pending)
-        # shadow 起的 OpenVPN 进程被停掉(无孤儿泄漏)。
+        # 两个老 OpenVPN 进程在 cutover 时被停掉。
         self.assertEqual(len(stopped_procs), 2)
-        # 失败 target 进 skip 窗口。
-        self.assertGreater(mgr._skipped.get("new-0", 0), 0)
+        # cutover 成功,new-0 已上线,不进 skip 窗口。
+        self.assertNotIn("new-0", mgr._skipped)
         block_evt.set()  # 释放卡住的 health_check 线程
         mgr.shutdown()
 
@@ -989,6 +990,119 @@ class PoolLifecycleTests(unittest.TestCase):
         # 失败 target 进 skip 窗口。
         self.assertGreater(mgr._skipped.get("new-0", 0), 0)
         block_evt.set()  # 释放卡住的 health_check 线程
+        mgr.shutdown()
+
+    def test_wait_fill_idle_bounded_orphans_stuck_fill_thread(self) -> None:
+        # _wait_fill_idle 必须有界:fill 线程卡死时不能无限等(否则 _rebuilding
+        # 永真、tick_health 永久冻结,代理池停止更新)。超时后应孤儿化卡住的
+        # fill 线程(置 None)让 rebuild 推进、_rebuilding 能复位。
+        import threading as _t
+
+        mgr = self._mgr(pool_size=1, max_starting=1)
+        mgr.start()
+
+        block_evt = _t.Event()
+
+        def stuck_fill():
+            block_evt.wait(30)  # 永不 set,模拟 fill 线程卡死
+
+        stuck = _t.Thread(target=stuck_fill, daemon=True)
+        stuck.start()
+        mgr._fill_thread = stuck
+
+        ok = mgr._wait_fill_idle(timeout=0.2)
+        # 超时返回 False,卡住的 fill 线程被孤儿化。
+        self.assertFalse(ok)
+        self.assertIsNone(mgr._fill_thread)
+
+        block_evt.set()  # 释放卡住的线程
+        mgr.shutdown()
+
+    def test_wait_fill_idle_releases_rebuilding_on_stuck_fill(self) -> None:
+        # 服务器现象的核心:fill 卡住时 replace_all 仍能让 _rebuilding 复位,
+        # 否则 tick_health 被永久冻结。这是"运行长就不更新"的直接回归点。
+        import threading as _t
+
+        mgr = self._mgr(pool_size=1, max_starting=1, max_shadow_starting=1)
+        mgr.start()
+        _seed_pool(mgr, [
+            {"id": "old-0", "country_short": "JP", "country": "Japan", "ip": "10.0.0.0",
+             "score_latency": 10, "ip_type": "hosting", "config_text": "o0",
+             "probe_status": "available"}
+        ])
+        _wait_ready(mgr, 1)
+
+        block_evt = _t.Event()
+
+        def stuck_fill():
+            block_evt.wait(30)
+
+        stuck = _t.Thread(target=stuck_fill, daemon=True)
+        stuck.start()
+        mgr._fill_thread = stuck
+
+        # 用一个有新 target 的节点触发 replace_all,但 fill 卡住。
+        new_nodes = [
+            {"id": "new-0", "country_short": "TH", "country": "Thailand", "ip": "20.0.0.0",
+             "score_latency": 1, "ip_type": "residential", "config_text": "n0",
+             "probe_status": "available"}
+        ]
+        # 缩短等待上限,让测试快速完成。
+        mgr.replacement_grace_seconds = 0.3
+        mgr.replace_all_slots_from_target_nodes(new_nodes, batch_size=1)
+
+        # _rebuilding 必然复位 —— replace_all 不会因 fill 卡死而永远阻塞。
+        self.assertFalse(mgr._rebuilding)
+        # 卡住的 fill 线程被孤儿化。
+        self.assertIsNone(mgr._fill_thread)
+
+        block_evt.set()
+        mgr.shutdown()
+
+    def test_fill_loop_reaps_stuck_starting_slot(self) -> None:
+        # fill 路径 _start_reserved_slot 卡过 slot_start_timeout:_run_fill_loop
+        # 的 join 超时后必须把 STARTING slot 复位回 EMPTY 并进 _skipped,
+        # 否则该 slot 被 _reserve_start_task_locked(只挑 EMPTY)永久漏掉。
+        import threading as _t
+
+        gate = _t.Event()
+
+        def slow_start(config_path, dev):
+            gate.wait(30)  # 卡住,超过 slot_start_timeout
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            return True, "ok", proc
+
+        mgr = self._mgr(start_side_effect=slow_start, pool_size=2, max_starting=2)
+        mgr.slot_start_timeout = 0.3
+        mgr.start()
+        _seed_pool(mgr, [
+            {"id": "A", "country_short": "JP", "country": "Japan", "ip": "1.1.1.1",
+             "score_latency": 5, "ip_type": "hosting", "config_text": "a",
+             "probe_status": "available"},
+            {"id": "B", "country_short": "US", "country": "US", "ip": "2.2.2.2",
+             "score_latency": 6, "ip_type": "hosting", "config_text": "b",
+             "probe_status": "available"},
+        ])
+
+        # 触发 fill:两个 EMPTY slot 都进 STARTING,但 _start_reserved_slot 卡在
+        # start_openvpn,超过 slot_start_timeout(0.3s)后被 reap。
+        mgr._request_fill_slots()
+        # 等 fill 线程跑完一轮 join(含 reap)。
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if all(s.state == proxy_pool.SLOT_EMPTY for s in mgr.slots):
+                break
+            time.sleep(0.02)
+
+        for slot in mgr.slots:
+            self.assertEqual(slot.state, proxy_pool.SLOT_EMPTY,
+                             f"slot {slot.index} should be reaped back to EMPTY")
+        # 被 reap 的节点进 skip 窗口。
+        self.assertGreater(mgr._skipped.get("A", 0), 0)
+        self.assertGreater(mgr._skipped.get("B", 0), 0)
+
+        gate.set()
         mgr.shutdown()
 
 
