@@ -369,6 +369,9 @@ class PoolManager:
         self._skipped: dict[str, float] = {}
         self._started = False
         self._rebuilding = False
+        # 滚动替换起始 slot 游标;每轮从这开始顺序选 slot,curover 后推��到本轮结束
+        # 位置(含跳过的)并 wrap。服务重启天然回 0,无需持久化。
+        self.refresh_cursor: int = 0
         self._fill_thread: threading.Thread | None = None
         self._temp_config_dir: tempfile.TemporaryDirectory[str] | None = None
 
@@ -696,6 +699,7 @@ class PoolManager:
                 "require_exit_ip": self.require_exit_ip,
                 "refresh_batch_size": self.refresh_batch_size,
                 "failed_node_skip_seconds": self.failed_node_skip_seconds,
+                "refresh_cursor": self.refresh_cursor,
             }
             if detail:
                 result["slot_detail"] = [
@@ -1063,6 +1067,129 @@ class PoolManager:
         finally:
             with self._lock:
                 self._rebuilding = False
+
+    def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
+        """每轮只滚动替换 pool_size 的 10%(``max(1, pool_size // 10)``)个 READY slot。
+
+        与 ``replace_all_slots_from_target_nodes`` 的全量对账不同:本方法每轮只动一小批
+        slot,从 ``refresh_cursor`` 起顺序挑选并推进游标(含被跳过的)、wrap 到
+        pool_size,其余 slot 纹丝不动。多轮周期检测后逐步覆盖整池,任意时刻最多
+        配额个 slot 在经历 shadow cutover,老节点服务到 cutover 为止——避免周期检测
+        后整池重建导致的代理列表骤降。
+
+        * 候选选择(不门控优先级):挑第一个"不同 id、不在用 id/exit_ip、未冷却"的
+          候选,允许换到同等或略差节点,保证每轮稳定轮换防老化。
+        * 复用 ``_start_shadow_for_slot`` 做 shadow cutover(隧道建立即切,验证失败也
+          切),线程 start 不 join,靠其内部 try/except 兜底清理,与 health 路径
+          ``_request_slot_replacement_locked`` 的并发模型一致。
+        * 不设 ``_rebuilding``、不冻结 tick_health/fill:只动 READY slot,fill 只补
+          EMPTY,互不干涉;cutover 在锁内原子切换,tick_health 看不到中间态。与
+          health 路径共享 ``max_shadow_starting`` 并发预算防超发。
+
+        ``batch_size`` 非 None 时覆盖默认 10% 配额(供测试)。返回本轮实际发起替换数。
+        """
+        candidates = self._dedupe_nodes(list(nodes or []))
+        candidates.sort(key=self._candidate_priority_key)
+        if not self.slots:
+            return 0
+
+        if batch_size is not None:
+            quota = max(1, int(batch_size))
+        else:
+            quota = max(1, self.pool_size // 10)
+
+        picked: list[tuple[PoolSlot, dict[str, Any]]] = []
+        with self._lock:
+            self._last_candidates = list(candidates)
+            now = time.time()
+            start_cursor = self.refresh_cursor
+            # 本轮已用候选 id,避免同一轮里把同一候选分给多个 slot
+            consumed_ids: set[str] = set()
+            visited = 0
+            while visited < self.pool_size and len(picked) < quota:
+                idx = (start_cursor + visited) % self.pool_size
+                visited += 1
+                slot = self.slots[idx]
+                if slot.state != SLOT_READY:
+                    continue
+                if not slot.node_id or slot.process is None or slot.listener is None:
+                    continue
+                if slot.replacement_pending or slot.shadow is not None:
+                    continue
+                if self._shadow_inflight_count_locked() >= self.max_shadow_starting:
+                    break
+                node = self._pick_rolling_target_locked(slot, candidates, consumed_ids, now)
+                if node is None:
+                    continue
+                nid = self._node_id(node)
+                consumed_ids.add(nid)
+                shadow = ShadowCandidate(
+                    index=slot.index,
+                    tun_name=self._shadow_tun_name(slot),
+                    port=self._shadow_port(slot),
+                )
+                self._shadow_meta_from_node(shadow, node)
+                slot.shadow = shadow
+                slot.replacement_pending = True
+                slot.replacement_reason = "rolling-refresh"
+                slot.replacement_requested_at = now
+                slot.replacement_deadline_at = now + self.replacement_grace_seconds
+                picked.append((slot, node))
+            # cursor 推进到本轮结束位置(含被跳过的),下轮从这继续,wrap 后回 0
+            self.refresh_cursor = (start_cursor + visited) % self.pool_size
+
+        for slot, node in picked:
+            threading.Thread(
+                target=self._start_shadow_for_slot,
+                args=(slot, node),
+                name=f"proxy-pool-rolling-{slot.index}",
+                daemon=True,
+            ).start()
+        return len(picked)
+
+    def _pick_rolling_target_locked(
+        self,
+        slot: PoolSlot,
+        candidates: list[dict[str, Any]],
+        consumed_ids: set[str],
+        now: float,
+    ) -> dict[str, Any] | None:
+        """为滚动替换挑一个候选:不同 id、不在用 id/exit_ip、未冷却、未在本轮消费过。
+
+        不做优先级比较(不门控):只要不同、可用就换,保证每轮稳定轮换防老化。
+        """
+        used_ids = {
+            s.node_id
+            for s in self.slots
+            if s.node_id and s.state in (SLOT_READY, SLOT_STARTING)
+        }
+        used_ids.update(
+            s.shadow.node_id
+            for s in self.slots
+            if s.shadow is not None and s.shadow.node_id
+        )
+        used_exit_keys = {
+            self._slot_exit_key(s)
+            for s in self.slots
+            if s.state in (SLOT_READY, SLOT_STARTING) and self._slot_exit_key(s)
+        }
+        used_exit_keys.update(
+            self._shadow_exit_key(s.shadow)
+            for s in self.slots
+            if s.shadow is not None and self._shadow_exit_key(s.shadow)
+        )
+        for node in candidates:
+            nid = self._node_id(node)
+            if not nid or nid == slot.node_id or nid in used_ids or nid in consumed_ids:
+                continue
+            exit_key = self._candidate_exit_key(node)
+            if not exit_key or exit_key in used_exit_keys:
+                continue
+            until = self._skipped.get(nid)
+            if until is not None and until > now:
+                continue
+            return node
+        return None
 
     def _request_fill_slots(self) -> None:
         if not self._started or self._rebuilding:

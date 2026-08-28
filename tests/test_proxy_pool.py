@@ -1107,5 +1107,195 @@ class PoolLifecycleTests(unittest.TestCase):
 
 
 
+def _wait_node_ids(mgr: proxy_pool.PoolManager, expect_ids: set[str], timeout: float = 2.0) -> None:
+    """轮询直到 READY slot 的 node_id 集合包含 expect_ids(异步 cutover 完成后)。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY and s.node_id}
+        if expect_ids <= ids:
+            return
+        time.sleep(0.01)
+
+
+def _rolling_mgr(pool_size: int = 10, max_starting: int = 10, max_shadow_starting: int = 10,
+                 health_ok: bool = True) -> proxy_pool.PoolManager:
+    def ok_start(config_path, dev):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        return True, "ok", proc
+
+    def listener_factory(**kwargs):
+        lis = mock.Mock()
+        lis.start.return_value = kwargs["port"]
+        lis.is_alive.return_value = True
+        lis.stop = mock.Mock()
+        return lis
+
+    mgr = proxy_pool.PoolManager(
+        pool_size=pool_size,
+        port_base=52000,
+        public_host="127.0.0.1",
+        listen_host="127.0.0.1",
+        proxy_user="u",
+        proxy_pass="p",
+        return_credentials=True,
+        max_starting=max_starting,
+        max_shadow_starting=max_shadow_starting,
+        start_openvpn=ok_start,
+        stop_openvpn=mock.Mock(),
+        create_listener=listener_factory,
+        log=lambda *a, **k: None,
+        write_config=lambda node, path: path.write_text(node.get("config_text") or "", encoding="utf-8"),
+        config_dir=None,
+    )
+    # health_check 返回 slot 自己的 node_ip 作为 exit_ip,让 cutover 拿得到 exit_ip
+    def health_check(slot):
+        return (True, "ok", {"exit_ip": getattr(slot, "node_ip", ""), "latency_ms": 12}) if health_ok \
+            else (False, "bad", {})
+    mgr.health_check = mock.Mock(side_effect=health_check)
+    return mgr
+
+
+def _hosting_node(node_id: str, ip: str, latency: int = 10, cfg: str = "x") -> dict[str, object]:
+    return {"id": node_id, "country_short": "JP", "country": "Japan", "ip": ip,
+            "score_latency": latency, "ip_type": "hosting", "config_text": cfg,
+            "probe_status": "available"}
+
+
+def _resi_node(node_id: str, ip: str, latency: int = 10, cfg: str = "x") -> dict[str, object]:
+    return {"id": node_id, "country_short": "US", "country": "US", "ip": ip,
+            "score_latency": latency, "ip_type": "residential", "config_text": cfg,
+            "probe_status": "available"}
+
+
+class PoolRollingReplaceTests(unittest.TestCase):
+    def test_rolling_replace_replaces_only_ten_percent(self) -> None:
+        mgr = _rolling_mgr(pool_size=10, max_starting=10, max_shadow_starting=10)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(10)])
+        _wait_ready(mgr, 10)
+
+        resi = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(10)]
+        started = mgr.rolling_replace_from_nodes(resi)
+        _wait_node_ids(mgr, {"new-0"})
+
+        # 10% of 10 = 1 个被换;其余 9 个仍是 old
+        self.assertEqual(started, 1)
+        ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
+        self.assertIn("new-0", ready_ids)
+        self.assertEqual(len(ready_ids & {f"old-{i}" for i in range(10)}), 9)
+        mgr.shutdown()
+
+    def test_rolling_replace_cursor_advances_and_wraps(self) -> None:
+        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
+        _wait_ready(mgr, 4)
+
+        # 每次只换 1 个(4//10 -> max(1,0)=1? pool_size=4 -> 4//10=0 -> max(1,0)=1)
+        # cursor 依次 0,1,2,3,0...
+        for i in range(5):
+            mgr.rolling_replace_from_nodes([_resi_node(f"new-{i}", f"20.0.0.{i}")])
+            _wait_node_ids(mgr, {f"new-{i}"})
+
+        # 5 次后 cursor = 5 % 4 = 1
+        self.assertEqual(mgr.refresh_cursor, 5 % 4)
+        ready = [s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY]
+        # slot 0 被 new-4 覆盖(第5次 wrap 回 slot 0)
+        self.assertEqual(ready[0], "new-4")
+        mgr.shutdown()
+
+    def test_rolling_replace_prefers_residential_over_hosting(self) -> None:
+        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
+        _wait_ready(mgr, 4)
+
+        # 候选混 residential + hosting;_candidate_priority_key 让 residential 排前
+        cands = [_resi_node("resi-0", "20.0.0.0"), _hosting_node("h-0", "30.0.0.0")]
+        mgr.rolling_replace_from_nodes(cands)
+        _wait_node_ids(mgr, {"resi-0"})
+
+        ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
+        self.assertIn("resi-0", ready_ids)
+        self.assertNotIn("h-0", ready_ids)
+        mgr.shutdown()
+
+    def test_rolling_replace_skips_non_ready_slots(self) -> None:
+        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
+        _wait_ready(mgr, 4)
+        # 把 slot 0 砸成 EMPTY
+        mgr.slots[0].state = proxy_pool.SLOT_EMPTY
+        mgr.slots[0].node_id = ""
+        mgr.slots[0].process = None
+        mgr.slots[0].listener = None
+
+        mgr.rolling_replace_from_nodes([_resi_node("new-0", "20.0.0.0")])
+        _wait_node_ids(mgr, {"new-0"})
+
+        # slot 0 被跳过,换的是 slot 1;cursor 推进含跳过的 0 -> 至少到 2
+        self.assertEqual(mgr.slots[1].node_id, "new-0")
+        self.assertGreaterEqual(mgr.refresh_cursor, 2)
+        mgr.shutdown()
+
+    def test_rolling_replace_skips_slots_with_pending_replacement(self) -> None:
+        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
+        _wait_ready(mgr, 4)
+        # slot 0 预置 replacement_pending + shadow
+        mgr.slots[0].replacement_pending = True
+        mgr.slots[0].shadow = proxy_pool.ShadowCandidate(index=0, tun_name="tun4", port=53000)
+
+        mgr.rolling_replace_from_nodes([_resi_node("new-0", "20.0.0.0")])
+        _wait_node_ids(mgr, {"new-0"})
+
+        # slot 0 被跳过,换的是 slot 1
+        self.assertEqual(mgr.slots[1].node_id, "new-0")
+        self.assertGreaterEqual(mgr.refresh_cursor, 2)
+        mgr.shutdown()
+
+    def test_rolling_replace_resets_cursor_on_new_instance(self) -> None:
+        a = _rolling_mgr(pool_size=4)
+        b = _rolling_mgr(pool_size=4)
+        self.assertEqual(a.refresh_cursor, 0)
+        self.assertEqual(b.refresh_cursor, 0)
+        a.shutdown()
+        b.shutdown()
+
+    def test_rolling_replace_caps_at_max_shadow_starting(self) -> None:
+        # pool 30 -> routine_floor = 30//10 = 3,max_shadow_starting 被 floor 拉到 3。
+        # 显式 batch_size=5 把 quota 拉到 5,超过并发预算 3 -> 只起 3 个。
+        mgr = _rolling_mgr(pool_size=30, max_starting=3, max_shadow_starting=3)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(30)])
+        _wait_ready(mgr, 30)
+
+        cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(30)]
+        started = mgr.rolling_replace_from_nodes(cands, batch_size=5)
+        # quota=5 但并发预算=3 -> 只发起 3 个
+        self.assertEqual(started, 3)
+        _wait_node_ids(mgr, {"new-0", "new-1", "new-2"})
+        # 再调:前 3 个 shadow 已 cutover 释放,又能起 3 个
+        started2 = mgr.rolling_replace_from_nodes(cands, batch_size=5)
+        self.assertEqual(started2, 3)
+        mgr.shutdown()
+
+    def test_rolling_replace_updates_last_candidates(self) -> None:
+        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
+        _wait_ready(mgr, 4)
+
+        new_nodes = [_resi_node("new-0", "20.0.0.0"), _resi_node("new-1", "20.0.0.1")]
+        mgr.rolling_replace_from_nodes(new_nodes)
+
+        # _last_candidates 更新为 dedupe+排序后的候选,供 fill 空槽补位用
+        self.assertEqual([n["id"] for n in mgr._last_candidates], ["new-0", "new-1"])
+        mgr.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()
