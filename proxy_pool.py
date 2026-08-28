@@ -1104,6 +1104,8 @@ class PoolManager:
         # 先把空槽填起来(空池初始填充 / health drop 后补位)。fill 只动 EMPTY,
         # 受 max_starting 并发约束,不限总量;空池时这一步把能填的都填到 READY,
         # 之后的滚动替换才有 READY slot 可换。fill 不消费 refresh_cursor。
+        # 注意:fill 会优先消耗候选把 EMPTY 槽补上(补缺比换掉好节点优先);候选
+        # 不足时 fill 吃光候选,滚动这轮就空手——这是预期优先级,待候选富余再滚。
         with self._lock:
             self._last_candidates = list(candidates)
         self._run_fill_loop()
@@ -1112,9 +1114,12 @@ class PoolManager:
         with self._lock:
             now = time.time()
             start_cursor = self.refresh_cursor
+            ready_count = sum(1 for s in self.slots if s.state == SLOT_READY)
+            empty_count = sum(1 for s in self.slots if s.state == SLOT_EMPTY)
             # 本轮已用候选 id,避免同一轮里把同一候选分给多个 slot
             consumed_ids: set[str] = set()
             visited = 0
+            skipped_no_target = 0
             while visited < self.pool_size and len(picked) < quota:
                 idx = (start_cursor + visited) % self.pool_size
                 visited += 1
@@ -1129,6 +1134,7 @@ class PoolManager:
                     break
                 node = self._pick_rolling_target_locked(slot, candidates, consumed_ids, now)
                 if node is None:
+                    skipped_no_target += 1
                     continue
                 nid = self._node_id(node)
                 consumed_ids.add(nid)
@@ -1146,6 +1152,16 @@ class PoolManager:
                 picked.append((slot, node))
             # cursor 推进到本轮结束位置(含被跳过的),下轮从这继续,wrap 后回 0
             self.refresh_cursor = (start_cursor + visited) % self.pool_size
+
+        try:
+            self.log(
+                "Pool",
+                f"rolling_replace ready={ready_count} empty={empty_count} picked={len(picked)} "
+                f"quota={quota} skipped_no_target={skipped_no_target} "
+                f"cursor={start_cursor}->{self.refresh_cursor}",
+            )
+        except Exception:
+            pass
 
         for slot, node in picked:
             threading.Thread(
