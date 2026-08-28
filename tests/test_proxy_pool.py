@@ -1226,16 +1226,17 @@ class PoolRollingReplaceTests(unittest.TestCase):
         mgr.start()
         _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
         _wait_ready(mgr, 4)
-        # 把 slot 0 砸成 EMPTY
-        mgr.slots[0].state = proxy_pool.SLOT_EMPTY
-        mgr.slots[0].node_id = ""
-        mgr.slots[0].process = None
-        mgr.slots[0].listener = None
+        # 把 slot 0 置成 STARTING(fill 不挑 STARTING,滚动也跳过非 READY),
+        # 测纯滚动跳过逻辑:slot 0 不参与 cutover,换的是下一个 READY slot。
+        mgr.slots[0].state = proxy_pool.SLOT_STARTING
+        mgr.slots[0].process = mock.Mock()
+        mgr.slots[0].process.poll.return_value = None
 
         mgr.rolling_replace_from_nodes([_resi_node("new-0", "20.0.0.0")])
         _wait_node_ids(mgr, {"new-0"})
 
-        # slot 0 被跳过,换的是 slot 1;cursor 推进含跳过的 0 -> 至少到 2
+        # slot 0 仍是 old-0(STARTING,被跳过),换的是 slot 1
+        self.assertEqual(mgr.slots[0].node_id, "old-0")
         self.assertEqual(mgr.slots[1].node_id, "new-0")
         self.assertGreaterEqual(mgr.refresh_cursor, 2)
         mgr.shutdown()
@@ -1294,6 +1295,21 @@ class PoolRollingReplaceTests(unittest.TestCase):
 
         # _last_candidates 更新为 dedupe+排序后的候选,供 fill 空槽补位用
         self.assertEqual([n["id"] for n in mgr._last_candidates], ["new-0", "new-1"])
+        mgr.shutdown()
+
+    def test_rolling_replace_fills_empty_pool(self) -> None:
+        # 空池调 rolling_replace 应先把 EMPTY 填到 READY(fill 路径),不能只滚不填。
+        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
+        mgr.start()
+        # 不 seed,池子全 EMPTY
+        nodes = [_hosting_node(f"fill-{i}", f"10.0.0.{i}") for i in range(4)]
+        mgr.rolling_replace_from_nodes(nodes)
+        _wait_ready(mgr, 4)
+
+        ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
+        self.assertEqual(ready_ids, {f"fill-{i}" for i in range(4)})
+        # 全是 fill 来的,没有 shadow cutover,cursor 仍 0
+        self.assertEqual(mgr.refresh_cursor, 0)
         mgr.shutdown()
 
 

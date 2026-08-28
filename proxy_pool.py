@@ -1077,6 +1077,9 @@ class PoolManager:
         配额个 slot 在经历 shadow cutover,老节点服务到 cutover 为止——避免周期检测
         后整池重建导致的代理列表骤降。
 
+        * 空槽先填:开头先跑 ``_run_fill_loop`` 把 EMPTY slot 按候选补到 READY
+          (受 ``max_starting`` 并发约束,不限总量)。这样服务重启/health drop 后空池
+          能填起来——本方法是周期检测后唯一的池维护入口,不能只滚不填。
         * 候选选择(不门控优先级):挑第一个"不同 id、不在用 id/exit_ip、未冷却"的
           候选,允许换到同等或略差节点,保证每轮稳定轮换防老化。
         * 复用 ``_start_shadow_for_slot`` 做 shadow cutover(隧道建立即切,验证失败也
@@ -1098,9 +1101,15 @@ class PoolManager:
         else:
             quota = max(1, self.pool_size // 10)
 
-        picked: list[tuple[PoolSlot, dict[str, Any]]] = []
+        # 先把空槽填起来(空池初始填充 / health drop 后补位)。fill 只动 EMPTY,
+        # 受 max_starting 并发约束,不限总量;空池时这一步把能填的都填到 READY,
+        # 之后的滚动替换才有 READY slot 可换。fill 不消费 refresh_cursor。
         with self._lock:
             self._last_candidates = list(candidates)
+        self._run_fill_loop()
+
+        picked: list[tuple[PoolSlot, dict[str, Any]]] = []
+        with self._lock:
             now = time.time()
             start_cursor = self.refresh_cursor
             # 本轮已用候选 id,避免同一轮里把同一候选分给多个 slot
