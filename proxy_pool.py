@@ -1120,6 +1120,7 @@ class PoolManager:
             consumed_ids: set[str] = set()
             visited = 0
             skipped_no_target = 0
+            skip_reasons: dict[str, int] = {}
             while visited < self.pool_size and len(picked) < quota:
                 idx = (start_cursor + visited) % self.pool_size
                 visited += 1
@@ -1132,7 +1133,9 @@ class PoolManager:
                     continue
                 if self._shadow_inflight_count_locked() >= self.max_shadow_starting:
                     break
-                node = self._pick_rolling_target_locked(slot, candidates, consumed_ids, now)
+                node = self._pick_rolling_target_locked(
+                    slot, candidates, consumed_ids, now, skip_reasons
+                )
                 if node is None:
                     skipped_no_target += 1
                     continue
@@ -1154,10 +1157,12 @@ class PoolManager:
             self.refresh_cursor = (start_cursor + visited) % self.pool_size
 
         try:
+            reasons = " ".join(f"{k}={v}" for k, v in sorted(skip_reasons.items())) or "none"
             self.log(
                 "Pool",
                 f"rolling_replace ready={ready_count} empty={empty_count} picked={len(picked)} "
                 f"quota={quota} skipped_no_target={skipped_no_target} "
+                f"reasons[{reasons}] candidates={len(candidates)} "
                 f"cursor={start_cursor}->{self.refresh_cursor}",
             )
         except Exception:
@@ -1178,10 +1183,12 @@ class PoolManager:
         candidates: list[dict[str, Any]],
         consumed_ids: set[str],
         now: float,
+        skip_reasons: dict[str, int] | None = None,
     ) -> dict[str, Any] | None:
         """为滚动替换挑一个候选:不同 id、不在用 id/exit_ip、未冷却、未在本轮消费过。
 
         不做优先级比较(不门控):只要不同、可用就换,保证每轮稳定轮换防老化。
+        ``skip_reasons`` 非 None 时累计该 slot 无候选的原因(诊断用)。
         """
         used_ids = {
             s.node_id
@@ -1205,13 +1212,27 @@ class PoolManager:
         )
         for node in candidates:
             nid = self._node_id(node)
-            if not nid or nid == slot.node_id or nid in used_ids or nid in consumed_ids:
+            if not nid:
+                if skip_reasons is not None:
+                    skip_reasons["no_id"] = skip_reasons.get("no_id", 0) + 1
+                continue
+            if nid == slot.node_id:
+                if skip_reasons is not None:
+                    skip_reasons["same_id"] = skip_reasons.get("same_id", 0) + 1
+                continue
+            if nid in used_ids or nid in consumed_ids:
+                if skip_reasons is not None:
+                    skip_reasons["in_use"] = skip_reasons.get("in_use", 0) + 1
                 continue
             exit_key = self._candidate_exit_key(node)
             if not exit_key or exit_key in used_exit_keys:
+                if skip_reasons is not None:
+                    skip_reasons["exit_used"] = skip_reasons.get("exit_used", 0) + 1
                 continue
             until = self._skipped.get(nid)
             if until is not None and until > now:
+                if skip_reasons is not None:
+                    skip_reasons["cooling"] = skip_reasons.get("cooling", 0) + 1
                 continue
             return node
         return None
