@@ -1076,27 +1076,28 @@ class PoolManager:
                 self._rebuilding = False
 
     def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
-        """每轮只滚动替换 pool_size 的 10%(``max(1, pool_size // 10)``)个 READY slot。
+        """按当前可用列表对账滚动替换,分两阶段,全池不冻结、代理列表不骤降。
 
-        与 ``replace_all_slots_from_target_nodes`` 的全量对账不同:本方法每轮只动一小批
-        slot,从 ``refresh_cursor`` 起顺序挑选并推进游标(含被跳过的)、wrap 到
-        pool_size,其余 slot 纹丝不动。多轮周期检测后逐步覆盖整池,任意时刻最多
-        配额个 slot 在经历 shadow cutover,老节点服务到 cutover 为止——避免周期检测
-        后整池重建导致的代理列表骤降。
+        阶段一(全量对账,历史节点清退):node_id 不在本次候选 id 集合里的 READY
+        slot 属于历史节点(最近检测已不可用),全部优先发起 shadow cutover 替换,
+        不受 10% 配额限制,只受 ``max_shadow_starting`` 并发预算约束——本轮换不完
+        的下一轮继续,直到池里只剩当前列表里的节点。
+
+        阶段二(防老化轮换):剩余预算内按 ``refresh_cursor`` 顺序替换至多
+        ``max(1, pool_size // 10)`` 个仍在列的健康 slot,游标推进到本轮结束位置
+        (含被跳过的)并 wrap。候选选择不门控优先级:不同 id、不在用、未冷却即换。
 
         * 空槽先填:开头先跑 ``_run_fill_loop`` 把 EMPTY slot 按候选补到 READY
-          (受 ``max_starting`` 并发约束,不限总量)。这样服务重启/health drop 后空池
+          (受 ``max_starting`` 并发约束,不限总量)。服务重启/health drop 后空池
           能填起来——本方法是周期检测后唯一的池维护入口,不能只滚不填。
-        * 候选选择(不门控优先级):挑第一个"不同 id、不在用 id/exit_ip、未冷却"的
-          候选,允许换到同等或略差节点,保证每轮稳定轮换防老化。
         * 复用 ``_start_shadow_for_slot`` 做 shadow cutover(隧道建立即切,验证失败也
           切),线程 start 不 join,靠其内部 try/except 兜底清理,与 health 路径
           ``_request_slot_replacement_locked`` 的并发模型一致。
         * 不设 ``_rebuilding``、不冻结 tick_health/fill:只动 READY slot,fill 只补
-          EMPTY,互不干涉;cutover 在锁内原子切换,tick_health 看不到中间态。与
-          health 路径共享 ``max_shadow_starting`` 并发预算防超发。
+          EMPTY,互不干涉;cutover 在锁内原子切换,tick_health 看不到中间态。
 
-        ``batch_size`` 非 None 时覆盖默认 10% 配额(供测试)。返回本轮实际发起替换数。
+        ``batch_size`` 非 None 时覆盖默认 10% 轮换配额(供测试)。返回本轮实际发起
+        替换数(对账 + 轮换)。
         """
         candidates = self._dedupe_nodes(list(nodes or []))
         candidates.sort(key=self._candidate_priority_key)
@@ -1110,25 +1111,71 @@ class PoolManager:
 
         # 先把空槽填起来(空池初始填充 / health drop 后补位)。fill 只动 EMPTY,
         # 受 max_starting 并发约束,不限总量;空池时这一步把能填的都填到 READY,
-        # 之后的滚动替换才有 READY slot 可换。fill 不消费 refresh_cursor。
+        # 之后的对账/轮换才有 READY slot 可换。fill 不消费 refresh_cursor。
         # 注意:fill 会优先消耗候选把 EMPTY 槽补上(补缺比换掉好节点优先);候选
-        # 不足时 fill 吃光候选,滚动这轮就空手——这是预期优先级,待候选富余再滚。
+        # 不足时 fill 吃光候选,对账/轮换这轮就空手——这是预期优先级,待候选富余再滚。
         with self._lock:
             self._last_candidates = list(candidates)
         self._run_fill_loop()
 
-        picked: list[tuple[PoolSlot, dict[str, Any]]] = []
+        candidate_ids = {nid for nid in (self._node_id(n) for n in candidates) if nid}
+        picked: list[tuple[PoolSlot, dict[str, Any], str]] = []
         with self._lock:
             now = time.time()
-            start_cursor = self.refresh_cursor
             ready_count = sum(1 for s in self.slots if s.state == SLOT_READY)
             empty_count = sum(1 for s in self.slots if s.state == SLOT_EMPTY)
+            stale_pool = sum(
+                1 for s in self.slots
+                if s.state == SLOT_READY and s.node_id and s.node_id not in candidate_ids
+            )
             # 本轮已用候选 id,避免同一轮里把同一候选分给多个 slot
             consumed_ids: set[str] = set()
-            visited = 0
             skipped_no_target = 0
             skip_reasons: dict[str, int] = {}
-            while visited < self.pool_size and len(picked) < quota:
+
+            def _reserve_locked(slot: PoolSlot, node: dict[str, Any], reason: str) -> None:
+                shadow = ShadowCandidate(
+                    index=slot.index,
+                    tun_name=self._shadow_tun_name(slot),
+                    port=self._shadow_port(slot),
+                )
+                self._shadow_meta_from_node(shadow, node)
+                slot.shadow = shadow
+                slot.replacement_pending = True
+                slot.replacement_reason = reason
+                slot.replacement_requested_at = now
+                slot.replacement_deadline_at = now + self.replacement_grace_seconds
+                picked.append((slot, node, reason))
+
+            # 阶段一:历史节点清退(全量对账)。不在当前候选 id 集合里的 READY slot
+            # 全部替换,不占 10% 轮换配额,只受 max_shadow_starting 并发预算约束。
+            stale_picked = 0
+            for slot in self.slots:
+                if self._shadow_inflight_count_locked() >= self.max_shadow_starting:
+                    break
+                if slot.state != SLOT_READY:
+                    continue
+                if not slot.node_id or slot.process is None or slot.listener is None:
+                    continue
+                if slot.replacement_pending or slot.shadow is not None:
+                    continue
+                if slot.node_id in candidate_ids:
+                    continue
+                node = self._pick_rolling_target_locked(
+                    slot, candidates, consumed_ids, now, skip_reasons
+                )
+                if node is None:
+                    skipped_no_target += 1
+                    continue
+                consumed_ids.add(self._node_id(node))
+                _reserve_locked(slot, node, "rolling-stale")
+                stale_picked += 1
+
+            # 阶段二:防老化轮换。剩余预算内从游标起换至多 quota 个在列健康 slot。
+            start_cursor = self.refresh_cursor
+            rot_picked = 0
+            visited = 0
+            while visited < self.pool_size and rot_picked < quota:
                 idx = (start_cursor + visited) % self.pool_size
                 visited += 1
                 slot = self.slots[idx]
@@ -1146,20 +1193,9 @@ class PoolManager:
                 if node is None:
                     skipped_no_target += 1
                     continue
-                nid = self._node_id(node)
-                consumed_ids.add(nid)
-                shadow = ShadowCandidate(
-                    index=slot.index,
-                    tun_name=self._shadow_tun_name(slot),
-                    port=self._shadow_port(slot),
-                )
-                self._shadow_meta_from_node(shadow, node)
-                slot.shadow = shadow
-                slot.replacement_pending = True
-                slot.replacement_reason = "rolling-refresh"
-                slot.replacement_requested_at = now
-                slot.replacement_deadline_at = now + self.replacement_grace_seconds
-                picked.append((slot, node))
+                consumed_ids.add(self._node_id(node))
+                _reserve_locked(slot, node, "rolling-refresh")
+                rot_picked += 1
             # cursor 推进到本轮结束位置(含被跳过的),下轮从这继续,wrap 后回 0
             self.refresh_cursor = (start_cursor + visited) % self.pool_size
 
@@ -1167,15 +1203,17 @@ class PoolManager:
             reasons = " ".join(f"{k}={v}" for k, v in sorted(skip_reasons.items())) or "none"
             self.log(
                 "Pool",
-                f"rolling_replace ready={ready_count} empty={empty_count} picked={len(picked)} "
-                f"quota={quota} skipped_no_target={skipped_no_target} "
+                f"rolling_replace ready={ready_count} empty={empty_count} "
+                f"picked={len(picked)} stale_pool={stale_pool} stale_picked={stale_picked} "
+                f"rot_picked={rot_picked} quota={quota} "
+                f"skipped_no_target={skipped_no_target} "
                 f"reasons[{reasons}] candidates={len(candidates)} "
                 f"cursor={start_cursor}->{self.refresh_cursor}",
             )
         except Exception:
             pass
 
-        for slot, node in picked:
+        for slot, node, _reason in picked:
             threading.Thread(
                 target=self._start_shadow_for_slot,
                 args=(slot, node),
