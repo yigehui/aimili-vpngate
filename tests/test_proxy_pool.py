@@ -1427,6 +1427,34 @@ class PoolRollingReplaceTests(unittest.TestCase):
         self.assertEqual(slot.device_name, "tun4")
         mgr.shutdown()
 
+    def test_rolling_replace_filters_cooled_candidates(self) -> None:
+        # 冷却中的候选(近期启动失败)不能占目标位置:AUTH_FAILED 机器探测可达
+        # 但隧道起不来,不剔除就反复被选中、反复失败,slot 的老节点换不掉。
+        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
+        _wait_ready(mgr, 4)
+
+        # bad-0 放进冷却名单(模拟刚 AUTH_FAILED),候选里仍在 -> 被剔除,
+        # 位置由后面的可用候选顶上
+        mgr._skipped["bad-0"] = time.time() + 3600
+        cands = [_hosting_node("bad-0", "40.0.0.0")] + \
+                [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
+        mgr.rolling_replace_from_nodes(cands, batch_size=1)
+        _wait_node_ids(mgr, {"new-0"})
+        self.assertEqual(mgr.slots[0].node_id, "new-0")
+        mgr.shutdown()
+
+    def test_penalize_node_auth_failed_gets_one_hour(self) -> None:
+        # AUTH_FAILED(错误码 2005)= 凭证已废,罚 1 小时;普通失败仍按默认冷却。
+        mgr = _rolling_mgr(pool_size=2)
+        seconds = mgr._penalize_node("dead-0", "[错误代码 2005] [ERR_OVPN_AUTH_FAILED] ...")
+        self.assertGreaterEqual(seconds, 3600)
+        self.assertGreater(mgr._skipped["dead-0"], time.time() + 3500)
+        seconds2 = mgr._penalize_node("flake-0", "connection timed out")
+        self.assertEqual(seconds2, mgr.failed_node_skip_seconds)
+        mgr.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

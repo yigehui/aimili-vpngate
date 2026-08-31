@@ -433,6 +433,20 @@ class PoolManager:
         slot.replacement_deadline_at = 0.0
         self._cleanup_shadow_locked(slot)
 
+    def _penalize_node(self, nid: str, message: str = "") -> float:
+        """把节点放进冷却名单,返回本次冷却秒数。
+
+        普通失败按 ``failed_node_skip_seconds``(默认 300s)冷却——可能只是网络
+        抖动。但 AUTH_FAILED(错误码 2005)表示节点凭证已废/免费节点下线,短冷却
+        只会让替换路径反复选它反复失败(生产实测:同一台失效机器的十几个端口被
+        各 slot 轮流试,每个 slot 的老节点被迫多留几小时),罚 1 小时。
+        """
+        seconds = self.failed_node_skip_seconds
+        if "ERR_OVPN_AUTH_FAILED" in message or "错误代码 2005" in message:
+            seconds = max(seconds, 3600)
+        self._skipped[nid] = time.time() + seconds
+        return seconds
+
     def _shadow_meta_from_node(self, shadow: ShadowCandidate, node: dict[str, Any]) -> None:
         shadow.node_id = self._node_id(node)
         shadow.node_ip = str(node.get("ip") or node.get("node_ip") or "")
@@ -1104,6 +1118,17 @@ class PoolManager:
         candidates.sort(key=self._candidate_priority_key)
         if not self.slots:
             return 0
+        # 冷却中的候选(近期启动失败,尤其 AUTH_FAILED)先剔除:它们探测可达
+        # 但真实隧道起不来,不剔除就会一直占住目标位置被各 slot 反复选中反复
+        # 失败(生产实测:同一台失效机器让十几个 slot 的老节点被迫多留数小时)。
+        # 剔除后位置由后续可用候选顶上;可用候选因此少于池子时,尾部多余槽
+        # 按既有语义停掉。
+        now_ts = time.time()
+        candidates = [
+            node
+            for node in candidates
+            if self._skipped.get(self._node_id(node), 0.0) <= now_ts
+        ]
         target_nodes = self._target_nodes(candidates)
 
         if batch_size is not None:
@@ -1509,7 +1534,7 @@ class PoolManager:
                 with self._lock:
                     if slot.shadow is not None and slot.shadow.node_id == nid:
                         slot.last_error = msg or "shadow start_openvpn failed"
-                        self._skipped[nid] = time.time() + self.failed_node_skip_seconds
+                        self._penalize_node(nid, msg)
                         self._reset_replacement_fields_locked(slot)
                 self.log("PoolSlot", f"shadow start_fail slot={slot.index} node={nid} tun={shadow.tun_name}: {msg}")
                 return False
@@ -1600,7 +1625,7 @@ class PoolManager:
             with self._lock:
                 if slot.shadow is not None and slot.shadow.node_id == nid:
                     slot.last_error = str(exc)
-                    self._skipped[nid] = time.time() + self.failed_node_skip_seconds
+                    self._penalize_node(nid, str(exc))
                     self._reset_replacement_fields_locked(slot)
             return False
 
