@@ -1312,6 +1312,43 @@ class PoolRollingReplaceTests(unittest.TestCase):
         self.assertEqual(mgr.refresh_cursor, 0)
         mgr.shutdown()
 
+    def test_shadow_tun_name_ping_pongs_after_cutover(self) -> None:
+        # cutover 后 shadow 进程转正占着本轮影子名(slot.device_name),下一轮
+        # shadow 必须换用另一个名字,否则 TUNSETIFF 撞自己主进程(errno=16),
+        # cutover 永远不发生,slot 卡死在老节点上(生产 188 实测)。
+        # pool_size=4 保证 seed 后无空槽,fill 不会抢走滚动候选。
+        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node("old-0", "10.0.0.0"), _hosting_node("old-1", "10.0.0.1"),
+                         _hosting_node("old-2", "10.0.0.2"), _hosting_node("old-3", "10.0.0.3")])
+        _wait_ready(mgr, 4)
+
+        slot = mgr.slots[0]
+        # 初始:主进程在 tun0,影子名 tun4(pool_size+index)
+        self.assertEqual(slot.device_name, "tun0")
+        self.assertEqual(mgr._shadow_tun_name(slot), "tun4")
+
+        # 第一次滚动 cutover:shadow 用 tun4,转正后 device_name=tun4
+        mgr.rolling_replace_from_nodes([_resi_node("new-0", "20.0.0.0")])
+        _wait_node_ids(mgr, {"new-0"})
+        self.assertEqual(slot.node_id, "new-0")
+        self.assertEqual(slot.device_name, "tun4")
+
+        # 归零 cursor 让第二轮仍从 slot 0 开始(否则 quota=1 会滚到 slot 1)
+        mgr.refresh_cursor = 0
+        # 第二次滚动 cutover:影子名必须乒乓到 tun8(2*pool_size),不能再用 tun4
+        mgr.rolling_replace_from_nodes([_resi_node("new-1", "20.0.0.1")])
+        _wait_node_ids(mgr, {"new-1"})
+        self.assertEqual(slot.node_id, "new-1")
+        self.assertEqual(slot.device_name, "tun8")
+
+        # 第三次:乒乓回 tun4(tun4 已随第一代进程停止而释放)
+        mgr.refresh_cursor = 0
+        mgr.rolling_replace_from_nodes([_resi_node("new-2", "20.0.0.2")])
+        _wait_node_ids(mgr, {"new-2"})
+        self.assertEqual(slot.device_name, "tun4")
+        mgr.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

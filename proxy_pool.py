@@ -391,7 +391,14 @@ class PoolManager:
                 self._temp_config_dir = None
 
     def _shadow_tun_name(self, slot: PoolSlot) -> str:
-        return f"tun{self.pool_size + slot.index}"
+        # 每个 slot 一对影子 tun 名乒乓使用:tun{pool_size+index} / tun{2*pool_size+index}。
+        # cutover 后 shadow 进程转正,继续占着本轮的影子名(slot.device_name 记录它);
+        # 下一轮 shadow 必须换用另一个名字,否则 TUNSETIFF 撞上自己的主进程
+        # (errno=16 Device or resource busy),cutover 永远不发生,slot 卡死在老节点。
+        name_a = f"tun{self.pool_size + slot.index}"
+        if slot.device_name == name_a:
+            return f"tun{2 * self.pool_size + slot.index}"
+        return name_a
 
     def _shadow_port(self, slot: PoolSlot) -> int:
         return self.shadow_port_base + (slot.index % self.shadow_port_count)
