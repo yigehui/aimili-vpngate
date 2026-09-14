@@ -357,13 +357,14 @@ class PoolManager:
         routine_shadow_floor = max(1, self.pool_size // 10)
         self.max_shadow_starting = max(routine_shadow_floor, int(max_shadow_starting or 0))
         self.replacement_grace_seconds = max(0, int(replacement_grace_seconds or 180))
-        self.refresh_batch_size = DEFAULT_REFRESH_BATCH_SIZE
+        self.refresh_batch_size = max(1, int(refresh_batch_size or DEFAULT_REFRESH_BATCH_SIZE))
         self.failed_node_skip_seconds = max(0, int(failed_node_skip_seconds or DEFAULT_FAILED_NODE_SKIP_SECONDS))
         self.shadow_port_base = int(shadow_port_base or 53000)
         self.shadow_port_count = max(1, int(shadow_port_count or 200))
         self.health_check_timeout = max(5, int(health_check_timeout or 20))
         self.api_token = ""
         self.slots: list[PoolSlot] = [PoolSlot(i, self.port_base) for i in range(self.pool_size)]
+        self._retiring: list[dict[str, Any]] = []
         self._lock = threading.RLock()
         self._last_candidates: list[dict[str, Any]] = []
         self._skipped: dict[str, float] = {}
@@ -382,6 +383,23 @@ class PoolManager:
         with self._lock:
             for slot in self.slots:
                 self._stop_slot(slot)
+            # 优雅切换尚未回收的旧节点进程一并停掉,避免泄漏。
+            for entry in self._retiring:
+                process = entry.get("process")
+                if process is not None:
+                    try:
+                        self.stop_openvpn(process)
+                    except Exception:
+                        pass
+                listener = entry.get("listener")
+                if listener is not None:
+                    try:
+                        stop = getattr(listener, "stop", None)
+                        if callable(stop):
+                            stop()
+                    except Exception:
+                        pass
+            self._retiring = []
             self._started = False
             if self._temp_config_dir is not None:
                 try:
@@ -540,6 +558,8 @@ class PoolManager:
         to_probe: list[PoolSlot] = []
         now = time.time()
         with self._lock:
+            # 优雅切换:先回收排空/到期的旧节点进程(纯簿记,不阻塞)。
+            self._reap_retiring_locked()
             to_replace: list[tuple[PoolSlot, str]] = []
             for slot in self.slots:
                 if slot.state == SLOT_STARTING:
@@ -577,7 +597,7 @@ class PoolManager:
                         except Exception:
                             unhealthy = True
                 if not unhealthy and self.health_check is not None and now - slot.last_health_at >= self.health_check_interval:
-                    to_probe.append(slot)
+                    to_probe.append((slot, slot.node_id))
                     continue
                 if unhealthy:
                     slot.fail_count += 1
@@ -597,7 +617,24 @@ class PoolManager:
         if to_probe:
             workers = min(self.health_check_workers, len(to_probe))
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                list(executor.map(self._probe_ready_slot, to_probe))
+                list(executor.map(lambda item: self._probe_ready_slot(item[0], item[1]), to_probe))
+        # 防御:READY 槽从未被探测过(last_health_at==0)说明探测队列有异常,
+        # 打一条日志便于在服务器上定位(正常时此计数恒为 0)。
+        if to_probe:
+            try:
+                with self._lock:
+                    never_probed = sum(
+                        1
+                        for s in self.slots
+                        if s.state == SLOT_READY and s.last_health_at == 0
+                    )
+                if never_probed > 0:
+                    self.log(
+                        "Pool",
+                        f"health: {never_probed} READY slots have never been probed (last_health_at=0)",
+                    )
+            except Exception:
+                pass
 
     def list_proxies(
         self,
@@ -715,6 +752,7 @@ class PoolManager:
                 "pool_size": self.pool_size,
                 "port_base": self.port_base,
                 "slots": counts,
+                "retiring": len(self._retiring),
                 "proxy_auth": bool(self.proxy_user or self.proxy_pass),
                 "public_host": self.public_host,
                 "require_exit_ip": self.require_exit_ip,
@@ -1090,7 +1128,7 @@ class PoolManager:
                 self._rebuilding = False
 
     def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
-        """位置对账滚动替换:候选住宅优先排序后按位置映射到 slot,每轮换 10%。
+        """全量轮换:每轮从 ``refresh_cursor`` 起换 ``refresh_batch_size`` 个槽。
 
         语义简单直接:
 
@@ -1100,18 +1138,20 @@ class PoolManager:
         * 候选数 < 池子:多出来的尾部位置目标为 None,持旧节点的 slot **直接
           停掉**(多余槽不留历史节点);候选数 ≥ 池子:所有旧节点都会被逐步
           换成目标列表。
-        * 每轮从 ``refresh_cursor`` 起顺序扫过全部位置(visited 含跳过的,
-          wrap 回 0),只执行最多 ``max(1, pool_size // 10)`` 个变更:slot 与
-          目标 id 不一致 → shadow cutover(老节点服务到切换为止);目标为
-          None → 停 slot。其余位置本轮纹丝不动。
-        * 排序由延迟/住宅决定,多轮间列表顺序抖动造成的错位也只影响每轮
-          10%,整池不冻结、代理列表不骤降。
+        * 每轮从 ``refresh_cursor`` 起顺序扫过位置(visited 含跳过的,wrap 回
+          0),执行最多 ``refresh_batch_size`` 个变更(默认 30):持 READY 的
+          slot 一律 shadow cutover 到该位置的目标节点 —— **即使槽内节点与目标
+          相同也换**(重建隧道,保证没有节点能长期存活);目标为 None → 停
+          slot。其余位置本轮纹丝不动,下一轮 cursor 接着扫,全部槽位约
+          ``pool_size / refresh_batch_size`` 轮轮换一遍。
+        * 切换是优雅的:老 OpenVPN 进程在 cutover 后进入 ``_retiring`` 列表,
+          在途连接排空或超过 ``replacement_grace_seconds`` 才被回收,不瞬断。
 
         空槽先填:开头先跑 ``_run_fill_loop`` 把 EMPTY slot 按候选补到 READY
         (受 ``max_starting`` 并发约束,不限总量)——服务重启/health drop 后
         空池能填起来;fill 用的也是这份目标列表,天然与对账一致。
 
-        ``batch_size`` 非 None 时覆盖默认 10% 配额(供测试)。返回本轮实际发起
+        ``batch_size`` 非 None 时覆盖默认组大小(供测试)。返回本轮实际发起
         变更数(cutover + 停槽)。
         """
         candidates = self._dedupe_nodes(list(nodes or []))
@@ -1134,7 +1174,7 @@ class PoolManager:
         if batch_size is not None:
             quota = max(1, int(batch_size))
         else:
-            quota = max(1, self.pool_size // 10)
+            quota = max(1, self.refresh_batch_size)
 
         # 空槽补位(空池初始填充 / health drop 后补位)。fill 只动 EMPTY,与
         # 位置对账互不干涉;fill 不消费 refresh_cursor。
@@ -1164,9 +1204,8 @@ class PoolManager:
                     continue
                 if slot.replacement_pending or slot.shadow is not None:
                     continue
-                if target is not None and target.get("id") == slot.node_id:
-                    # 已持有目标:不需要变更
-                    continue
+                # 全量轮换:即使槽内节点与位置目标相同也重建隧道(不跳过),
+                # 保证没有节点能长期存活。
                 if self._shadow_inflight_count_locked() >= self.max_shadow_starting:
                     break
                 if target is None:
@@ -1635,18 +1674,10 @@ class PoolManager:
             return False
         old_listener = slot.listener
         old_process = slot.process
-        old_tun = slot.tun_name
         new_public_listener = None
         try:
-            if old_listener is not None:
-                stop = getattr(old_listener, "stop", None)
-                if callable(stop):
-                    stop()
-            if shadow.listener is not None:
-                stop_shadow = getattr(shadow.listener, "stop", None)
-                if callable(stop_shadow):
-                    stop_shadow()
-                shadow.listener = None
+            # 先绑新 listener(带 SO_REUSEPORT,旧监听还在也能绑上),绑定失败
+            # 直接放弃本次切换 —— 旧服务零影响,无需回滚。
             new_public_listener = self.create_listener(
                 host=self.listen_host,
                 port=slot.port,
@@ -1661,7 +1692,19 @@ class PoolManager:
                     new_public_listener.start(background=True)
                 except TypeError:
                     new_public_listener.start()
-        except Exception:
+            # 新监听已就绪,停旧监听的 accept:已 accept 的客户端连接由各自
+            # 线程继续跑(上游 socket 绑在旧 tun 上不受影响),新连接全部走
+            # 新监听。REUSEPORT 缺失(Windows)时这里只有毫秒级端口空窗。
+            if old_listener is not None:
+                stop = getattr(old_listener, "stop", None)
+                if callable(stop):
+                    stop()
+            if shadow.listener is not None:
+                stop_shadow = getattr(shadow.listener, "stop", None)
+                if callable(stop_shadow):
+                    stop_shadow()
+                shadow.listener = None
+        except Exception as exc:
             if new_public_listener is not None:
                 try:
                     stop = getattr(new_public_listener, "stop", None)
@@ -1669,29 +1712,15 @@ class PoolManager:
                         stop()
                 except Exception:
                     pass
-            slot.listener = None
+            # 切换失败:旧监听/进程全程未动,slot 继续服务旧节点。清理已验证
+            # 的 shadow 进程并复位 replacement 状态,槽位留待下轮重试。
             try:
-                slot.listener = self.create_listener(
-                    host=self.listen_host,
-                    port=slot.port,
-                    username=self.proxy_user,
-                    password=self.proxy_pass,
-                    bind_device=old_tun,
-                    require_auth=True,
-                    max_connections=None,
+                self.log(
+                    "PoolSlot",
+                    f"shadow cutover failed slot={slot.index} node={shadow.node_id}: {exc}; old node retained",
                 )
-                if hasattr(slot.listener, "start"):
-                    try:
-                        slot.listener.start(background=True)
-                    except TypeError:
-                        slot.listener.start()
             except Exception:
-                slot.listener = None
-            # Cutover failed: the old slot was rolled back above, but the
-            # verified shadow OpenVPN process is now orphaned. Stop it and
-            # clear the shadow/replacement state so the slot is left cleanly
-            # serving its old node and is eligible for a later retry — instead
-            # of leaking the process and wedging on slot.shadow != None.
+                pass
             if shadow.process is not None:
                 try:
                     self.stop_openvpn(shadow.process)
@@ -1726,15 +1755,66 @@ class PoolManager:
         # stop the process we just took over.
         shadow.process = None
         shadow.listener = None
+        # 优雅切换:旧 OpenVPN 进程不立即杀 —— 它的 tun 还承载着 cutover 前
+        # 已建立的客户端连接。放进 retiring 列表,由 tick_health 在在途连接
+        # 排空(或 replacement_grace_seconds 到期)后回收。
         if old_process is not None:
-            try:
-                self.stop_openvpn(old_process)
-            except Exception:
-                pass
+            now_ts = time.time()
+            self._retiring.append(
+                {
+                    "index": slot.index,
+                    "listener": old_listener,
+                    "process": old_process,
+                    "node_id": slot.node_id,
+                    "since": now_ts,
+                    "deadline_at": now_ts + self.replacement_grace_seconds,
+                }
+            )
         self._reset_replacement_fields_locked(slot)
         return True
 
-    def _probe_ready_slot(self, slot: PoolSlot) -> None:
+    def _reap_retiring_locked(self) -> None:
+        """回收优雅切换后的旧 OpenVPN 进程。
+
+        退出条件(满足其一):在途连接已排空(无监听或 active_connections<=0)
+        或宽限期 ``replacement_grace_seconds`` 到期。排空早于到期的情形立即
+        回收,不空等。锁内调用,只做进程回收与簿记,不做任何阻塞操作。
+        """
+        if not self._retiring:
+            return
+        now = time.time()
+        remaining: list[dict[str, Any]] = []
+        for entry in self._retiring:
+            listener = entry.get("listener")
+            conns = -1
+            if listener is not None:
+                try:
+                    conns = int(listener.active_connections)
+                except Exception:
+                    conns = -1
+            drained = listener is None or conns <= 0
+            expired = now >= entry.get("deadline_at", 0.0)
+            if not drained and not expired:
+                remaining.append(entry)
+                continue
+            process = entry.get("process")
+            if process is not None:
+                try:
+                    self.stop_openvpn(process)
+                except Exception:
+                    pass
+            try:
+                waited = now - entry.get("since", now)
+                self.log(
+                    "PoolSlot",
+                    f"retiring reaped slot={entry.get('index')} node={entry.get('node_id')} "
+                    f"conns={conns} drained={drained} waited={waited:.0f}s",
+                )
+            except Exception:
+                pass
+        self._retiring = remaining
+
+    def _probe_ready_slot(self, slot: PoolSlot, probed_node_id: str | None = None) -> None:
         if self.health_check is None:
             return
         try:
@@ -1747,6 +1827,17 @@ class PoolManager:
             ok, message, meta = False, str(exc), {}
         with self._lock:
             if slot.state != SLOT_READY:
+                return
+            # 身份校验:探测排队期间槽位可能已被 cutover/换节点,旧节点的
+            # 探测结果不能写到新节点头上。
+            if probed_node_id is not None and slot.node_id != probed_node_id:
+                try:
+                    self.log(
+                        "PoolSlot",
+                        f"health probe stale drop slot={slot.index} probed={probed_node_id} current={slot.node_id}",
+                    )
+                except Exception:
+                    pass
                 return
             slot.last_health_at = time.time()
             if ok:

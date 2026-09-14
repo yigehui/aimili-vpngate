@@ -68,6 +68,35 @@ class ProxyListenerTests(unittest.TestCase):
         finally:
             probe.close()
 
+    def test_listener_active_connections_tracked(self) -> None:
+        # 在途连接计数:accept 后 +1,连接关闭后归零 —— 优雅切换 drain 判定依据。
+        listener = proxy_server.create_proxy_listener(
+            "127.0.0.1",
+            0,
+            username="u1",
+            password="p1",
+            bind_device=None,
+            max_connections=8,
+            require_auth=True,
+        )
+        port = listener.start()
+        self.assertEqual(listener.active_connections, 0)
+        sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+        sock.settimeout(3)
+        deadline = time.time() + 3
+        while time.time() < deadline and listener.active_connections == 0:
+            time.sleep(0.01)
+        self.assertEqual(listener.active_connections, 1)
+        # 发请求让 proxy_client 处理完一轮(407 应答后客户端关连接)
+        sock.sendall(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        sock.recv(4096)
+        sock.close()
+        deadline = time.time() + 3
+        while time.time() < deadline and listener.active_connections != 0:
+            time.sleep(0.01)
+        self.assertEqual(listener.active_connections, 0)
+        listener.stop()
+
     def test_open_server_socket_sets_accept_timeout(self) -> None:
         listener = proxy_server.create_proxy_listener(
             "127.0.0.1",

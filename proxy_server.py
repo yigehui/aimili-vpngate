@@ -526,11 +526,34 @@ class ProxyListener:
         self._stop = threading.Event()
         self._sem = threading.BoundedSemaphore(max_connections or MAX_PROXY_CONNECTIONS)
         self._alive = False
+        self._active = 0
+        self._active_lock = threading.Lock()
         self.bound_port = 0
+
+    @property
+    def active_connections(self) -> int:
+        """当前在途客户端连接数（accept 后未关闭的），供优雅切换 drain 判定。"""
+        with self._active_lock:
+            return self._active
 
     @property
     def auth_enabled(self) -> bool:
         return bool(self.require_auth)
+
+    @staticmethod
+    def _set_reuseport(server: socket.socket) -> None:
+        """SO_REUSEPORT：允许新监听在旧监听未关闭时绑定同一端口（优雅切换前置）。
+
+        Linux 上内核会把新连接在多个 REUSEPORT socket 间分流，旧监听 stop()
+        后新连接全部走新监听；Windows 无此选项则跳过（开发机退化回旧行为）。
+        """
+        reuse_port = getattr(socket, "SO_REUSEPORT", None)
+        if reuse_port is None:
+            return
+        try:
+            server.setsockopt(socket.SOL_SOCKET, reuse_port, 1)
+        except OSError:
+            pass
 
     def _open_server_socket(self) -> None:
         host = self.host
@@ -541,6 +564,7 @@ class ProxyListener:
         try:
             server = socket.socket(af, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._set_reuseport(server)
             if is_ipv6:
                 try:
                     server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -565,6 +589,7 @@ class ProxyListener:
                 try:
                     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    self._set_reuseport(server)
                     server.bind(("0.0.0.0", port))
                     server.listen(256)
                     server.settimeout(1.0)
@@ -583,6 +608,7 @@ class ProxyListener:
                 try:
                     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    self._set_reuseport(server)
                     server.bind(("127.0.0.1", port))
                     server.listen(256)
                     server.settimeout(1.0)
@@ -626,6 +652,8 @@ class ProxyListener:
                 except OSError:
                     pass
                 continue
+            with self._active_lock:
+                self._active += 1
 
             def run_client(
                 c: socket.socket = client,
@@ -641,6 +669,8 @@ class ProxyListener:
                         require_auth=self.require_auth,
                     )
                 finally:
+                    with self._active_lock:
+                        self._active -= 1
                     self._sem.release()
 
             threading.Thread(target=run_client, daemon=True).start()

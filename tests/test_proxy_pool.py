@@ -204,7 +204,8 @@ class PoolQueryTests(unittest.TestCase):
             create_listener=mock.Mock(),
             log=lambda *a, **k: None,
         )
-        self.assertEqual(mgr.status()["refresh_batch_size"], 30)
+        # refresh_batch_size 构造参数现在生效(全量轮换组大小可配)
+        self.assertEqual(mgr.status()["refresh_batch_size"], 5)
 
     def test_list_proxy_lines_defaults_to_http_multiline(self) -> None:
         text = self.mgr.list_proxy_lines(country="jp,us", sort="port")
@@ -931,8 +932,11 @@ class PoolLifecycleTests(unittest.TestCase):
             # shadow 已清,不卡死。
             self.assertIsNone(slot.shadow)
             self.assertFalse(slot.replacement_pending)
-        # 两个老 OpenVPN 进程在 cutover 时被停掉。
+        # 两个老 OpenVPN 进程进入优雅切换列表,排空后由 tick_health 回收。
+        self.assertEqual(len(mgr._retiring), 2)
+        mgr.tick_health()
         self.assertEqual(len(stopped_procs), 2)
+        self.assertEqual(len(mgr._retiring), 0)
         # cutover 成功,new-0 已上线,不进 skip 窗口。
         self.assertNotIn("new-0", mgr._skipped)
         block_evt.set()  # 释放卡住的 health_check 线程
@@ -1183,9 +1187,9 @@ def _seeded_candidates(pool_nodes: list[dict[str, object]]) -> list[dict[str, ob
 
 
 class PoolRollingReplaceTests(unittest.TestCase):
-    def test_rolling_replace_replaces_only_ten_percent(self) -> None:
-        # 位置对账:slot[i] != target[i] 每轮最多换 10%。池 10 个 hosting,
-        # 候选 10 个 residential -> 所有位置都不匹配,本轮只换 1 个。
+    def test_rolling_replace_full_batch_replaces_whole_pool(self) -> None:
+        # 全量轮换:每轮换 refresh_batch_size 个。池 10 个 hosting,候选 10 个
+        # residential,默认 batch=30 覆盖整池 -> 一轮全部换成新节点。
         mgr = _rolling_mgr(pool_size=10, max_starting=10, max_shadow_starting=10)
         mgr.start()
         _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(10)])
@@ -1193,17 +1197,17 @@ class PoolRollingReplaceTests(unittest.TestCase):
 
         resi = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(10)]
         started = mgr.rolling_replace_from_nodes(resi)
-        _wait_node_ids(mgr, {"new-0"})
+        _wait_quiesced(mgr)
+        _wait_ready(mgr, 10)
 
-        # 10% of 10 = 1 个被换;其余 9 个仍是 old
-        self.assertEqual(started, 1)
+        self.assertEqual(started, 10)
         ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
-        self.assertIn("new-0", ready_ids)
-        self.assertEqual(len(ready_ids & {f"old-{i}" for i in range(10)}), 9)
+        self.assertEqual(ready_ids, {f"new-{i}" for i in range(10)})
         mgr.shutdown()
 
-    def test_rolling_replace_position_match_skips_cutover(self) -> None:
-        # slot[i] 已持有 target[i] 的节点 -> 不发起 cutover。
+    def test_rolling_replace_rebuilds_tunnel_even_for_matching_position(self) -> None:
+        # 全量轮换不再跳过"已持有目标节点"的槽:同节点也重建隧道(新 tun/新
+        # 进程),保证没有节点能长期存活。
         mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
         mgr.start()
         # seed 节点 id 与候选排序后的位置一一对应(residential 按延迟)
@@ -1212,7 +1216,8 @@ class PoolRollingReplaceTests(unittest.TestCase):
         _wait_ready(mgr, 4)
 
         started = mgr.rolling_replace_from_nodes([_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)])
-        self.assertEqual(started, 0)
+        _wait_quiesced(mgr)
+        self.assertEqual(started, 4)
         ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
         self.assertEqual(ready_ids, {f"new-{i}" for i in range(4)})
         mgr.shutdown()
@@ -1224,10 +1229,11 @@ class PoolRollingReplaceTests(unittest.TestCase):
         _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
         _wait_ready(mgr, 4)
 
-        # 1 residential(排位置0)+ 3 hosting(排位置1-3);配额 1 -> slot0 换 resi
+        # 1 residential(排位置0)+ 3 hosting(排位置1-3);batch_size=1 限一轮
+        # 只换 1 个 -> slot0 换 resi
         cands = [_resi_node("resi-0", "20.0.0.0"), _hosting_node("h-0", "30.0.0.0"),
                  _hosting_node("h-1", "30.0.0.1"), _hosting_node("h-2", "30.0.0.2")]
-        started = mgr.rolling_replace_from_nodes(cands)
+        started = mgr.rolling_replace_from_nodes(cands, batch_size=1)
         self.assertEqual(started, 1)
         _wait_node_ids(mgr, {"resi-0"})
         self.assertEqual(mgr.slots[0].node_id, "resi-0")
@@ -1279,7 +1285,7 @@ class PoolRollingReplaceTests(unittest.TestCase):
         mgr.shutdown()
 
     def test_rolling_replace_cursor_advances_and_wraps(self) -> None:
-        # 游标推进:每轮 1 个变更,从 cursor 起顺序找需要变更的位置。
+        # 游标推进:每轮 1 个变更(batch_size=1),从 cursor 起顺序找位置。
         mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
         mgr.start()
         _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
@@ -1288,13 +1294,14 @@ class PoolRollingReplaceTests(unittest.TestCase):
         cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
         # 4 轮,每轮换 1 个:slot0..3 依次变
         for i in range(4):
-            started = mgr.rolling_replace_from_nodes(cands)
+            started = mgr.rolling_replace_from_nodes(cands, batch_size=1)
             self.assertEqual(started, 1)
             _wait_node_ids(mgr, {f"new-{i}"})
-        # 第 5 轮:全部已匹配,无变更,visited 走满 -> cursor wrap 0
-        started = mgr.rolling_replace_from_nodes(cands)
-        self.assertEqual(started, 0)
+        # 第 5 轮:batch=1 从 cursor=0 起再换 slot0(全量轮换,同位同节点也重建)
         self.assertEqual(mgr.refresh_cursor, 0)
+        started = mgr.rolling_replace_from_nodes(cands, batch_size=1)
+        self.assertEqual(started, 1)
+        _wait_quiesced(mgr)
         ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
         self.assertEqual(ready_ids, {f"new-{i}" for i in range(4)})
         mgr.shutdown()
@@ -1401,20 +1408,21 @@ class PoolRollingReplaceTests(unittest.TestCase):
         self.assertEqual(slot.device_name, "tun0")
         self.assertEqual(mgr._shadow_tun_name(slot), "tun4")
 
-        # 第一轮:候选 4 个 new(residential 占前 4 位置),配额 1 -> slot0 换 new-0
+        # 第一轮:候选 4 个 new(residential 占前 4 位置),batch=1 -> slot0 换 new-0
         cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
-        mgr.rolling_replace_from_nodes(cands)
+        mgr.rolling_replace_from_nodes(cands, batch_size=1)
         _wait_node_ids(mgr, {"new-0"})
         self.assertEqual(slot.node_id, "new-0")
         self.assertEqual(slot.device_name, "tun4")
 
-        # 第二轮:slot0 的目标不再是 new-0(候选序变了),配额 1 从 slot0 起,
+        # 第二轮:slot0 的目标不再是 new-0(候选序变了),batch=1 从 slot0 起,
         # 影子名必须乒乓到 tun8,不能再用 tun4(被转正的主进程占着)。
         cands2 = [_resi_node("new-1", "20.0.0.1"), _resi_node("new-2", "20.0.0.2"),
                   _resi_node("new-3", "20.0.0.3"), _resi_node("new-x", "20.0.0.9")]
         mgr.refresh_cursor = 0
-        mgr.rolling_replace_from_nodes(cands2)
+        mgr.rolling_replace_from_nodes(cands2, batch_size=1)
         _wait_node_ids(mgr, {"new-1"})
+        _wait_quiesced(mgr)
         self.assertEqual(slot.node_id, "new-1")
         self.assertEqual(slot.device_name, "tun8")
 
@@ -1422,8 +1430,9 @@ class PoolRollingReplaceTests(unittest.TestCase):
         cands3 = [_resi_node("new-4", "20.0.0.4"), _resi_node("new-5", "20.0.0.5"),
                   _resi_node("new-6", "20.0.0.6"), _resi_node("new-y", "20.0.0.8")]
         mgr.refresh_cursor = 0
-        mgr.rolling_replace_from_nodes(cands3)
+        mgr.rolling_replace_from_nodes(cands3, batch_size=1)
         _wait_node_ids(mgr, {"new-4"})
+        _wait_quiesced(mgr)
         self.assertEqual(slot.device_name, "tun4")
         mgr.shutdown()
 
@@ -1454,6 +1463,131 @@ class PoolRollingReplaceTests(unittest.TestCase):
         seconds2 = mgr._penalize_node("flake-0", "connection timed out")
         self.assertEqual(seconds2, mgr.failed_node_skip_seconds)
         mgr.shutdown()
+
+
+class PoolGracefulCutoverTests(unittest.TestCase):
+    """优雅切换:老节点进程进 retiring 列表,排空/到期后由 tick_health 回收。"""
+
+    def _cutovered_mgr(self, grace: float = 60.0):
+        mgr = _rolling_mgr(pool_size=2, max_starting=2, max_shadow_starting=2)
+        mgr.replacement_grace_seconds = grace
+        mgr.start()
+        _seed_pool(mgr, [
+            _hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(2)
+        ])
+        _wait_ready(mgr, 2)
+        return mgr
+
+    def test_cutover_keeps_old_process_in_retiring(self) -> None:
+        mgr = self._cutovered_mgr()
+        old_procs = [mgr.slots[i].process for i in range(2)]
+        old_listeners = [mgr.slots[i].listener for i in range(2)]
+
+        mgr.rolling_replace_from_nodes(
+            [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(2)]
+        )
+        _wait_quiesced(mgr)
+        _wait_ready(mgr, 2)
+
+        # cutover 后老进程不立即杀,进 retiring;新节点已就位
+        self.assertEqual(len(mgr._retiring), 2)
+        mgr.stop_openvpn.assert_not_called()
+        for i in range(2):
+            self.assertEqual(mgr.slots[i].node_id, f"new-{i}")
+            self.assertIsNot(mgr.slots[i].process, old_procs[i])
+            self.assertIsNot(mgr.slots[i].listener, old_listeners[i])
+        # status 暴露 retiring 计数
+        self.assertEqual(mgr.status()["retiring"], 2)
+        mgr.shutdown()
+
+    def test_retiring_reaped_when_connections_drained(self) -> None:
+        mgr = self._cutovered_mgr()
+        mgr.rolling_replace_from_nodes(
+            [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(2)]
+        )
+        _wait_quiesced(mgr)
+        self.assertEqual(len(mgr._retiring), 2)
+
+        # 在途连接排空(active_connections=0)-> 下一轮 tick 立即回收(早于到期)
+        for entry in mgr._retiring:
+            entry["listener"].active_connections = 0
+        mgr.tick_health()
+        self.assertEqual(len(mgr._retiring), 0)
+        mgr.stop_openvpn.assert_called()
+        mgr.shutdown()
+
+    def test_retiring_reaped_after_grace_deadline(self) -> None:
+        mgr = self._cutovered_mgr(grace=60.0)
+        mgr.rolling_replace_from_nodes(
+            [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(2)]
+        )
+        _wait_quiesced(mgr)
+        self.assertEqual(len(mgr._retiring), 2)
+
+        # 连接还在(active_connections=3)但宽限期已过 -> 到期强制回收
+        for entry in mgr._retiring:
+            entry["listener"].active_connections = 3
+            entry["deadline_at"] = time.time() - 1
+        mgr.tick_health()
+        self.assertEqual(len(mgr._retiring), 0)
+        mgr.stop_openvpn.assert_called()
+        mgr.shutdown()
+
+    def test_retiring_with_active_connections_within_grace_survives(self) -> None:
+        mgr = self._cutovered_mgr(grace=60.0)
+        mgr.rolling_replace_from_nodes(
+            [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(2)]
+        )
+        _wait_quiesced(mgr)
+
+        # 有在途连接且未到期:不回收
+        for entry in mgr._retiring:
+            entry["listener"].active_connections = 2
+        mgr.tick_health()
+        self.assertEqual(len(mgr._retiring), 2)
+        mgr.stop_openvpn.assert_not_called()
+        mgr.shutdown()
+
+    def test_cutover_bind_failure_keeps_old_serving(self) -> None:
+        # 新 listener 绑定失败:旧监听/进程全程未动,slot 继续服务旧节点,
+        # shadow 被清理、replacement 状态复位,槽位可下轮重试。
+        mgr = self._cutovered_mgr()
+        old_procs = [mgr.slots[i].process for i in range(2)]
+        old_listeners = [mgr.slots[i].listener for i in range(2)]
+
+        def failing_listener(**kwargs):
+            raise OSError("EADDRINUSE")
+
+        mgr.create_listener = failing_listener
+        started = mgr.rolling_replace_from_nodes(
+            [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(2)]
+        )
+        _wait_quiesced(mgr)
+
+        self.assertEqual(started, 2)
+        self.assertEqual(len(mgr._retiring), 0)
+        for i in range(2):
+            slot = mgr.slots[i]
+            self.assertEqual(slot.state, proxy_pool.SLOT_READY)
+            self.assertEqual(slot.node_id, f"old-{i}")
+            self.assertIs(slot.process, old_procs[i])
+            self.assertIs(slot.listener, old_listeners[i])
+            self.assertIsNone(slot.shadow)
+            self.assertFalse(slot.replacement_pending)
+        mgr.shutdown()
+
+    def test_shutdown_reaps_pending_retiring(self) -> None:
+        # shutdown 时还有没回收完的 retiring 进程,必须一并停掉,不能泄漏。
+        mgr = self._cutovered_mgr()
+        mgr.rolling_replace_from_nodes(
+            [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(2)]
+        )
+        _wait_quiesced(mgr)
+        self.assertEqual(len(mgr._retiring), 2)
+        mgr.shutdown()
+        self.assertEqual(len(mgr._retiring), 0)
+        mgr.stop_openvpn.assert_called()
+        self.assertTrue(all(s.state == proxy_pool.SLOT_EMPTY for s in mgr.slots))
 
 
 if __name__ == "__main__":
