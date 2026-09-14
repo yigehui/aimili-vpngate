@@ -869,6 +869,8 @@ class PoolLifecycleTests(unittest.TestCase):
 
         # cutover 全失败,没有 slot 成功切到 target。
         self.assertEqual(started, 0)
+        # shadow 失败会当场换候选重试(候选耗尽才放弃),等全部尝试落地
+        _wait_quiesced(mgr)
         for i in range(2):
             slot = mgr.slots[i]
             # 老节点保留在岗。
@@ -878,8 +880,9 @@ class PoolLifecycleTests(unittest.TestCase):
             # replacement 状态已清空,shadow 已清 —— 不卡死,下轮可重试。
             self.assertIsNone(slot.shadow)
             self.assertFalse(slot.replacement_pending)
-        # shadow 起的 OpenVPN 进程已被停掉(无孤儿)。
-        self.assertEqual(len(stopped_procs), 2)
+        # shadow 起的 OpenVPN 进程已被停掉(无孤儿):重试语义下每个失败
+        # 尝试的进程都回收,至少 2 个
+        self.assertGreaterEqual(len(stopped_procs), 2)
         mgr.shutdown()
 
     def test_rebuild_shadow_health_check_timeout_cutover_anyway(self) -> None:
@@ -1186,17 +1189,21 @@ def _seeded_candidates(pool_nodes: list[dict[str, object]]) -> list[dict[str, ob
     return [_hosting_node(str(n["id"]), str(n["ip"])) for n in pool_nodes]
 
 
-class PoolRollingReplaceTests(unittest.TestCase):
-    def test_rolling_replace_full_batch_replaces_whole_pool(self) -> None:
-        # 全量轮换:每轮换 refresh_batch_size 个。池 10 个 hosting,候选 10 个
-        # residential,默认 batch=30 覆盖整池 -> 一轮全部换成新节点。
-        mgr = _rolling_mgr(pool_size=10, max_starting=10, max_shadow_starting=10)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(10)])
-        _wait_ready(mgr, 10)
+class PoolFullReplaceTests(unittest.TestCase):
+    """检测完成后的全量替换:fill 同逻辑 + 优雅切换,无 cursor/quota。"""
 
+    def _pool(self, size=10, **kw):
+        mgr = _rolling_mgr(pool_size=size, max_starting=size, max_shadow_starting=size, **kw)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(size)])
+        _wait_ready(mgr, size)
+        return mgr
+
+    def test_replace_pool_replaces_whole_pool(self) -> None:
+        # 池 10 个 hosting,候选 10 个 residential -> 一轮全部换成新节点。
+        mgr = self._pool(10)
         resi = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(10)]
-        started = mgr.rolling_replace_from_nodes(resi)
+        started = mgr.replace_pool_from_nodes(resi)
         _wait_quiesced(mgr)
         _wait_ready(mgr, 10)
 
@@ -1205,253 +1212,216 @@ class PoolRollingReplaceTests(unittest.TestCase):
         self.assertEqual(ready_ids, {f"new-{i}" for i in range(10)})
         mgr.shutdown()
 
-    def test_rolling_replace_rebuilds_tunnel_even_for_matching_position(self) -> None:
-        # 全量轮换不再跳过"已持有目标节点"的槽:同节点也重建隧道(新 tun/新
-        # 进程),保证没有节点能长期存活。
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        # seed 节点 id 与候选排序后的位置一一对应(residential 按延迟)
-        pool_nodes = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
-        _seed_pool(mgr, pool_nodes)
+    def test_replace_pool_rebuilds_tunnel_even_for_same_node(self) -> None:
+        # 同节点也重建隧道(新 tun/新进程),保证没有节点能长期存活。
+        mgr = self._pool(4)
+        same = [_resi_node(f"n-{i}", f"20.0.0.{i}") for i in range(4)]
+        _seed_pool(mgr, same)
         _wait_ready(mgr, 4)
 
-        started = mgr.rolling_replace_from_nodes([_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)])
+        started = mgr.replace_pool_from_nodes(same)
         _wait_quiesced(mgr)
         self.assertEqual(started, 4)
         ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
-        self.assertEqual(ready_ids, {f"new-{i}" for i in range(4)})
+        self.assertEqual(ready_ids, {f"n-{i}" for i in range(4)})
         mgr.shutdown()
 
-    def test_rolling_replace_residential_first_mapping(self) -> None:
-        # 住宅优先:_candidate_priority_key 排序后 residential 占据前几个位置。
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
-        _wait_ready(mgr, 4)
-
-        # 1 residential(排位置0)+ 3 hosting(排位置1-3);batch_size=1 限一轮
-        # 只换 1 个 -> slot0 换 resi
-        cands = [_resi_node("resi-0", "20.0.0.0"), _hosting_node("h-0", "30.0.0.0"),
+    def test_replace_pool_residential_first(self) -> None:
+        # 住宅优先排序:候选按 _candidate_priority_key 排序后轮转分配。
+        mgr = self._pool(4)
+        cands = [_hosting_node("h-0", "30.0.0.0"), _resi_node("resi-0", "20.0.0.0"),
                  _hosting_node("h-1", "30.0.0.1"), _hosting_node("h-2", "30.0.0.2")]
-        started = mgr.rolling_replace_from_nodes(cands, batch_size=1)
-        self.assertEqual(started, 1)
-        _wait_node_ids(mgr, {"resi-0"})
+        started = mgr.replace_pool_from_nodes(cands)
+        self.assertEqual(started, 4)
+        _wait_quiesced(mgr)
+        # resi-0 排第一,分给 slot0
         self.assertEqual(mgr.slots[0].node_id, "resi-0")
         mgr.shutdown()
 
-    def test_rolling_replace_trims_tail_when_candidates_fewer_than_pool(self) -> None:
-        # 候选 2 < 池 4:位置 2/3 目标为 None,持旧节点的多余槽直接停掉。
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
-        _wait_ready(mgr, 4)
-
-        # 显式 batch_size=4 保证 trim 与 cutover 同轮完成;轮间等 cutover 落地
-        started = mgr.rolling_replace_from_nodes(
-            [_hosting_node("t-0", "30.0.0.0"), _hosting_node("t-1", "30.0.0.1")],
-            batch_size=4,
+    def test_replace_pool_trims_tail_when_candidates_fewer_than_pool(self) -> None:
+        # 候选 2 < 池 4:前 2 槽换新,尾部多余槽直接停掉,不留历史节点。
+        mgr = self._pool(4)
+        started = mgr.replace_pool_from_nodes(
+            [_hosting_node("t-0", "30.0.0.0"), _hosting_node("t-1", "30.0.0.1")]
         )
         self.assertEqual(started, 4)
         _wait_quiesced(mgr)
         _wait_ready(mgr, 2)
         ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
         self.assertEqual(ready_ids, {"t-0", "t-1"})
-        # 尾部两个槽被清空
         self.assertEqual(mgr.slots[2].state, proxy_pool.SLOT_EMPTY)
         self.assertEqual(mgr.slots[3].state, proxy_pool.SLOT_EMPTY)
         mgr.shutdown()
 
-    def test_rolling_replace_more_candidates_than_pool_replaces_all_over_rounds(self) -> None:
-        # 候选 6 > 池 4:所有位置都有目标,全部旧节点最终(跨轮)被替换。
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
-        _wait_ready(mgr, 4)
-
-        # 位置映射:resi-0..1 延迟 5 排前,h-0..3 延迟 10 排后 -> target = [resi-0, resi-1, h-0, h-1]
+    def test_replace_pool_more_candidates_than_pool(self) -> None:
+        # 候选 6 > 池 4:一轮内每个 READY 槽领一个候选,全部旧节点被换。
+        mgr = self._pool(4)
         cands = [_resi_node("resi-0", "20.0.0.0", latency=5), _resi_node("resi-1", "20.0.0.1", latency=5),
                  _hosting_node("h-0", "30.0.0.0"), _hosting_node("h-1", "30.0.0.1"),
                  _hosting_node("h-2", "30.0.0.2"), _hosting_node("h-3", "30.0.0.3")]
-        # 逐轮直到收敛:每轮换 max(1, 4//10)=1 个位置;轮间等异步 cutover 落地,
-        # 否则 pending 中的 slot 会被跳过、下一轮 picked=0 提前收敛。
-        for _ in range(20):
-            started = mgr.rolling_replace_from_nodes(cands)
-            _wait_quiesced(mgr)
-            if started == 0:
-                break
+        started = mgr.replace_pool_from_nodes(cands)
+        self.assertEqual(started, 4)
+        _wait_quiesced(mgr)
         _wait_ready(mgr, 4)
         ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
         self.assertEqual(ready_ids, {"resi-0", "resi-1", "h-0", "h-1"})
         mgr.shutdown()
 
-    def test_rolling_replace_cursor_advances_and_wraps(self) -> None:
-        # 游标推进:每轮 1 个变更(batch_size=1),从 cursor 起顺序找位置。
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
-        _wait_ready(mgr, 4)
-
-        cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
-        # 4 轮,每轮换 1 个:slot0..3 依次变
-        for i in range(4):
-            started = mgr.rolling_replace_from_nodes(cands, batch_size=1)
-            self.assertEqual(started, 1)
-            _wait_node_ids(mgr, {f"new-{i}"})
-        # 第 5 轮:batch=1 从 cursor=0 起再换 slot0(全量轮换,同位同节点也重建)
-        self.assertEqual(mgr.refresh_cursor, 0)
-        started = mgr.rolling_replace_from_nodes(cands, batch_size=1)
-        self.assertEqual(started, 1)
-        _wait_quiesced(mgr)
-        ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
-        self.assertEqual(ready_ids, {f"new-{i}" for i in range(4)})
-        mgr.shutdown()
-
-    def test_rolling_replace_skips_non_ready_slots(self) -> None:
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
-        _wait_ready(mgr, 4)
-        # 把 slot 0 置成 STARTING(fill 不挑 STARTING,对账也跳过非 READY)
+    def test_replace_pool_skips_non_ready_slots(self) -> None:
+        mgr = self._pool(4)
+        # slot 0 置 STARTING(fill 自己的路径处理,替换跳过)
         mgr.slots[0].state = proxy_pool.SLOT_STARTING
         mgr.slots[0].process = mock.Mock()
         mgr.slots[0].process.poll.return_value = None
 
         cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
-        mgr.rolling_replace_from_nodes(cands)
-        _wait_node_ids(mgr, {"new-1"})
+        mgr.replace_pool_from_nodes(cands)
+        _wait_quiesced(mgr)
 
-        # slot 0 仍是 old-0(STARTING,被跳过),变更落在 slot 1 -> target[1]=new-1
+        # slot 0 不动;slot 1 领第一个候选 new-0
         self.assertEqual(mgr.slots[0].node_id, "old-0")
-        self.assertEqual(mgr.slots[1].node_id, "new-1")
+        self.assertEqual(mgr.slots[1].node_id, "new-0")
         mgr.shutdown()
 
-    def test_rolling_replace_skips_slots_with_pending_replacement(self) -> None:
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
-        _wait_ready(mgr, 4)
-        # slot 0 预置 replacement_pending + shadow
+    def test_replace_pool_skips_slots_with_pending_replacement(self) -> None:
+        mgr = self._pool(4)
         mgr.slots[0].replacement_pending = True
         mgr.slots[0].shadow = proxy_pool.ShadowCandidate(index=0, tun_name="tun4", port=53000)
 
         cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
-        mgr.rolling_replace_from_nodes(cands)
-        _wait_node_ids(mgr, {"new-1"})
+        mgr.replace_pool_from_nodes(cands)
+        _wait_quiesced(mgr)
 
-        # slot 0 被跳过(pending),变更落在 slot 1 -> target[1]=new-1
-        self.assertEqual(mgr.slots[1].node_id, "new-1")
+        # slot 0 在途 shadow 不被干扰;slot 1 领第一个候选
+        self.assertEqual(mgr.slots[1].node_id, "new-0")
         mgr.shutdown()
 
-    def test_rolling_replace_resets_cursor_on_new_instance(self) -> None:
-        a = _rolling_mgr(pool_size=4)
-        b = _rolling_mgr(pool_size=4)
-        self.assertEqual(a.refresh_cursor, 0)
-        self.assertEqual(b.refresh_cursor, 0)
-        a.shutdown()
-        b.shutdown()
-
-    def test_rolling_replace_caps_at_max_shadow_starting(self) -> None:
-        # pool 30 -> routine_floor = 30//10 = 3,max_shadow_starting 被 floor 拉到 3。
-        # 显式 batch_size=5 把 quota 拉到 5,超过并发预算 3 -> 只起 3 个。
+    def test_replace_pool_caps_at_max_shadow_starting(self) -> None:
+        # 并发预算:pool 30 -> floor=3,max_shadow_starting=3 -> 一轮只起 3 个。
         mgr = _rolling_mgr(pool_size=30, max_starting=3, max_shadow_starting=3)
         mgr.start()
         _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(30)])
         _wait_ready(mgr, 30)
 
         cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(30)]
-        started = mgr.rolling_replace_from_nodes(cands, batch_size=5)
-        # quota=5 但并发预算=3 -> 只发起 3 个
+        started = mgr.replace_pool_from_nodes(cands)
         self.assertEqual(started, 3)
         _wait_node_ids(mgr, {"new-0", "new-1", "new-2"})
-        # 再调:前 3 个 shadow 已 cutover 释放,又能起 3 个
-        started2 = mgr.rolling_replace_from_nodes(cands, batch_size=5)
+        _wait_quiesced(mgr)
+        # 上一批落地后,下一轮检测再补 3 个
+        started2 = mgr.replace_pool_from_nodes(cands)
         self.assertEqual(started2, 3)
         mgr.shutdown()
 
-    def test_rolling_replace_updates_last_candidates(self) -> None:
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
-        _wait_ready(mgr, 4)
-
+    def test_replace_pool_updates_last_candidates(self) -> None:
+        mgr = self._pool(4)
         new_nodes = [_resi_node("new-0", "20.0.0.0"), _resi_node("new-1", "20.0.0.1")]
-        mgr.rolling_replace_from_nodes(new_nodes)
+        mgr.replace_pool_from_nodes(new_nodes)
+        _wait_quiesced(mgr)
 
         # _last_candidates 更新为 dedupe+排序后的候选,供 fill 空槽补位用
         self.assertEqual([n["id"] for n in mgr._last_candidates], ["new-0", "new-1"])
         mgr.shutdown()
 
-    def test_rolling_replace_fills_empty_pool(self) -> None:
-        # 空池调 rolling_replace 应先把 EMPTY 填到 READY(fill 路径),不能只滚不填。
+    def test_replace_pool_fills_empty_pool(self) -> None:
+        # 空池(冷启动语义):fill 把 EMPTY 填到 READY,没有 READY 槽可换。
         mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
         mgr.start()
-        # 不 seed,池子全 EMPTY
         nodes = [_hosting_node(f"fill-{i}", f"10.0.0.{i}") for i in range(4)]
-        mgr.rolling_replace_from_nodes(nodes)
+        mgr.replace_pool_from_nodes(nodes)
         _wait_ready(mgr, 4)
 
         ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
         self.assertEqual(ready_ids, {f"fill-{i}" for i in range(4)})
         mgr.shutdown()
 
-    def test_shadow_tun_name_ping_pongs_after_cutover(self) -> None:
-        # cutover 后 shadow 进程转正占着本轮影子名(slot.device_name),下一轮
-        # shadow 必须换用另一个名字,否则 TUNSETIFF 撞自己主进程(errno=16),
-        # cutover 永远不发生,slot 卡死在老节点上(生产 188 实测)。
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
-        _wait_ready(mgr, 4)
+    def test_replace_pool_filters_cooled_candidates(self) -> None:
+        # 冷却中的候选(近期启动失败)被剔除,不占名额。
+        mgr = self._pool(4)
+        mgr._skipped["bad-0"] = time.time() + 3600
+        cands = [_hosting_node("bad-0", "40.0.0.0")] + \
+                [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
+        mgr.replace_pool_from_nodes(cands)
+        _wait_quiesced(mgr)
+        # bad-0 不被选中;slot0 拿到的是排序后第一个可用候选 new-0
+        self.assertEqual(mgr.slots[0].node_id, "new-0")
+        mgr.shutdown()
 
+    def test_shadow_tun_name_ping_pongs_after_cutover(self) -> None:
+        # cutover 后 shadow 进程转正占着影子名,下一轮 shadow 必须换用另一个
+        # 名字,否则 TUNSETIFF 撞主进程,slot 卡死(生产 188 实测)。
+        mgr = self._pool(4)
         slot = mgr.slots[0]
-        # 初始:主进程在 tun0,影子名 tun4(pool_size+index)
         self.assertEqual(slot.device_name, "tun0")
         self.assertEqual(mgr._shadow_tun_name(slot), "tun4")
 
-        # 第一轮:候选 4 个 new(residential 占前 4 位置),batch=1 -> slot0 换 new-0
         cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
-        mgr.rolling_replace_from_nodes(cands, batch_size=1)
+        mgr.replace_pool_from_nodes(cands)
         _wait_node_ids(mgr, {"new-0"})
         self.assertEqual(slot.node_id, "new-0")
         self.assertEqual(slot.device_name, "tun4")
 
-        # 第二轮:slot0 的目标不再是 new-0(候选序变了),batch=1 从 slot0 起,
-        # 影子名必须乒乓到 tun8,不能再用 tun4(被转正的主进程占着)。
-        cands2 = [_resi_node("new-1", "20.0.0.1"), _resi_node("new-2", "20.0.0.2"),
-                  _resi_node("new-3", "20.0.0.3"), _resi_node("new-x", "20.0.0.9")]
-        mgr.refresh_cursor = 0
-        mgr.rolling_replace_from_nodes(cands2, batch_size=1)
-        _wait_node_ids(mgr, {"new-1"})
+        # 第二轮(同候选也重建):影子名必须乒乓到 tun8
+        mgr.replace_pool_from_nodes(cands)
+        _wait_node_ids(mgr, {"new-0"})
         _wait_quiesced(mgr)
-        self.assertEqual(slot.node_id, "new-1")
         self.assertEqual(slot.device_name, "tun8")
 
-        # 第三轮:再换 slot0,影子名乒乓回 tun4(tun4 已随第一代进程停止而释放)
-        cands3 = [_resi_node("new-4", "20.0.0.4"), _resi_node("new-5", "20.0.0.5"),
-                  _resi_node("new-6", "20.0.0.6"), _resi_node("new-y", "20.0.0.8")]
-        mgr.refresh_cursor = 0
-        mgr.rolling_replace_from_nodes(cands3, batch_size=1)
-        _wait_node_ids(mgr, {"new-4"})
+        # 第三轮:乒乓回 tun4
+        mgr.replace_pool_from_nodes(cands)
+        _wait_node_ids(mgr, {"new-0"})
         _wait_quiesced(mgr)
         self.assertEqual(slot.device_name, "tun4")
         mgr.shutdown()
 
-    def test_rolling_replace_filters_cooled_candidates(self) -> None:
-        # 冷却中的候选(近期启动失败)不能占目标位置:AUTH_FAILED 机器探测可达
-        # 但隧道起不来,不剔除就反复被选中、反复失败,slot 的老节点换不掉。
-        mgr = _rolling_mgr(pool_size=4, max_starting=4, max_shadow_starting=4)
-        mgr.start()
-        _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(4)])
-        _wait_ready(mgr, 4)
+    def test_shadow_failure_retries_next_candidate(self) -> None:
+        # shadow 起失败(候选 A 隧道起不来)-> 节点进冷却,当场换下一个候选
+        # B 重试,老节点垫底服务到成功为止。
+        def selective_start(config_path, dev):
+            text = open(config_path, encoding="utf-8").read()
+            if "FAIL-TUNNEL" in text:
+                return False, "[错误代码 2005] AUTH_FAILED", None
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            return True, "ok", proc
 
-        # bad-0 放进冷却名单(模拟刚 AUTH_FAILED),候选里仍在 -> 被剔除,
-        # 位置由后面的可用候选顶上
-        mgr._skipped["bad-0"] = time.time() + 3600
-        cands = [_hosting_node("bad-0", "40.0.0.0")] + \
-                [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(4)]
-        mgr.rolling_replace_from_nodes(cands, batch_size=1)
-        _wait_node_ids(mgr, {"new-0"})
-        self.assertEqual(mgr.slots[0].node_id, "new-0")
+        mgr = _rolling_mgr(pool_size=1, max_starting=1, max_shadow_starting=1)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node("old-0", "10.0.0.0")])
+        _wait_ready(mgr, 1)
+        mgr.start_openvpn = selective_start  # seed 用默认 mock,此后按 config 区分
+
+        cands = [_resi_node("bad-0", "40.0.0.0", cfg="FAIL-TUNNEL"),
+                 _resi_node("good-0", "20.0.0.1", cfg="GOOD")]
+        mgr.replace_pool_from_nodes(cands)
+        _wait_node_ids(mgr, {"good-0"}, timeout=4.0)
+        _wait_quiesced(mgr)
+
+        self.assertEqual(mgr.slots[0].node_id, "good-0")
+        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
+        # bad-0 进了冷却
+        self.assertGreater(mgr._skipped.get("bad-0", 0), time.time())
+        mgr.shutdown()
+
+    def test_shadow_failure_all_candidates_dead_keeps_old_node(self) -> None:
+        # 候选全灭:老节点保留 READY,槽位等下一轮检测,不留空槽。
+        def always_fail(config_path, dev):
+            return False, "boom", None
+
+        mgr = _rolling_mgr(pool_size=1, max_starting=1, max_shadow_starting=1)
+        mgr.start()
+        _seed_pool(mgr, [_hosting_node("old-0", "10.0.0.0")])
+        _wait_ready(mgr, 1)
+        mgr.start_openvpn = always_fail  # seed 完成后再让一切失败
+
+        cands = [_resi_node("bad-0", "40.0.0.0"), _resi_node("bad-1", "40.0.0.1")]
+        mgr.replace_pool_from_nodes(cands)
+        _wait_quiesced(mgr, timeout=4.0)
+
+        self.assertEqual(mgr.slots[0].state, proxy_pool.SLOT_READY)
+        self.assertEqual(mgr.slots[0].node_id, "old-0")
+        self.assertFalse(mgr.slots[0].replacement_pending)
+        self.assertIsNone(mgr.slots[0].shadow)
         mgr.shutdown()
 
     def test_penalize_node_auth_failed_gets_one_hour(self) -> None:
@@ -1463,6 +1433,7 @@ class PoolRollingReplaceTests(unittest.TestCase):
         seconds2 = mgr._penalize_node("flake-0", "connection timed out")
         self.assertEqual(seconds2, mgr.failed_node_skip_seconds)
         mgr.shutdown()
+
 
 
 class PoolGracefulCutoverTests(unittest.TestCase):

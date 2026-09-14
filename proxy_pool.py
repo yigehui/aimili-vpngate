@@ -372,9 +372,6 @@ class PoolManager:
         self._skipped: dict[str, float] = {}
         self._started = False
         self._rebuilding = False
-        # 滚动替换起始 slot 游标;每轮从这开始顺序选 slot,curover 后推��到本轮结束
-        # 位置(含跳过的)并 wrap。服务重启天然回 0,无需持久化。
-        self.refresh_cursor: int = 0
         self._fill_thread: threading.Thread | None = None
         self._temp_config_dir: tempfile.TemporaryDirectory[str] | None = None
 
@@ -760,7 +757,6 @@ class PoolManager:
                 "require_exit_ip": self.require_exit_ip,
                 "refresh_batch_size": self.refresh_batch_size,
                 "failed_node_skip_seconds": self.failed_node_skip_seconds,
-                "refresh_cursor": self.refresh_cursor,
             }
             if detail:
                 result["slot_detail"] = [
@@ -1129,32 +1125,26 @@ class PoolManager:
             with self._lock:
                 self._rebuilding = False
 
-    def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
-        """全量轮换:每轮从 ``refresh_cursor`` 起换 ``refresh_batch_size`` 个槽。
+    def replace_pool_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
+        """检测完成后的全量优雅替换 —— 冷启动 fill 的同套逻辑,只多一步切换。
 
-        语义简单直接:
+        每轮节点检测完成(结果 = 测试通过的全部可用节点)后调用一次:
 
-        * 候选列表 = 池内全部去重候选按 ``_candidate_priority_key``(住宅/移动
-          优先,其余按延迟)排序,经 ``_target_nodes`` 按 exit ip 去重后截取前
-          ``pool_size`` 个 —— 这就是每个 slot 的目标(位置 i ↔ target[i])。
-        * 候选数 < 池子:多出来的尾部位置目标为 None,持旧节点的 slot **直接
-          停掉**(多余槽不留历史节点);候选数 ≥ 池子:所有旧节点都会被逐步
-          换成目标列表。
-        * 每轮从 ``refresh_cursor`` 起顺序扫过位置(visited 含跳过的,wrap 回
-          0),执行最多 ``refresh_batch_size`` 个变更(默认 30):持 READY 的
-          slot 一律 shadow cutover 到该位置的目标节点 —— **即使槽内节点与目标
-          相同也换**(重建隧道,保证没有节点能长期存活);目标为 None → 停
-          slot。其余位置本轮纹丝不动,下一轮 cursor 接着扫,全部槽位约
-          ``pool_size / refresh_batch_size`` 轮轮换一遍。
-        * 切换是优雅的:老 OpenVPN 进程在 cutover 后进入 ``_retiring`` 列表,
-          在途连接排空或超过 ``replacement_grace_seconds`` 才被回收,不瞬断。
+        * 候选去重(按 exit ip)、剔除冷却中的失败节点、住宅/延迟排序。
+        * 空槽先补:``_run_fill_loop`` 把 EMPTY 槽按候选填到 READY(冷启动
+          路径,同一套启动逻辑)。
+        * 热替换:对每个 READY 且无在途 shadow 的槽,直接指派 shadow 目标
+          (候选轮转分配,同节点也重建隧道 —— 没有槽位能存活超过一个检测
+          周期),``max_shadow_starting`` 个并发起 shadow,一个落地补一个。
+        * shadow 起失败:节点进冷却,**当场换下一个候选重试**(老节点垫底
+          服务到成功为止),不是等下一轮检测。
+        * 候选数少于 READY 槽数:多余的槽**直接停掉**,不留历史节点。
+        * 优雅切换:shadow 隧道验证通过 → 新公网 listener 先绑同端口
+          (SO_REUSEPORT)→ 停老 listener → slot 换新节点 → 老进程进
+          ``_retiring``,在途连接排空或宽限期到才回收,客户端不断连。
 
-        空槽先填:开头先跑 ``_run_fill_loop`` 把 EMPTY slot 按候选补到 READY
-        (受 ``max_starting`` 并发约束,不限总量)——服务重启/health drop 后
-        空池能填起来;fill 用的也是这份目标列表,天然与对账一致。
-
-        ``batch_size`` 非 None 时覆盖默认组大小(供测试)。返回本轮实际发起
-        变更数(cutover + 停槽)。
+        ``batch_size`` 为兼容保留的参数(旧行为是每轮配额),现在无配额概念,
+        仅透传给 shadow 并发上限计算。返回本轮发起的变更数(cutover + 停槽)。
         """
         candidates = self._dedupe_nodes(list(nodes or []))
         candidates.sort(key=self._candidate_priority_key)
@@ -1163,66 +1153,46 @@ class PoolManager:
         # 冷却中的候选(近期启动失败,尤其 AUTH_FAILED)先剔除:它们探测可达
         # 但真实隧道起不来,不剔除就会一直占住目标位置被各 slot 反复选中反复
         # 失败(生产实测:同一台失效机器让十几个 slot 的老节点被迫多留数小时)。
-        # 剔除后位置由后续可用候选顶上;可用候选因此少于池子时,尾部多余槽
-        # 按既有语义停掉。
         now_ts = time.time()
         candidates = [
             node
             for node in candidates
             if self._skipped.get(self._node_id(node), 0.0) <= now_ts
         ]
-        target_nodes = self._target_nodes(candidates)
 
-        if batch_size is not None:
-            quota = max(1, int(batch_size))
-        else:
-            quota = max(1, self.refresh_batch_size)
-
-        # 空槽补位(空池初始填充 / health drop 后补位)。fill 只动 EMPTY,与
-        # 位置对账互不干涉;fill 不消费 refresh_cursor。
+        # 空槽补位(冷启动 / health drop 后补位)。fill 只动 EMPTY,与热替换
+        # 互不干涉;fill 用的也是这份候选列表。
         with self._lock:
             self._last_candidates = list(candidates)
         self._run_fill_loop()
 
-        # lock 外先算好每个位置的动作,锁内只做状态检查与预留
+        # 候选轮转指针:READY 槽按顺序各领一个候选,同节点也重建
         picked: list[tuple[PoolSlot, dict[str, Any] | None]] = []
+        stop_picked = 0
+        cut_picked = 0
         with self._lock:
             now = time.time()
             ready_count = sum(1 for s in self.slots if s.state == SLOT_READY)
             empty_count = sum(1 for s in self.slots if s.state == SLOT_EMPTY)
-            stop_picked = 0
-            cut_picked = 0
-            start_cursor = self.refresh_cursor
-            visited = 0
-            while visited < self.pool_size and (cut_picked + stop_picked) < quota:
-                idx = (start_cursor + visited) % self.pool_size
-                visited += 1
-                target = target_nodes[idx] if idx < len(target_nodes) else None
-                slot = self.slots[idx]
+            inflight = self._shadow_inflight_count_locked()
+            # 本次可新起的 shadow 数 = 并发预算 - 已在途
+            budget = max(0, self.max_shadow_starting - inflight)
+            cursor = 0
+            for slot in self.slots:
                 if slot.state == SLOT_EMPTY or slot.state == SLOT_DRAINING:
                     continue
                 if slot.state != SLOT_READY:
-                    # STARTING 等:fill/它自己的路径会处理,不动
+                    # STARTING:fill 自己的路径会处理,不动
                     continue
                 if slot.replacement_pending or slot.shadow is not None:
+                    # 上一批 shadow 还在途:让它走完,下一轮检测后照样被换
                     continue
-                # 全量轮换:即使槽内节点与位置目标相同也重建隧道(不跳过),
-                # 保证没有节点能长期存活。
-                if self._shadow_inflight_count_locked() >= self.max_shadow_starting:
-                    break
-                if target is None:
-                    # 多余槽(候选不足池子):直接停,不留历史节点
-                    old_id = slot.node_id
-                    self._stop_slot(slot)
-                    if old_id:
-                        self._skipped[old_id] = now + self.failed_node_skip_seconds
-                        try:
-                            self.log("PoolSlot", f"rolling trim slot={slot.index} node={old_id}: no target position")
-                        except Exception:
-                            pass
-                    stop_picked += 1
-                    picked.append((slot, None))
-                else:
+                if cursor < len(candidates):
+                    if budget <= 0:
+                        break
+                    target = candidates[cursor]
+                    cursor += 1
+                    budget -= 1
                     shadow = ShadowCandidate(
                         index=slot.index,
                         tun_name=self._shadow_tun_name(slot),
@@ -1231,20 +1201,30 @@ class PoolManager:
                     self._shadow_meta_from_node(shadow, target)
                     slot.shadow = shadow
                     slot.replacement_pending = True
-                    slot.replacement_reason = "rolling-position"
+                    slot.replacement_reason = "full-refresh"
                     slot.replacement_requested_at = now
                     slot.replacement_deadline_at = now + self.replacement_grace_seconds
                     picked.append((slot, target))
                     cut_picked += 1
-            self.refresh_cursor = (start_cursor + visited) % self.pool_size
+                else:
+                    # 候选不够分:多余槽直接停,不留历史节点
+                    old_id = slot.node_id
+                    self._stop_slot(slot)
+                    if old_id:
+                        self._skipped[old_id] = now + self.failed_node_skip_seconds
+                        try:
+                            self.log("PoolSlot", f"full-refresh trim slot={slot.index} node={old_id}: no candidate left")
+                        except Exception:
+                            pass
+                    stop_picked += 1
+                    picked.append((slot, None))
 
         try:
             self.log(
                 "Pool",
-                f"rolling_replace ready={ready_count} empty={empty_count} "
+                f"replace_pool ready={ready_count} empty={empty_count} "
                 f"picked={len(picked)} cutover={cut_picked} trimmed={stop_picked} "
-                f"quota={quota} targets={len(target_nodes)} candidates={len(candidates)} "
-                f"cursor={start_cursor}->{self.refresh_cursor}",
+                f"inflight={inflight} targets={len(candidates)}",
             )
         except Exception:
             pass
@@ -1255,10 +1235,14 @@ class PoolManager:
             threading.Thread(
                 target=self._start_shadow_for_slot,
                 args=(slot, node),
-                name=f"proxy-pool-rolling-{slot.index}",
+                name=f"proxy-pool-refresh-{slot.index}",
                 daemon=True,
             ).start()
         return len(picked)
+
+    # 旧名兼容:检测循环historically调用 rolling_replace_from_nodes。
+    def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
+        return self.replace_pool_from_nodes(nodes, batch_size=batch_size)
 
     def _request_fill_slots(self) -> None:
         if not self._started or self._rebuilding:
@@ -1544,7 +1528,67 @@ class PoolManager:
                 pass
             return False
 
+    def _pick_next_candidate_locked(self, exclude_ids: set[str]) -> dict[str, Any] | None:
+        """从上一轮检测候选里挑下一个未冷却节点(shadow 失败重试用)。"""
+        now = time.time()
+        for node in self._last_candidates:
+            nid = self._node_id(node)
+            if nid in exclude_ids:
+                continue
+            if self._skipped.get(nid, 0.0) > now:
+                continue
+            return node
+        return None
+
     def _start_shadow_for_slot(self, slot: PoolSlot, node: dict[str, Any]) -> bool:
+        """shadow 启动入口:失败当场换下一个候选重试(最多 3 次)。
+
+        重试期间老节点照常 READY 垫底服务;候选打光仍失败则保留老节点,
+        等下一轮检测再换 —— 不是卡死在失败节点上也不是留空槽。
+        """
+        current = node
+        failed_ids: list[str] = []
+        for depth in range(4):  # 首次 + 最多 3 次重试
+            if depth > 0:
+                with self._lock:
+                    if slot.state != SLOT_READY or slot.shadow is not None or slot.replacement_pending:
+                        # 老节点没了(health drop)或别的路径已接管,不再重试
+                        return False
+                    nxt = self._pick_next_candidate_locked(set(failed_ids) | {slot.node_id or ""})
+                    if nxt is None:
+                        try:
+                            self.log(
+                                "PoolSlot",
+                                f"shadow retry_exhausted slot={slot.index} tried={len(failed_ids)}: no candidate left, keep old node",
+                            )
+                        except Exception:
+                            pass
+                        return False
+                    shadow = ShadowCandidate(
+                        index=slot.index,
+                        tun_name=self._shadow_tun_name(slot),
+                        port=self._shadow_port(slot),
+                    )
+                    self._shadow_meta_from_node(shadow, nxt)
+                    slot.shadow = shadow
+                    slot.replacement_pending = True
+                    slot.replacement_reason = "full-refresh-retry"
+                    slot.replacement_requested_at = time.time()
+                    slot.replacement_deadline_at = time.time() + self.replacement_grace_seconds
+                    current = nxt
+                try:
+                    self.log(
+                        "PoolSlot",
+                        f"shadow retry slot={slot.index} depth={depth} next={self._node_id(current)}",
+                    )
+                except Exception:
+                    pass
+            if self._start_shadow_attempt(slot, current):
+                return True
+            failed_ids.append(self._node_id(current))
+        return False
+
+    def _start_shadow_attempt(self, slot: PoolSlot, node: dict[str, Any]) -> bool:
         shadow: ShadowCandidate | None
         with self._lock:
             shadow = slot.shadow

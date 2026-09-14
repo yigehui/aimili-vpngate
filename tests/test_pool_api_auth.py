@@ -45,7 +45,9 @@ class ConfigLoadTests(unittest.TestCase):
             cfg2 = proxy_pool.load_or_create_pool_config(path)
             self.assertEqual(cfg1, cfg2)
 
-    def test_load_or_create_pool_secrets_ignores_deprecated_shadow_setting(self) -> None:
+    def test_load_or_create_pool_secrets_reads_shadow_starting_setting(self) -> None:
+        # max_shadow_starting 曾被忽略(无 cfg 键,构造只靠 pool_size//10 兜底),
+        # 现在从文件/env 正常读取。
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "pool_secrets.json"
             path.write_text(
@@ -53,7 +55,7 @@ class ConfigLoadTests(unittest.TestCase):
                 encoding="utf-8",
             )
             cfg = proxy_pool.load_or_create_pool_config(path)
-            self.assertNotIn("max_shadow_starting", cfg)
+            self.assertEqual(cfg["max_shadow_starting"], 99)
 
     def test_load_or_create_pool_secrets_reads_refresh_and_skip_settings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
