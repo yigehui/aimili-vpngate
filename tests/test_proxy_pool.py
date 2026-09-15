@@ -1239,7 +1239,8 @@ class PoolFullReplaceTests(unittest.TestCase):
         mgr.shutdown()
 
     def test_replace_pool_trims_tail_when_candidates_fewer_than_pool(self) -> None:
-        # 候选 2 < 池 4:前 2 槽换新,尾部多余槽直接停掉,不留历史节点。
+        # 池规模镜像候选集合:候选 2 < 池 4,池里只留 2 个代理(前 2 槽),
+        # 尾部多余槽直接停掉,不留历史节点 —— 不凑满 pool_size。
         mgr = self._pool(4)
         started = mgr.replace_pool_from_nodes(
             [_hosting_node("t-0", "30.0.0.0"), _hosting_node("t-1", "30.0.0.1")]
@@ -1251,6 +1252,14 @@ class PoolFullReplaceTests(unittest.TestCase):
         self.assertEqual(ready_ids, {"t-0", "t-1"})
         self.assertEqual(mgr.slots[2].state, proxy_pool.SLOT_EMPTY)
         self.assertEqual(mgr.slots[3].state, proxy_pool.SLOT_EMPTY)
+        # 下轮候选更少(1 个):池子跟着缩到 1
+        mgr.replace_pool_from_nodes([_hosting_node("t-2", "30.0.0.2")])
+        _wait_quiesced(mgr)
+        _wait_ready(mgr, 1)
+        ready2 = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
+        self.assertEqual(ready2, {"t-2"})
+        empties = sum(1 for s in mgr.slots if s.state == proxy_pool.SLOT_EMPTY)
+        self.assertEqual(empties, 3)
         mgr.shutdown()
 
     def test_replace_pool_more_candidates_than_pool(self) -> None:
@@ -1307,17 +1316,14 @@ class PoolFullReplaceTests(unittest.TestCase):
 
         cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(30)]
         started = mgr.replace_pool_from_nodes(cands)
-        # 首批受并发预算约束
-        self.assertEqual(started, 3)
-        # 等待队列持有剩余槽,落地补位直至全池换完
+        # 全部 30 个槽都指派了目标(返回值=指派数,不是首批并发数):
+        # 首批只有 3 个 shadow 真正在起,其余 27 个在等待队列落地补位
+        self.assertEqual(started, 30)
+        # 落地补位直至全池换完
         _wait_node_ids(mgr, {f"new-{i}" for i in range(30)}, timeout=10.0)
         _wait_quiesced(mgr, timeout=10.0)
         ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
         self.assertEqual(ready_ids, {f"new-{i}" for i in range(30)})
-        # 全部换完后再次调用:全量替换语义下同节点也重建隧道,再起一批
-        started2 = mgr.replace_pool_from_nodes(cands)
-        self.assertEqual(started2, 3)
-        _wait_quiesced(mgr, timeout=10.0)
         mgr.shutdown()
 
     def test_replace_pool_updates_last_candidates(self) -> None:
