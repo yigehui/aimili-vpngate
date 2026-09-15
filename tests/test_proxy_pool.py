@@ -1296,8 +1296,10 @@ class PoolFullReplaceTests(unittest.TestCase):
         self.assertEqual(mgr.slots[1].node_id, "new-0")
         mgr.shutdown()
 
-    def test_replace_pool_caps_at_max_shadow_starting(self) -> None:
-        # 并发预算:pool 30 -> floor=3,max_shadow_starting=3 -> 一轮只起 3 个。
+    def test_replace_pool_caps_at_max_shadow_starting_then_replenishes(self) -> None:
+        # 并发预算:pool 30 -> floor=3,max_shadow_starting=3 -> 首批只起 3 个,
+        # 其余槽进等待队列;每个 shadow 落地后"一个落地补一个",整池一个
+        # 检测周期内全部换完。
         mgr = _rolling_mgr(pool_size=30, max_starting=3, max_shadow_starting=3)
         mgr.start()
         _seed_pool(mgr, [_hosting_node(f"old-{i}", f"10.0.0.{i}") for i in range(30)])
@@ -1305,12 +1307,17 @@ class PoolFullReplaceTests(unittest.TestCase):
 
         cands = [_resi_node(f"new-{i}", f"20.0.0.{i}") for i in range(30)]
         started = mgr.replace_pool_from_nodes(cands)
+        # 首批受并发预算约束
         self.assertEqual(started, 3)
-        _wait_node_ids(mgr, {"new-0", "new-1", "new-2"})
-        _wait_quiesced(mgr)
-        # 上一批落地后,下一轮检测再补 3 个
+        # 等待队列持有剩余槽,落地补位直至全池换完
+        _wait_node_ids(mgr, {f"new-{i}" for i in range(30)}, timeout=10.0)
+        _wait_quiesced(mgr, timeout=10.0)
+        ready_ids = {s.node_id for s in mgr.slots if s.state == proxy_pool.SLOT_READY}
+        self.assertEqual(ready_ids, {f"new-{i}" for i in range(30)})
+        # 全部换完后再次调用:全量替换语义下同节点也重建隧道,再起一批
         started2 = mgr.replace_pool_from_nodes(cands)
         self.assertEqual(started2, 3)
+        _wait_quiesced(mgr, timeout=10.0)
         mgr.shutdown()
 
     def test_replace_pool_updates_last_candidates(self) -> None:

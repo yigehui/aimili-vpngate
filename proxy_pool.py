@@ -372,6 +372,11 @@ class PoolManager:
         self._skipped: dict[str, float] = {}
         self._started = False
         self._rebuilding = False
+        # 本轮检测候选(热替换"一个落地补一个"用):候选列表 + 轮转指针 +
+        # 预算耗尽后在等待队列里排队的 slot 下标。
+        self._refresh_candidates: list[dict[str, Any]] = []
+        self._refresh_cursor = 0
+        self._refresh_waiting: list[int] = []
         self._fill_thread: threading.Thread | None = None
         self._temp_config_dir: tempfile.TemporaryDirectory[str] | None = None
 
@@ -1164,9 +1169,14 @@ class PoolManager:
         # 互不干涉;fill 用的也是这份候选列表。
         with self._lock:
             self._last_candidates = list(candidates)
+            self._refresh_candidates = list(candidates)
+            self._refresh_cursor = 0
+            self._refresh_waiting = []
         self._run_fill_loop()
 
-        # 候选轮转指针:READY 槽按顺序各领一个候选,同节点也重建
+        # 候选轮转指针:READY 槽按顺序各领一个候选,同节点也重建。
+        # 并发预算用完后剩余槽进等待队列,由 _replenish_replacements 在每个
+        # shadow 落地后补起("一个落地补一个"),整池在一个检测周期内换完。
         picked: list[tuple[PoolSlot, dict[str, Any] | None]] = []
         stop_picked = 0
         cut_picked = 0
@@ -1185,11 +1195,12 @@ class PoolManager:
                     # STARTING:fill 自己的路径会处理,不动
                     continue
                 if slot.replacement_pending or slot.shadow is not None:
-                    # 上一批 shadow 还在途:让它走完,下一轮检测后照样被换
+                    # 上一批 shadow 还在途:让它走完,本轮照常被换
                     continue
                 if cursor < len(candidates):
                     if budget <= 0:
-                        break
+                        self._refresh_waiting.append(slot.index)
+                        continue
                     target = candidates[cursor]
                     cursor += 1
                     budget -= 1
@@ -1218,13 +1229,15 @@ class PoolManager:
                             pass
                     stop_picked += 1
                     picked.append((slot, None))
+            # 首批消费掉的候选同步到轮转指针,replenish 从这里接着发
+            self._refresh_cursor = cursor
 
         try:
             self.log(
                 "Pool",
                 f"replace_pool ready={ready_count} empty={empty_count} "
                 f"picked={len(picked)} cutover={cut_picked} trimmed={stop_picked} "
-                f"inflight={inflight} targets={len(candidates)}",
+                f"waiting={len(self._refresh_waiting)} inflight={inflight} targets={len(candidates)}",
             )
         except Exception:
             pass
@@ -1243,6 +1256,75 @@ class PoolManager:
     # 旧名兼容:检测循环historically调用 rolling_replace_from_nodes。
     def rolling_replace_from_nodes(self, nodes: list[dict[str, Any]], batch_size: int | None = None) -> int:
         return self.replace_pool_from_nodes(nodes, batch_size=batch_size)
+
+    def _replenish_replacements_locked(self) -> int:
+        """shadow 落地后补位:从等待队列取下一个槽指派 shadow("一个落地补一个")。
+
+        返回本次新起的 shadow 数(由调用方在锁外 spawn 线程)。并发预算 =
+        ``max_shadow_starting`` - 当前在途;候选按 ``_refresh_cursor`` 轮转,
+        冷却/重复的候选跳过。没有等待槽或候选打光则清空队列返回 0。
+        """
+        if not self._refresh_waiting:
+            return 0
+        started: list[tuple[PoolSlot, dict[str, Any]]] = []
+        now = time.time()
+        budget = max(0, self.max_shadow_starting - self._shadow_inflight_count_locked())
+        while self._refresh_waiting and budget > 0:
+            idx = self._refresh_waiting.pop(0)
+            if idx >= len(self.slots):
+                continue
+            slot = self.slots[idx]
+            # 等待期间槽位可能被 health drop / fill 接管,不再是可替换状态
+            if slot.state != SLOT_READY or slot.replacement_pending or slot.shadow is not None:
+                continue
+            target = self._next_refresh_candidate_locked(slot)
+            if target is None:
+                # 候选打光:本轮剩余等待槽不再替换(下一轮检测会重新覆盖)
+                self._refresh_waiting.clear()
+                break
+            shadow = ShadowCandidate(
+                index=slot.index,
+                tun_name=self._shadow_tun_name(slot),
+                port=self._shadow_port(slot),
+            )
+            self._shadow_meta_from_node(shadow, target)
+            slot.shadow = shadow
+            slot.replacement_pending = True
+            slot.replacement_reason = "full-refresh"
+            slot.replacement_requested_at = now
+            slot.replacement_deadline_at = now + self.replacement_grace_seconds
+            started.append((slot, target))
+            budget -= 1
+        for slot, target in started:
+            threading.Thread(
+                target=self._start_shadow_for_slot,
+                args=(slot, target),
+                name=f"proxy-pool-refresh-{slot.index}",
+                daemon=True,
+            ).start()
+        return len(started)
+
+    def _next_refresh_candidate_locked(self, slot: PoolSlot) -> dict[str, Any] | None:
+        """从本轮候选按轮转指针取下一个可用候选(冷却中的跳过,不耗指针)。
+
+        最多扫 len 轮,全灭返回 None(指针归位,由调用方处理)。
+        """
+        candidates = self._refresh_candidates
+        n = len(candidates)
+        if n == 0:
+            return None
+        now = time.time()
+        for _ in range(n):
+            node = candidates[self._refresh_cursor % n]
+            self._refresh_cursor += 1
+            nid = self._node_id(node)
+            if nid == slot.node_id:
+                # 同节点:照样重建(全量替换语义),直接返回
+                return node
+            if self._skipped.get(nid, 0.0) > now:
+                continue
+            return node
+        return None
 
     def _request_fill_slots(self) -> None:
         if not self._started or self._rebuilding:
@@ -1584,9 +1666,22 @@ class PoolManager:
                 except Exception:
                     pass
             if self._start_shadow_attempt(slot, current):
+                self._after_shadow_landed()
                 return True
             failed_ids.append(self._node_id(current))
+        self._after_shadow_landed()
         return False
+
+    def _after_shadow_landed(self) -> None:
+        """一个 shadow 落地(成功或最终失败):并发预算释放了一个名额,
+        立刻从等待队列补起下一个槽 —— 整池在一个检测周期内换完。"""
+        with self._lock:
+            started = self._replenish_replacements_locked()
+        if started:
+            try:
+                self.log("Pool", f"replace_pool replenish started={started} waiting={len(self._refresh_waiting)}")
+            except Exception:
+                pass
 
     def _start_shadow_attempt(self, slot: PoolSlot, node: dict[str, Any]) -> bool:
         shadow: ShadowCandidate | None
