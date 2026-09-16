@@ -1171,6 +1171,7 @@ class PoolManager:
         # 池规模镜像本轮候选集合由热替换阶段的"候选打光 → 停槽"自然完成:
         # fill 只补 EMPTY;READY 槽按候选一一对应领目标,候选被占满后剩余槽
         # 直接停掉 —— 不留历史节点,也不强凑满 pool_size。
+        candidate_ids = {self._node_id(n) for n in candidates}
         with self._lock:
             self._last_candidates = list(candidates)
             self._refresh_candidates = list(candidates)
@@ -1194,53 +1195,35 @@ class PoolManager:
             # 本次可新起的 shadow 数 = 并发预算 - 已在途
             budget = max(0, self.max_shadow_starting - inflight)
             occupied = self._occupied_node_ids_locked()
+            # 确定性两阶段一一配对(不能靠共享游标逐槽领取 —— 游标会被先
+            # 领"空闲候选"的槽推过别的槽自己的候选位置,那个槽就永远扫不到
+            # 自家节点,被误停光。生产 188 实测:ready=205 targets=229 却
+            # cutover=55 trimmed=150,池子被 trim 崩):
+            #   1) 节点仍是本轮候选的槽先领自家节点(该候选只能由它重建,
+            #      其它槽不该抢);
+            #   2) 其余槽按槽序从"空闲候选"(未被任何槽持有/领取的)里领一个;
+            #   3) 领不到目标的槽才停掉 —— 池子规模镜像本轮候选数。
+            free_candidates: list[dict[str, Any]] = []
+            for node in candidates:
+                nid = self._node_id(node)
+                if nid and nid not in occupied:
+                    free_candidates.append(node)
             for slot in self.slots:
-                if slot.state == SLOT_EMPTY or slot.state == SLOT_DRAINING:
+                if slot.state != SLOT_READY or slot.replacement_pending or slot.shadow is not None:
+                    # 在途 shadow 的槽走正常替换路径,不在这里动
                     continue
-                if slot.state != SLOT_READY:
-                    # STARTING:fill 自己的路径会处理,不动
+                if budget <= 0:
+                    self._refresh_waiting.append(slot.index)
                     continue
-                if slot.replacement_pending or slot.shadow is not None:
-                    # 上一批 shadow 还在途:它的旧节点已让位、新目标已定,
-                    # 本轮不再重复指派
-                    continue
-                if self._refresh_cursor < len(candidates):
-                    if budget <= 0:
-                        self._refresh_waiting.append(slot.index)
-                        continue
-                    # 本槽自己的节点允许作为目标(fill 刚用它补位的槽照样重建
-                    # 隧道);只排除其它槽占用的候选。
-                    target = self._next_fresh_candidate_locked(occupied - {slot.node_id or ""}, now)
-                    if target is None:
-                        # 候选打光:该槽的节点不在本轮可用集合里,停掉
-                        old_id = slot.node_id
-                        self._stop_slot(slot)
-                        if old_id:
-                            self._skipped[old_id] = now + self.failed_node_skip_seconds
-                            try:
-                                self.log("PoolSlot", f"full-refresh trim slot={slot.index} node={old_id}: no candidate left")
-                            except Exception:
-                                pass
-                        stop_picked += 1
-                        picked.append((slot, None))
-                        continue
-                    occupied.add(self._node_id(target))
-                    occupied.discard(slot.node_id or "")  # 本槽老节点让位,不再占用
-                    shadow = ShadowCandidate(
-                        index=slot.index,
-                        tun_name=self._shadow_tun_name(slot),
-                        port=self._shadow_port(slot),
-                    )
-                    self._shadow_meta_from_node(shadow, target)
-                    slot.shadow = shadow
-                    slot.replacement_pending = True
-                    slot.replacement_reason = "full-refresh"
-                    slot.replacement_requested_at = now
-                    slot.replacement_deadline_at = now + self.replacement_grace_seconds
-                    picked.append((slot, target))
-                    cut_picked += 1
+                own_id = slot.node_id or ""
+                if own_id and own_id in candidate_ids:
+                    # 阶段 1:自家节点仍是候选 —— 重建自家隧道,不占空闲名额
+                    target = next((n for n in candidates if self._node_id(n) == own_id), None)
                 else:
-                    # 候选不够分:多余槽直接停,不留历史节点
+                    # 阶段 2:从空闲候选领取
+                    target = free_candidates.pop(0) if free_candidates else None
+                if target is None:
+                    # 无候选可领:该槽的节点不在本轮可用集合里,停掉
                     old_id = slot.node_id
                     self._stop_slot(slot)
                     if old_id:
@@ -1251,6 +1234,23 @@ class PoolManager:
                             pass
                     stop_picked += 1
                     picked.append((slot, None))
+                    continue
+                occupied.add(self._node_id(target))
+                occupied.discard(slot.node_id or "")  # 本槽老节点让位,不再占用
+                shadow = ShadowCandidate(
+                    index=slot.index,
+                    tun_name=self._shadow_tun_name(slot),
+                    port=self._shadow_port(slot),
+                )
+                self._shadow_meta_from_node(shadow, target)
+                slot.shadow = shadow
+                slot.replacement_pending = True
+                slot.replacement_reason = "full-refresh"
+                slot.replacement_requested_at = now
+                slot.replacement_deadline_at = now + self.replacement_grace_seconds
+                picked.append((slot, target))
+                cut_picked += 1
+                budget -= 1
 
         try:
             self.log(
@@ -1271,42 +1271,25 @@ class PoolManager:
                 name=f"proxy-pool-refresh-{slot.index}",
                 daemon=True,
             ).start()
-        return len(picked)
+        # 返回本轮发起的变更数:已指派(cutover+trim)+ 进等待队列待补位的
+        # 等待槽在 shadow 落地后由 replenish 补齐,也算变更
+        return len(picked) + len(self._refresh_waiting)
 
     def _next_fresh_candidate_locked(self, occupied: set[str], now: float) -> dict[str, Any] | None:
-        """从本轮候选取下一个未被占用/未冷却的候选。
+        """从本轮候选取下一个未被占用/未冷却的候选(线性扫描,无游标)。
 
-        只在成功返回时推进游标(被占用的候选**不消耗** —— 它可能正是其它
-        槽自己的节点,由那个槽自己领取);被冷却的候选直接跳过(冷却只会
-        增加,不会中途解除,可安全永久越过)。返回 None 表示扫到末尾仍无
-        可用候选,调用方停掉多余槽。
+        ``occupied`` 由调用方维护:每领走一个候选就 add 进去,因此重复调用
+        不会拿到同一个候选。被其它槽占用的候选不会被这里选中 —— 它们正由
+        持有槽自己(own-first)重建。返回 None 表示候选打光,调用方停掉
+        多余槽。
         """
-        candidates = self._refresh_candidates
-        n = len(candidates)
-        i = self._refresh_cursor
-        blocked_at = -1  # 扫描路上遇到的第一个"被其它槽占用"的候选位置
-        while i < n:
-            node = candidates[i]
+        for node in self._refresh_candidates:
             nid = self._node_id(node)
-            if not nid:
-                i += 1
+            if not nid or nid in occupied:
                 continue
             if self._skipped.get(nid, 0.0) > now:
-                i += 1
-                continue  # 冷却:永久跳过(冷却只会增加,不会中途解除)
-            if nid in occupied:
-                if blocked_at < 0:
-                    blocked_at = i
-                i += 1
-                continue  # 被占用:绕过它继续找后面的空闲候选
-            self._refresh_cursor = i + 1
+                continue
             return node
-        # 没有空闲候选:游标停在第一个被占用的候选上 —— 它是其它槽自己的
-        # 节点,由那个槽自己领取(本槽 own-first 领取的就是这种情况)。
-        if blocked_at >= 0:
-            self._refresh_cursor = blocked_at
-        else:
-            self._refresh_cursor = i
         return None
 
     # 旧名兼容:检测循环historically调用 rolling_replace_from_nodes。
@@ -1327,36 +1310,45 @@ class PoolManager:
         now = time.time()
         budget = max(0, self.max_shadow_starting - self._shadow_inflight_count_locked())
         occupied = self._occupied_node_ids_locked()
-        while self._refresh_waiting and budget > 0:
-            idx = self._refresh_waiting.pop(0)
+        candidate_ids = {self._node_id(n) for n in self._refresh_candidates}
+        # 先把"自家节点仍是候选"的持有槽挑出来 —— 它们重建自家隧道,不占
+        # 空闲候选名额;不能让队列里排在前面的非持有槽(无空闲候选可领)触发
+        # drain,把后面还能重建自家节点的持有槽一起误杀。
+        holders: list[int] = []
+        non_holders: list[int] = []
+        for idx in self._refresh_waiting:
             if idx >= len(self.slots):
                 continue
             slot = self.slots[idx]
-            # 等待期间槽位可能被 health drop / fill 接管,不再是可替换状态
             if slot.state != SLOT_READY or slot.replacement_pending or slot.shadow is not None:
                 continue
-            target = self._next_fresh_candidate_locked(occupied - {slot.node_id or ""}, now)
+            own_id = slot.node_id or ""
+            if own_id and own_id in candidate_ids:
+                holders.append(idx)
+            else:
+                non_holders.append(idx)
+        self._refresh_waiting = []
+        for idx in holders + non_holders:
+            if budget <= 0:
+                # 预算用完:剩余槽回等待队列,等下一个 shadow 落地再补
+                self._refresh_waiting.append(idx)
+                continue
+            slot = self.slots[idx]
+            own_id = slot.node_id or ""
+            if own_id and own_id in candidate_ids:
+                target = next((n for n in self._refresh_candidates if self._node_id(n) == own_id), None)
+            else:
+                target = self._next_fresh_candidate_locked(occupied, now)
             if target is None:
-                # 候选打光:剩余等待槽全部停掉 —— 它们的节点不在本轮可用
-                # 集合里,池子规模镜像本轮候选数,不留历史节点。
-                self.log(
-                    "Pool",
-                    f"replace_pool waiting drain: stopping {len(self._refresh_waiting)} extra slots (candidates exhausted)",
-                )
-                while self._refresh_waiting:
-                    wait_idx = self._refresh_waiting.pop(0)
-                    wait_slot = self.slots[wait_idx] if wait_idx < len(self.slots) else None
-                    if wait_slot is None or wait_slot.state != SLOT_READY:
-                        continue
-                    if wait_slot.replacement_pending or wait_slot.shadow is not None:
-                        continue
-                    old_id = wait_slot.node_id
-                    self._stop_slot(wait_slot)
-                    if old_id:
-                        self._skipped[old_id] = now + self.failed_node_skip_seconds
-                    stop_picked_local += 1
-                break
+                # 非持有槽且无空闲候选:该槽的节点不在本轮可用集合里,停掉
+                old_id = slot.node_id
+                self._stop_slot(slot)
+                if old_id:
+                    self._skipped[old_id] = now + self.failed_node_skip_seconds
+                stop_picked_local += 1
+                continue
             occupied.add(self._node_id(target))
+            occupied.discard(own_id)  # 本槽老节点让位,不再占用
             shadow = ShadowCandidate(
                 index=slot.index,
                 tun_name=self._shadow_tun_name(slot),
@@ -1370,6 +1362,11 @@ class PoolManager:
             slot.replacement_deadline_at = now + self.replacement_grace_seconds
             started.append((slot, target))
             budget -= 1
+        if stop_picked_local:
+            try:
+                self.log("Pool", f"replace_pool trimmed={stop_picked_local} waiting slots (pool mirrors candidate set)")
+            except Exception:
+                pass
         for slot, target in started:
             threading.Thread(
                 target=self._start_shadow_for_slot,
@@ -1377,11 +1374,6 @@ class PoolManager:
                 name=f"proxy-pool-refresh-{slot.index}",
                 daemon=True,
             ).start()
-        if stop_picked_local:
-            try:
-                self.log("Pool", f"replace_pool trimmed={stop_picked_local} waiting slots (pool mirrors candidate set)")
-            except Exception:
-                pass
         return len(started)
 
     def _request_fill_slots(self) -> None:
