@@ -1187,6 +1187,7 @@ class PoolManager:
         picked: list[tuple[PoolSlot, dict[str, Any] | None]] = []
         stop_picked = 0
         cut_picked = 0
+        free_debug = occupied_debug = holders_debug = -1
         with self._lock:
             now = time.time()
             ready_count = sum(1 for s in self.slots if s.state == SLOT_READY)
@@ -1208,6 +1209,13 @@ class PoolManager:
                 nid = self._node_id(node)
                 if nid and nid not in occupied:
                     free_candidates.append(node)
+            free_debug = len(free_candidates)
+            occupied_debug = len(occupied)
+            holders_debug = sum(
+                1 for s in self.slots
+                if s.state == SLOT_READY and not s.replacement_pending and s.shadow is None
+                and (s.node_id or "") in candidate_ids
+            )
             for slot in self.slots:
                 if slot.state != SLOT_READY or slot.replacement_pending or slot.shadow is not None:
                     # 在途 shadow 的槽走正常替换路径,不在这里动
@@ -1257,7 +1265,8 @@ class PoolManager:
                 "Pool",
                 f"replace_pool ready={ready_count} empty={empty_count} "
                 f"picked={len(picked)} cutover={cut_picked} trimmed={stop_picked} "
-                f"waiting={len(self._refresh_waiting)} inflight={inflight} targets={len(candidates)}",
+                f"waiting={len(self._refresh_waiting)} inflight={inflight} targets={len(candidates)} "
+                f"free={free_debug} occupied={occupied_debug} holders={holders_debug}",
             )
         except Exception:
             pass
