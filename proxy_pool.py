@@ -564,6 +564,11 @@ class PoolManager:
         with self._lock:
             # 优雅切换:先回收排空/到期的旧节点进程(纯簿记,不阻塞)。
             self._reap_retiring_locked()
+            # 冷却表过期项清理(纯簿记):防长期运行内存无限增长
+            if self._skipped:
+                expired = [nid for nid, until in self._skipped.items() if until <= now]
+                for nid in expired:
+                    self._skipped.pop(nid, None)
             to_replace: list[tuple[PoolSlot, str]] = []
             for slot in self.slots:
                 if slot.state == SLOT_STARTING:
@@ -1891,6 +1896,7 @@ class PoolManager:
             return False
         old_listener = slot.listener
         old_process = slot.process
+        old_node_id = slot.node_id  # cutover 会覆盖 slot.node_id,先存老节点 id
         new_public_listener = None
         try:
             # 先绑新 listener(带 SO_REUSEPORT,旧监听还在也能绑上),绑定失败
@@ -1977,12 +1983,13 @@ class PoolManager:
         # 排空(或 replacement_grace_seconds 到期)后回收。
         if old_process is not None:
             now_ts = time.time()
+            # 记录的是被回收的老节点 id(slot.node_id 已换成新节点)
             self._retiring.append(
                 {
                     "index": slot.index,
                     "listener": old_listener,
                     "process": old_process,
-                    "node_id": slot.node_id,
+                    "node_id": old_node_id,
                     "since": now_ts,
                     "deadline_at": now_ts + self.replacement_grace_seconds,
                 }
@@ -2077,23 +2084,50 @@ class PoolManager:
                 except Exception:
                     pass
     def _stop_slot(self, slot: PoolSlot) -> None:
+        """停一个槽。若槽正有存量连接在服务(READY 且有 listener),改为优雅
+        排空:停 accept(不再收新连接)后把老 OpenVPN 进程挂进 ``_retiring``,
+        由 tick_health 在在途连接排空或宽限期到再回收 —— 客户端存量连接不断。
+        其余情形(EMPTY/STARTING/无 listener)照旧立即清理。"""
         slot.state = SLOT_DRAINING
         self._cleanup_shadow_locked(slot)
-        if slot.listener is not None:
-            try:
-                stop = getattr(slot.listener, "stop", None)
-                if callable(stop):
-                    stop()
-            except Exception:
-                pass
-            slot.listener = None
-        if slot.process is not None:
-            try:
-                self.stop_openvpn(slot.process)
-            except Exception:
-                pass
-            slot.process = None
+        if slot.listener is None:
+            # 没有可排空的 listener(从未就绪/已被接管),直接清理进程
+            if slot.process is not None:
+                try:
+                    self.stop_openvpn(slot.process)
+                except Exception:
+                    pass
+                slot.process = None
+            self._reset_slot_fields(slot)
+            return
+        listener = slot.listener
+        slot.listener = None
+        try:
+            stop = getattr(listener, "stop", None)
+            if callable(stop):
+                stop()
+        except Exception:
+            pass
+        process = slot.process
+        slot.process = None
+        node_id = slot.node_id
+        if process is not None:
+            now_ts = time.time()
+            self._retiring.append(
+                {
+                    "index": slot.index,
+                    "listener": listener,
+                    "process": process,
+                    "node_id": node_id,
+                    "since": now_ts,
+                    "deadline_at": now_ts + self.replacement_grace_seconds,
+                }
+            )
+        old_tun = slot.device_name
         self._reset_slot_fields(slot)
+        # 排空期间老进程还占着它的 tun 名:保留到 device_name,让
+        # _shadow_tun_name 自动跳到下一个影子编号,避免同名 tun 冲突
+        slot.device_name = old_tun
 
     def _reset_slot_fields(self, slot: PoolSlot) -> None:
         slot.state = SLOT_EMPTY

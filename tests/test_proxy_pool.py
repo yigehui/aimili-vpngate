@@ -543,7 +543,11 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(active.state, proxy_pool.SLOT_EMPTY)
         self.assertEqual(active.node_id, "")
         original_listener.stop.assert_called_once()
+        # 摘除改为优雅排空:进程进 _retiring,排空后下一轮 tick_health 回收
+        self.assertEqual(len(mgr._retiring), 1)
+        mgr.tick_health()
         mgr.stop_openvpn.assert_any_call(original_process)
+        self.assertEqual(len(mgr._retiring), 0)
         self.assertFalse(active.replacement_pending)
         self.assertIsNone(active.shadow)
         mgr.shutdown()
@@ -594,7 +598,11 @@ class PoolLifecycleTests(unittest.TestCase):
         self.assertEqual(active.state, proxy_pool.SLOT_EMPTY)
         self.assertEqual(active.node_id, "")
         old_listener.stop.assert_called_once()
+        # 摘除改为优雅排空:进程进 _retiring,排空后下一轮 tick_health 回收
+        self.assertEqual(len(mgr._retiring), 1)
+        mgr.tick_health()
         mgr.stop_openvpn.assert_any_call(old_process)
+        self.assertEqual(len(mgr._retiring), 0)
         self.assertFalse(active.replacement_pending)
         self.assertIsNone(active.shadow)
         mgr.shutdown()
@@ -644,7 +652,12 @@ class PoolLifecycleTests(unittest.TestCase):
                 mgr.tick_health()
 
                 original_listener.stop.assert_called()
+                # 摘除改为优雅排空:进程进 _retiring,连接已排空(测试 listener
+                # 无在途连接)的下一轮 tick_health 立即回收
+                self.assertEqual(len(mgr._retiring), 1)
+                mgr.tick_health()
                 mgr.stop_openvpn.assert_any_call(original_process)
+                self.assertEqual(len(mgr._retiring), 0)
                 self.assertEqual(active.state, proxy_pool.SLOT_EMPTY)
                 self.assertEqual(active.node_id, "")
                 self.assertFalse(active.replacement_pending)
